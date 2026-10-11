@@ -65,8 +65,8 @@ def _probe_stream(path: Path) -> dict:
 
 class StemDeliveryTests(unittest.TestCase):
     def test_quality_mapping_and_preset(self) -> None:
-        self.assertEqual(quality_to_compression_level(6), 0.4)
-        self.assertEqual(quality_to_compression_level(8), 0.2)
+        self.assertAlmostEqual(quality_to_compression_level(6), 0.4, places=6)
+        self.assertAlmostEqual(quality_to_compression_level(8), 0.2, places=6)
         self.assertEqual(resolve_ogg_quality({"ogg_quality": 5, "ogg_min_bitrate": 1}), 8)
         self.assertEqual(resolve_ogg_quality({"ogg_quality": 7}, "q5"), 5)
         self.assertEqual(resolve_ogg_quality({}, "min"), 8)

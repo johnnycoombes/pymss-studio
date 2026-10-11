@@ -1097,6 +1097,7 @@ export const useTaskStore = defineStore('task', () => {
       deviceIds: defaults.device === runtimeDevice.device || defaults.device === 'auto' ? runtimeDevice.deviceIds : [0],
       outputFormat: defaults.outputFormat,
       selectedStems: [],
+      djOutput: false,
       useTta: useTta.value,
       debug: settings.developerMode,
       audioParams: settings.getAudioParams(),

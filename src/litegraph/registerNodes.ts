@@ -547,14 +547,19 @@ function makeNodeClass(spec: NodeSpec): any {
     }
 
     configure(info: any) {
-      const normalizedInfo = normalizeBuiltinWidgetLayout(spec, info)
+      let normalizedInfo = normalizeBuiltinWidgetLayout(spec, info)
       const incomingTitle = typeof normalizedInfo.title === 'string' ? normalizedInfo.title : ''
       const defaultTitle = !incomingTitle
         || incomingTitle === spec.title
         || incomingTitle === translateNodeTitle(spec)
       let widgets = spec.widgets
       if (spec.type === 'pymss_save_audio') {
-        const values = Array.isArray(normalizedInfo.widgets_values) ? normalizedInfo.widgets_values : []
+        let values = Array.isArray(normalizedInfo.widgets_values) ? normalizedInfo.widgets_values : []
+        // Older ComfyUI graphs store a trailing button placeholder. It is not Vorbis quality.
+        if (values.length > 0 && values[values.length - 1] == null) {
+          values = values.slice(0, -1)
+          normalizedInfo = { ...normalizedInfo, widgets_values: values }
+        }
         // The rate sits at index 2 in legacy graphs, including numeric folder names.
         // A trailing ComfyUI button value does not add an output-folder widget.
         const hasFolder = /^\d+$/.test(String(values[2] ?? ''))
