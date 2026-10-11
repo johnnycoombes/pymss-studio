@@ -181,8 +181,25 @@ def _studio_separator_type() -> type[Any]:
             return updated
 
         def __init__(self, *args: Any, output_naming: Any = None, output_model: str = "", **kwargs: Any) -> None:
+            from stem_delivery import resolve_ogg_quality
+
+            dj_output = bool(kwargs.pop("dj_output", False))
+            requested_format = str(kwargs.get("output_format") or "wav").strip().lower() or "wav"
+            if requested_format == "vorbis":
+                requested_format = "ogg"
+            audio_params = kwargs.get("audio_params") if isinstance(kwargs.get("audio_params"), dict) else {}
+            # pymss Vorbis ignores quality and does not share one gain across stems.
+            # Keep its writer on float WAV and finish OGG or the DJ residual here.
+            if dj_output or requested_format == "ogg":
+                kwargs["output_format"] = "wav"
             super().__init__(*args, **kwargs)
             self._studio_naming = _normalize_output_naming(output_naming)
+            self._studio_dj_output = dj_output
+            self._studio_requested_format = requested_format
+            self._studio_audio_params = dict(audio_params)
+            self._studio_defer_delivery = dj_output or requested_format == "ogg"
+            self._studio_pending: list[dict[str, Any]] = []
+            self._studio_ogg_quality = resolve_ogg_quality(audio_params)
             self._studio_output_model = output_model
             self._studio_output_lock = Lock()
             self._studio_claimed_paths: set[Path] = set()
@@ -288,6 +305,18 @@ def _studio_separator_type() -> type[Any]:
             with self._studio_output_lock:
                 context = self._output_context_for(file_name)
                 stem = str(instr or "").strip() or file_name
+                if getattr(self, "_studio_defer_delivery", False):
+                    import numpy as np
+
+                    self._studio_pending.append({
+                        "stem": stem,
+                        "audio": np.array(np.asarray(audio), dtype=np.float32, copy=True),
+                        "sr": int(sr),
+                        "save_dir": str(save_dir),
+                        "file_name": str(file_name),
+                        "context": dict(context),
+                    })
+                    return
                 if self._studio_naming["enabled"]:
                     target_name = _replace_output_tokens(
                         self._studio_naming["template"],
@@ -322,18 +351,115 @@ def _studio_separator_type() -> type[Any]:
             """Delegate separation to pymss and retain Studio output metadata."""
             self._studio_last_outputs = []
             self._studio_output_sources = {}
+            self._studio_pending = []
             self._prepare_output_contexts(input_folder, input_index)
             try:
                 success_files = super().process_folder(input_folder)
             except Exception:
                 self._discard_outputs_for_failed_inputs(set())
+                self._studio_pending = []
                 raise
             finally:
                 self._studio_input_contexts = {}
                 self._studio_active_context = None
                 self._studio_active_output_count = 0
             self._discard_outputs_for_failed_inputs(set(success_files))
+            if getattr(self, "_studio_defer_delivery", False):
+                self._flush_deferred_delivery(set(success_files))
             return success_files
+
+        def _delivery_filename(self, stem: str, context: dict[str, Any]) -> str:
+            from stem_delivery import naming_template_for_dj
+
+            naming = self._studio_naming
+            template = naming["template"]
+            enabled = bool(naming["enabled"])
+            if getattr(self, "_studio_dj_output", False):
+                template, enabled = naming_template_for_dj(template, enabled)
+            if enabled:
+                return _replace_output_tokens(
+                    template,
+                    input_path=str(context.get("input_path") or self._studio_input_path),
+                    stem=stem,
+                    stem_index=self._studio_stem_indices.get(stem.lower(), len(self._studio_stem_indices)),
+                    input_index=int(context.get("input_index") or self._studio_input_index),
+                    model=self._studio_output_model,
+                    now=context.get("now") or self._studio_now,
+                )
+            file_name = str(context.get("file_name") or stem)
+            return _safe_filename_part(f"{file_name}_{stem}")
+
+        def _flush_deferred_delivery(self, success_files: set[str]) -> None:
+            from stem_delivery import (
+                DJ_STEM_NAMES,
+                StemDeliveryError,
+                as_channel_major,
+                encode_stem_group,
+                fold_dj_stems,
+                linear_resample,
+                load_audio_channels,
+            )
+
+            pending = list(getattr(self, "_studio_pending", []) or [])
+            self._studio_pending = []
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for item in pending:
+                context = item.get("context") or {}
+                source_name = str(context.get("source_name") or "")
+                if source_name not in success_files:
+                    continue
+                key = str(context.get("input_path") or source_name)
+                groups.setdefault(key, []).append(item)
+
+            for input_path, items in groups.items():
+                if not items:
+                    continue
+                context = dict(items[0]["context"])
+                sample_rate = int(items[0]["sr"])
+                parts: dict[str, Any] = {}
+                for item in items:
+                    audio = as_channel_major(item["audio"], layout="samples")
+                    item_rate = int(item["sr"])
+                    if item_rate != sample_rate:
+                        audio = linear_resample(audio, item_rate, sample_rate)
+                    parts[str(item["stem"])] = audio
+                if getattr(self, "_studio_dj_output", False):
+                    mix, mix_rate = load_audio_channels(input_path)
+                    if int(mix_rate) != sample_rate:
+                        mix = linear_resample(mix, int(mix_rate), sample_rate)
+                    folded = fold_dj_stems(mix, parts, mix_layout="channels", stem_layout="channels")
+                    final = [(name, folded[name], sample_rate) for name in DJ_STEM_NAMES]
+                    self._studio_stem_indices = {name.lower(): index for index, name in enumerate(DJ_STEM_NAMES)}
+                else:
+                    final = [
+                        (str(item["stem"]), parts[str(item["stem"])], sample_rate)
+                        for item in items
+                    ]
+                extension = self._studio_requested_format or "wav"
+                save_dir = str(items[0]["save_dir"])
+                paths = []
+                try:
+                    for stem_name, _audio, _rate in final:
+                        target_name = self._delivery_filename(stem_name, context)
+                        paths.append(_claim_output_path(
+                            Path(save_dir) / f"{target_name}.{extension}",
+                            self._studio_claimed_paths,
+                        ))
+                    params = dict(getattr(self, "_studio_audio_params", {}) or {})
+                    params["ogg_quality"] = getattr(self, "_studio_ogg_quality", params.get("ogg_quality", 6))
+                    encode_stem_group(final, paths, output_format=extension, audio_params=params)
+                except Exception:
+                    for path in paths:
+                        path.unlink(missing_ok=True)
+                        self._studio_claimed_paths.discard(path)
+                    raise
+                source_name = str(context.get("source_name") or Path(input_path).name)
+                for (stem_name, _audio, _rate), path in zip(final, paths):
+                    self._studio_claimed_paths.add(path)
+                    self._studio_last_outputs.append({"stem": stem_name, "path": str(path)})
+                    self._studio_output_sources[path] = source_name
+            if getattr(self, "_studio_dj_output", False) and pending and not groups:
+                raise StemDeliveryError("4-stem DJ output did not receive any stems to fold.")
 
         def studio_outputs(self) -> list[dict[str, str]]:
             return sorted(
@@ -503,8 +629,9 @@ def _prepare_separator(
     device, device_ids, resolved_device_label = _resolve_separator_device(
         payload.get("device"), payload.get("deviceIds")
     )
-    output_format = payload.get("outputFormat") or "wav"
-    selected_stems = _normalize_selected_stems(payload.get("selectedStems"))
+    output_format = str(payload.get("outputFormat") or "wav").strip().lower() or "wav"
+    dj_output = bool(payload.get("djOutput") or payload.get("dj_output"))
+    selected_stems = [] if dj_output else _normalize_selected_stems(payload.get("selectedStems"))
     use_tta = bool(payload.get("useTta", False))
     debug = bool(payload.get("debug", False))
     inference_params = normalize_inference_params(
@@ -560,7 +687,7 @@ def _prepare_separator(
         config_path=resolved.get('config_path'),
         inference_params=inference_params,
     )
-    return StudioMSSeparator(
+    separator = StudioMSSeparator(
         model_type=resolved_model_type,
         model_path=resolved_model_path,
         config_path=resolved.get('config_path'),
@@ -578,7 +705,19 @@ def _prepare_separator(
         inference_params=runtime_inference_params,
         output_naming=payload.get("outputNaming"),
         output_model=str(model_name or ""),
+        dj_output=dj_output,
     )
+    if dj_output:
+        from stem_delivery import StemDeliveryError, missing_dj_roles
+
+        instruments = list(getattr(getattr(getattr(separator, "config", None), "training", None), "instruments", []) or [])
+        missing = missing_dj_roles(instruments)
+        if missing:
+            raise StemDeliveryError(
+                "4-stem DJ output needs a model that produces vocals, bass, and drums. "
+                f"This model is missing: {', '.join(missing)}."
+            )
+    return separator
 
 
 def normalize_inference_params(payload_params: Any, version: Any = None) -> dict[str, Any]:

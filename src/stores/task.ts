@@ -59,6 +59,7 @@ export type SeparationRunConfig = {
   outputFormat: string
   selectedStems: string[]
   useTta: boolean
+  djOutput: boolean
   debug: boolean
   audioParams: Record<string, string | number>
   inferenceParamsVersion?: number
@@ -161,6 +162,7 @@ type PersistedSeparateState = {
   modelListSortMode?: ModelListSortMode
   modelListPageSize?: number
   useTta?: boolean
+  djOutput?: boolean
   inferenceParamsByModel?: Record<string, PersistedSeparateModelState>
 }
 
@@ -590,6 +592,7 @@ export const useTaskStore = defineStore('task', () => {
   const modelListSortMode = ref<ModelListSortMode>('usage')
   const modelListPageSize = ref(12)
   const useTta = ref(false)
+  const djOutput = ref(false)
   const batch_size = ref<number | null>(1)
   const overlap_size = ref<number | null>(0)
   const num_overlap = ref<number | null>(0)
@@ -647,6 +650,7 @@ export const useTaskStore = defineStore('task', () => {
       modelListSortMode: modelListSortMode.value,
       modelListPageSize: modelListPageSize.value,
       useTta: useTta.value,
+      djOutput: djOutput.value,
       inferenceParamsByModel: JSON.parse(JSON.stringify(persistedSeparateModelState.value)),
     }
   }
@@ -822,6 +826,7 @@ export const useTaskStore = defineStore('task', () => {
       : 'usage'
     modelListPageSize.value = normalizePageSize(separateStored?.modelListPageSize, SEPARATE_MODEL_PAGE_SIZES, 12)
     useTta.value = separateStored?.useTta === true
+    djOutput.value = separateStored?.djOutput === true
     persistedSeparateModelState.value = Object.fromEntries(
       Object.entries(separateStored?.inferenceParamsByModel || {})
         .map(([name, value]) => {
@@ -838,7 +843,7 @@ export const useTaskStore = defineStore('task', () => {
 
   watch(
     [separateRunMode, ensembleEnabled, ensembleModels, ensembleStem, ensembleModelStems, ensembleType, ensembleWeights,
-      separateOutputLayout, separateOutputNamingTemplate, separateCustomStemOrder, modelListViewMode, modelListSortMode, modelListPageSize, useTta],
+      separateOutputLayout, separateOutputNamingTemplate, separateCustomStemOrder, modelListViewMode, modelListSortMode, modelListPageSize, useTta, djOutput],
     () => {
       if (applyingModelDefaults) return
       queueSeparateStatePersist()
@@ -1018,6 +1023,7 @@ export const useTaskStore = defineStore('task', () => {
       outputFormat: settings.defaultFormat,
       selectedStems: [...selectedStems.value],
       useTta: useTta.value,
+      djOutput: djOutput.value,
       debug: settings.developerMode,
       audioParams: settings.getAudioParams(),
       inferenceParamsVersion: CURRENT_INFERENCE_PARAMS_VERSION,
@@ -1221,6 +1227,7 @@ export const useTaskStore = defineStore('task', () => {
           outputNaming: config.outputNaming,
           selectedStems: config.selectedStems || [],
           useTta: config.useTta,
+          djOutput: config.djOutput,
           debug: config.debug,
           audioParams: config.audioParams,
           inferenceParamsVersion: config.inferenceParamsVersion ?? CURRENT_INFERENCE_PARAMS_VERSION,
@@ -1275,6 +1282,7 @@ export const useTaskStore = defineStore('task', () => {
           outputNaming: config.outputNaming,
           selectedStems: config.selectedStems || [],
           useTta: config.useTta,
+          djOutput: config.djOutput,
           debug: config.debug,
           audioParams: config.audioParams,
           inferenceParamsVersion: config.inferenceParamsVersion ?? CURRENT_INFERENCE_PARAMS_VERSION,
@@ -2251,6 +2259,7 @@ export const useTaskStore = defineStore('task', () => {
     modelListSortMode,
     modelListPageSize,
     useTta,
+    djOutput,
     batch_size,
     overlap_size,
     num_overlap,

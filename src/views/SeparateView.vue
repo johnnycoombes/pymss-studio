@@ -48,6 +48,13 @@ import { SEPARATE_MODEL_PAGE_SIZES } from '@/utils/pagination'
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import TaskLogConsole from '@/components/TaskLogConsole.vue'
 import AlignedInferenceInputNumber from '@/components/AlignedInferenceInputNumber.vue'
+import {
+  DJ_NAMING_TEMPLATE,
+  DJ_STEMS,
+  OUTPUT_FORMAT_OPTIONS,
+  isStockNamingTemplate,
+  modelSupportsDjStems,
+} from '@/audio/delivery'
 
 const { t, locale } = useI18n()
 const message = useMessage()
@@ -75,6 +82,7 @@ const {
   separateOutputNamingTemplate: outputNamingTemplate,
   separateCustomStemOrder: customStemOrder,
   useTta,
+  djOutput,
   batch_size,
   overlap_size,
   num_overlap,
@@ -151,12 +159,13 @@ const MAX_FILENAME_PART_BYTES = 200
 const PREVIEW_AUDIO_CACHE_LIMIT = 8
 let unlistenDragDrop: UnlistenFn | null = null
 
-const formatOptions = [
-  { label: 'WAV', value: 'wav' },
-  { label: 'FLAC', value: 'flac' },
-  { label: 'MP3', value: 'mp3' },
-  { label: 'M4A', value: 'm4a' },
-]
+const formatOptions = [...OUTPUT_FORMAT_OPTIONS]
+const oggQualityOptions = computed(() => [
+  { label: t('audio.oggQ5'), value: 5 },
+  { label: t('audio.oggQ6'), value: 6 },
+  { label: t('audio.oggQ7'), value: 7 },
+  { label: t('audio.oggQ8'), value: 8 },
+])
 
 function getFileKindLabel(path: string) {
   const ext = path.split('.').pop()?.toLowerCase() || ''
@@ -373,6 +382,13 @@ function parseModelInstruments(value?: unknown) {
     })
 }
 const availableStemNames = computed(() => parseModelInstruments(currentModelInfo.value?.configInstruments))
+const djModelSupported = computed(() => !availableStemNames.value.length || modelSupportsDjStems(availableStemNames.value))
+const djOutputActive = computed(() => (
+  runMode.value === 'model'
+  && !ensembleEnabled.value
+  && djOutput.value
+  && djModelSupported.value
+))
 const ensembleModelEntries = computed(() => ensembleModels.value
   .map(name => listedDownloadedModels.value.find(item => item.name === name))
   .filter((item): item is (typeof listedDownloadedModels.value)[number] => Boolean(item)))
@@ -465,14 +481,22 @@ function normalizeStemOrder(order: string[], stems: string[]) {
   return next
 }
 
-const orderedOutputStems = computed(() => runMode.value === 'model' && ensembleEnabled.value
-  ? [ensembleStem.value.trim()].filter(Boolean)
-  : normalizeStemOrder(customStemOrder.value, checkedOutputStems.value))
-const outputNamingConfig = computed(() => ({
-  enabled: Boolean(outputNamingTemplate.value.trim()),
-  template: outputNamingTemplate.value.trim() || '%index%_%filename%_%stem%',
-  stemOrder: orderedOutputStems.value,
-}))
+const orderedOutputStems = computed(() => {
+  if (runMode.value === 'model' && ensembleEnabled.value) return [ensembleStem.value.trim()].filter(Boolean)
+  if (djOutputActive.value) return [...DJ_STEMS]
+  return normalizeStemOrder(customStemOrder.value, checkedOutputStems.value)
+})
+const outputNamingConfig = computed(() => {
+  const template = outputNamingTemplate.value.trim()
+  if (djOutputActive.value && isStockNamingTemplate(template)) {
+    return { enabled: true, template: DJ_NAMING_TEMPLATE, stemOrder: [...DJ_STEMS] }
+  }
+  return {
+    enabled: Boolean(template),
+    template: template || '%index%_%filename%_%stem%',
+    stemOrder: orderedOutputStems.value,
+  }
+})
 const outputNamingSummary = computed(() => outputNamingConfig.value.enabled
   ? outputNamingConfig.value.template
   : t('separate.namingDefaultSummary'))
@@ -642,7 +666,7 @@ const startStatusText = computed(() => {
   if (!inputFiles.value.length) return t('separate.outputDirectorySummary')
   if (runMode.value === 'model' && ensembleEnabled.value && !ensembleReady.value) return t('separate.ensembleNotReady')
   if (runMode.value === 'model' && !ensembleEnabled.value && !modelDownloaded.value) return t('separate.startHintModelMissing')
-  if (runMode.value === 'model' && !ensembleEnabled.value && !hasOutputStemSelection.value) {
+  if (runMode.value === 'model' && !ensembleEnabled.value && !djOutputActive.value && !hasOutputStemSelection.value) {
     return t('separate.startHintNoOutputStems')
   }
   return t('separate.outputDirectorySummary')
@@ -736,7 +760,7 @@ const canStart = computed(() => (
     ? Boolean(selectedWorkflow.value) && inputFiles.value.length > 0
     : ensembleEnabled.value
       ? ensembleReady.value
-      : (modelDownloaded.value && inputFiles.value.length > 0 && hasOutputStemSelection.value))
+      : (modelDownloaded.value && inputFiles.value.length > 0 && (djOutputActive.value || hasOutputStemSelection.value)))
 ))
 function isSeparationJob(job: SeparationJob) {
   return !job.primary.runConfig?.workbench
@@ -1788,7 +1812,11 @@ async function start() {
     message.warning(t('inference.invalidChunkSize', currentChunkIssue.value))
     return
   }
-  if (runMode.value === 'model' && !ensembleEnabled.value && !hasOutputStemSelection.value) {
+  if (runMode.value === 'model' && !ensembleEnabled.value && djOutput.value && availableStemNames.value.length && !djModelSupported.value) {
+    message.warning(t('separate.djOutputUnavailable'))
+    return
+  }
+  if (runMode.value === 'model' && !ensembleEnabled.value && !djOutputActive.value && !hasOutputStemSelection.value) {
     message.warning(t('separate.startHintNoOutputStems'))
     return
   }
@@ -2681,7 +2709,9 @@ async function retryCurrentTask() {
             </div>
             <div class="check-list">
               <n-checkbox v-model:checked="useTta">{{ t('separate.tta') }}</n-checkbox>
+              <n-checkbox v-model:checked="djOutput" :disabled="ensembleEnabled || !djModelSupported">{{ t('separate.djOutput') }}</n-checkbox>
             </div>
+            <p class="settings-group__note">{{ djModelSupported ? t('separate.djOutputHint') : t('separate.djOutputUnavailable') }}</p>
           </div>
 
           <div class="settings-group">
@@ -2712,6 +2742,19 @@ async function retryCurrentTask() {
                 <div class="field-block">
                   <label>{{ t('audio.m4aBitRate') }}</label>
                   <n-select v-model:value="settings.m4aBitRate" :options="bitRateOptions" />
+                </div>
+              </n-grid-item>
+              <n-grid-item v-if="effectiveFormat === 'ogg'">
+                <div class="field-block">
+                  <label>{{ t('audio.oggQuality') }}</label>
+                  <n-select v-model:value="settings.oggQuality" :options="oggQualityOptions" :disabled="settings.oggMinBitrate" />
+                  <small class="settings-group__note">{{ t('audio.oggQualityHint') }}</small>
+                </div>
+              </n-grid-item>
+              <n-grid-item v-if="effectiveFormat === 'ogg'">
+                <div class="field-block">
+                  <label>{{ t('audio.oggMinBitrate') }}</label>
+                  <n-checkbox v-model:checked="settings.oggMinBitrate">{{ t('audio.oggMinBitrateHint') }}</n-checkbox>
                 </div>
               </n-grid-item>
               <n-grid-item v-if="effectiveFormat === 'm4a'">
@@ -5030,10 +5073,15 @@ async function retryCurrentTask() {
   font-size: 13px;
 }
 
-.settings-group__head span {
+.settings-group__head span,
+.settings-group__note {
   color: var(--on-surface-muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+.settings-group__note {
+  margin: 8px 0 0;
 }
 
 .settings-row {

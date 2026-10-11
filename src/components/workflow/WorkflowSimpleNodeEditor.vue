@@ -15,6 +15,8 @@ import WorkflowNodeLog from '@/components/workflow/WorkflowNodeLog.vue'
 import type { WorkflowNodeLogs } from '@/workflows/nodeLogs'
 import type { ModelDefaultInferenceParams, ModelEntry } from '@/stores/model'
 import AlignedInferenceInputNumber from '@/components/AlignedInferenceInputNumber.vue'
+import { OUTPUT_FORMAT_OPTIONS, modelSupportsDjStems } from '@/audio/delivery'
+import { useSettingsStore } from '@/stores/settings'
 import { inferenceChunkSizeIssue, resolveInferenceChunkStep, resolveInferenceSampleStep } from '@/features/inference/sampleStep'
 import { hasInvalidSimpleInferenceNumbers } from '@/workflows/formats'
 import {
@@ -88,6 +90,14 @@ const emit = defineEmits<{
 }>()
 
 const { t, locale } = useI18n()
+const settings = useSettingsStore()
+const formatOptions = OUTPUT_FORMAT_OPTIONS.map(item => ({ label: item.label, value: item.value }))
+const oggQualityOptions = computed(() => [
+  { label: t('audio.oggQ5'), value: 5 },
+  { label: t('audio.oggQ6'), value: 6 },
+  { label: t('audio.oggQ7'), value: 7 },
+  { label: t('audio.oggQ8'), value: 8 },
+])
 const editingName = ref(false)
 const showWorkflowSettings = ref(false)
 const nameBeforeEdit = ref('')
@@ -563,7 +573,11 @@ function nodeStyle(id: string) {
 }
 
 function stepHeight(step: SimpleStepDraft) {
-  return NODE_HEIGHT_BASE + Math.max(0, step.stems.length - 2) * PORT_GAP
+  return NODE_HEIGHT_BASE + 52 + Math.max(0, step.stems.length - 2) * PORT_GAP
+}
+
+function stepDjAvailable(step: SimpleStepDraft) {
+  return step.stems.length === 0 || modelSupportsDjStems(step.stems)
 }
 
 function ensembleHeight(ensemble: SimpleEnsembleDraft) {
@@ -995,7 +1009,18 @@ function applyModelUpdate(step: SimpleStepDraft, value: string, stems: string[])
     if (value?.trim()) nextSave[stem] = value
   })
   step.save = nextSave
+  if (step.djOutput && stems.length > 0 && !modelSupportsDjStems(stems)) step.djOutput = false
   cleanupSimpleDraft(draft.value)
+  recordHistory()
+}
+
+function updateDjOutput(step: SimpleStepDraft, value: boolean) {
+  if (value && !stepDjAvailable(step)) {
+    step.djOutput = false
+    message.warning(t('workflows.djOutputUnavailable'))
+    return
+  }
+  step.djOutput = value
   recordHistory()
 }
 
@@ -1499,6 +1524,12 @@ onBeforeUnmount(() => {
           <div class="simple-node__body" @pointerdown.stop>
             <label><span>{{ t('workflows.stepModel') }}</span><n-select :ref="(instance: unknown) => setSelectInstance(`step-model:${step.id}`, instance)" :value="step.model" size="small" filterable :options="modelOptions" :placeholder="t('workflows.stepModelPlaceholder')" @update:value="updateModel(step, $event)" /></label>
             <label><span>{{ t('workflows.stepInput') }}</span><n-select :ref="(instance: unknown) => setSelectInstance(`step-input:${step.id}`, instance)" :value="step.input" size="small" :options="stepInputOptions(step, index)" @update:value="updateStepInput(step, String($event || ''))" /></label>
+            <label class="simple-dj-output">
+              <span>{{ t('workflows.djOutput') }}</span>
+              <n-checkbox :checked="step.djOutput" :disabled="readonly || !stepDjAvailable(step)" @update:checked="updateDjOutput(step, $event)" />
+            </label>
+            <p v-if="step.djOutput" class="simple-dj-output__hint">{{ t('workflows.djOutputHint') }}</p>
+            <p v-else-if="!stepDjAvailable(step)" class="simple-dj-output__hint">{{ t('workflows.djOutputUnavailable') }}</p>
           </div>
           <div class="simple-node__outputs">
             <div v-for="stem in step.stems" :key="stem" class="simple-output-row">
@@ -1564,7 +1595,10 @@ onBeforeUnmount(() => {
     <n-modal v-model:show="showWorkflowSettings" preset="card" :title="t('workflows.settingsAction')" class="simple-workflow-settings-modal" style="width: min(440px, calc(100vw - 32px))">
       <div class="simple-node-editor__defaults">
         <label><span>{{ t('workflows.defaultDevice') }}</span><n-select :ref="(instance: unknown) => setSelectInstance('default-device', instance)" v-model:value="draft.defaultDevice" :disabled="readonly" size="small" :options="[{ label: 'Auto', value: 'auto' }, { label: 'CPU', value: 'cpu' }, { label: 'CUDA', value: 'cuda' }, { label: 'MPS', value: 'mps' }, { label: 'MLX', value: 'mlx' }]" /></label>
-        <label><span>{{ t('workflows.defaultFormat') }}</span><n-select :ref="(instance: unknown) => setSelectInstance('default-format', instance)" v-model:value="draft.defaultFormat" :disabled="readonly" size="small" :options="[{ label: 'WAV', value: 'wav' }, { label: 'FLAC', value: 'flac' }, { label: 'MP3', value: 'mp3' }, { label: 'M4A', value: 'm4a' }]" /></label>
+        <label><span>{{ t('workflows.defaultFormat') }}</span><n-select :ref="(instance: unknown) => setSelectInstance('default-format', instance)" v-model:value="draft.defaultFormat" :disabled="readonly" size="small" :options="formatOptions" /></label>
+        <label v-if="draft.defaultFormat === 'ogg'"><span>{{ t('audio.oggQuality') }}</span><n-select v-model:value="settings.oggQuality" :disabled="readonly || settings.oggMinBitrate" size="small" :options="oggQualityOptions" /></label>
+        <label v-if="draft.defaultFormat === 'ogg'" class="simple-dj-output"><span>{{ t('audio.oggMinBitrate') }}</span><n-checkbox v-model:checked="settings.oggMinBitrate" :disabled="readonly">{{ t('audio.oggMinBitrateHint') }}</n-checkbox></label>
+        <p v-if="draft.defaultFormat === 'ogg'" class="simple-dj-output__hint">{{ t('audio.oggQualityHint') }}</p>
         <label><span>{{ t('workflows.defaultNormalize') }}</span><n-select v-model:value="defaultNormalizeMode" :disabled="readonly" size="small" :options="defaultNormalizeOptions" /></label>
       </div>
       <template #footer><div class="simple-workflow-settings-actions"><n-button v-if="!readonly" size="small" secondary @click="autoLayout(); showWorkflowSettings = false"><template #icon><n-icon :component="LocateOutline" /></template>{{ t('workflows.autoLayout') }}</n-button><n-button size="small" secondary @click="showWorkflowSettings = false">{{ t('common.close') }}</n-button></div></template>
@@ -2014,6 +2048,8 @@ onBeforeUnmount(() => {
 }
 
 .simple-node__body :deep(.n-select) { min-width: 0; }
+.simple-dj-output { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.simple-dj-output__hint { margin: 0; color: var(--on-surface-muted); font-size: 11px; line-height: 1.4; }
 
 .simple-inference-settings { position: relative; }
 .simple-inference-settings:hover { background: color-mix(in srgb, var(--primary) 12%, transparent) !important; color: var(--primary-strong) !important; }

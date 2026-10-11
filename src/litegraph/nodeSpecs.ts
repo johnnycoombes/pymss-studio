@@ -216,11 +216,12 @@ export const NODE_SPECS: Record<string, NodeSpec> = {
     ],
     outputs: [],
     widgets: [
-      { name: 'output_format', type: 'combo', default: 'wav', options: ['wav', 'flac', 'mp3', 'm4a'] },
+      { name: 'output_format', type: 'combo', default: 'wav', options: ['wav', 'flac', 'mp3', 'm4a', 'ogg'] },
       { name: 'sample_rate', type: 'combo', default: '44100', options: ['32000', '44100', '48000'] },
       { name: 'wav_bit_depth', type: 'combo', default: 'FLOAT', options: ['FLOAT', 'PCM_24', 'PCM_16'] },
       { name: 'flac_bit_depth', type: 'combo', default: 'PCM_24', options: ['PCM_24', 'PCM_16'] },
       { name: 'mp3_bit_rate', type: 'combo', default: '320k', options: ['128k', '192k', '256k', '320k'] },
+      { name: 'ogg_quality', type: 'combo', default: 'q6', options: ['q5', 'q6', 'q7', 'q8', 'min'] },
     ],
   },
   pymss_audio_ensemble: {
@@ -244,6 +245,24 @@ export const NODE_SPECS: Record<string, NodeSpec> = {
     category: 'pymss/audio_tools',
     inputs: [{ name: 'a', type: PORT.AUDIO }],
     outputs: [{ name: '-a', type: PORT.AUDIO }],
+    widgets: [],
+  },
+  studio_dj_fold: {
+    type: 'studio_dj_fold',
+    title: '4-stem DJ Output',
+    category: 'pymss/audio_tools',
+    inputs: [
+      { name: 'mix', type: PORT.AUDIO },
+      { name: 'vocals', type: PORT.AUDIO },
+      { name: 'bass', type: PORT.AUDIO },
+      { name: 'drums', type: PORT.AUDIO },
+    ],
+    outputs: [
+      { name: 'Vocals', type: PORT.AUDIO },
+      { name: 'Melody', type: PORT.AUDIO },
+      { name: 'Bass', type: PORT.AUDIO },
+      { name: 'Drums', type: PORT.AUDIO },
+    ],
     widgets: [],
   },
   pymss_audio_normalize: {

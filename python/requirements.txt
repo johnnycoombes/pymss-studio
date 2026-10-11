@@ -7,6 +7,9 @@
 
 av>=14
 librosa>=0.10.2
+# Vorbis quality uses soundfile's compression_level (0 = highest). librosa
+# already depends on soundfile; 0.12+ is what understands compression_level.
+soundfile>=0.12.1
 audioread>=3.0,<4
 numpy>=1.26
 pysocks>=1.7.1

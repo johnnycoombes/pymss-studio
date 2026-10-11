@@ -100,6 +100,7 @@ export function hasInvalidSimpleStructure(definition: Record<string, unknown>): 
     if (value.inference_params != null && !isRecord(value.inference_params)) return true
     if (isRecord(value.inference_params) && hasInvalidSimpleInferenceNumbers(value.inference_params)) return true
     if (value.save != null && !isRecord(value.save)) return true
+    if (value.dj_output != null && typeof value.dj_output !== 'boolean') return true
     return false
   })
   if (hasInvalidStep) return true
@@ -264,7 +265,7 @@ export function isWorkflowSaveNodeType(value: unknown): boolean {
   return WORKFLOW_SAVE_NODE_TYPES.has(String(value || ''))
 }
 
-const LEGACY_SIMPLE_SAVE_FILENAME = /\.(?:wav|flac|mp3|m4a)$/iu
+const LEGACY_SIMPLE_SAVE_FILENAME = /\.(?:wav|flac|mp3|m4a|ogg)$/iu
 const DEFAULT_SIMPLE_OUTPUT_NAME = '%filename%_%stem%_%model%'
 
 /**

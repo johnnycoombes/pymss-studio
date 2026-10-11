@@ -61,6 +61,8 @@ export type PymssYamlStep = {
   device?: string
   output_format?: string
   use_tta?: boolean
+  /** Studio-only. pymss drops unknown step fields; the worker folds before save. */
+  dj_output?: boolean
 }
 
 export type SimpleWorkflowInferenceParams = ModelDefaultInferenceParams & {
@@ -101,6 +103,8 @@ export type SimpleStepDraft = {
   outputNames: Record<string, string>
   /** Absent means this step follows the current model-level global settings. */
   inferenceParams?: SimpleWorkflowInferenceParams
+  /** Replace model stems with Vocals, Melody, Bass, and Drums at save time. */
+  djOutput: boolean
 }
 
 export type SimpleEnsembleDraft = {
@@ -272,6 +276,7 @@ export function hydrateSimpleWorkflow(definition: unknown): SimpleDraft {
         ? Object.fromEntries(Object.entries(raw.output_names).map(([k, v]) => [k, String(v)]))
         : {},
       inferenceParams: normalizeSimpleInferenceParams(raw.inference_params),
+      djOutput: raw.dj_output === true,
     }))
   const ensembles = (Array.isArray(definition.ensembles) ? definition.ensembles : [])
     .filter(isRecord)
@@ -327,6 +332,7 @@ export function buildSimpleWorkflowDefinition(draft: SimpleDraft): PymssYamlWork
         save: { ...step.save },
         output_names: { ...step.outputNames },
         ...(inferenceParams ? { inference_params: inferenceParams } : {}),
+        ...(step.djOutput ? { dj_output: true } : {}),
       }
     }),
     ...(draft.ensembles.length
@@ -432,6 +438,7 @@ export function createStepDraft(index: number): SimpleStepDraft {
     save: {},
     outputNames: {},
     inferenceParams: undefined,
+    djOutput: false,
   }
 }
 
@@ -459,7 +466,7 @@ export function createAudioOperationDraft(operation: SimpleAudioOperation, index
 }
 
 const SIMPLE_FILENAME_TOKENS = /%([A-Za-z_][A-Za-z0-9_]*)%/g
-const SIMPLE_AUDIO_SUFFIX = /\.(?:wav|flac|mp3|m4a)$/i
+const SIMPLE_AUDIO_SUFFIX = /\.(?:wav|flac|mp3|m4a|ogg)$/i
 const SIMPLE_INVALID_FILENAME_CHARS = /[\u0000-\u001f<>:"/\\|?*]+/g
 const SIMPLE_WINDOWS_RESERVED_NAMES = new Set([
   'CON', 'PRN', 'AUX', 'NUL',
