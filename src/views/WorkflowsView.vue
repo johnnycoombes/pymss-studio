@@ -32,6 +32,8 @@ import {
 import { WorkflowEditorInUseError } from '@/utils/workflowEditorState'
 import { hasInvalidSimpleStructure, isGraphWorkflowDefinition, isSimpleWorkflowDefinition } from '@/workflows/formats'
 import { litegraphToComfy } from '@/litegraph/graphAdapter'
+import { OUTPUT_FORMAT_OPTIONS } from '@/audio/delivery'
+import { useSettingsStore } from '@/stores/settings'
 import {
   countWorkflowSaveOutputs,
   getWorkflowDefinitionIssue,
@@ -42,6 +44,7 @@ const message = useMessage()
 const dialog = useDialog()
 const workflow = useWorkflowStore()
 const model = useModelStore()
+const settings = useSettingsStore()
 const { workflows, selectedWorkflowId, selectedWorkflow, simpleEditorOpenWorkflowId } = storeToRefs(workflow)
 const { downloadedModels } = storeToRefs(model)
 const editingId = ref('')
@@ -75,12 +78,13 @@ const deviceOptions = [
   { label: 'MPS', value: 'mps' },
   { label: 'MLX', value: 'mlx' },
 ]
-const formatOptions = [
-  { label: 'WAV', value: 'wav' },
-  { label: 'FLAC', value: 'flac' },
-  { label: 'MP3', value: 'mp3' },
-  { label: 'M4A', value: 'm4a' },
-]
+const formatOptions = OUTPUT_FORMAT_OPTIONS.map(item => ({ label: item.label, value: item.value }))
+const oggQualityOptions = computed(() => [
+  { label: t('audio.oggQ5'), value: 5 },
+  { label: t('audio.oggQ6'), value: 6 },
+  { label: t('audio.oggQ7'), value: 7 },
+  { label: t('audio.oggQ8'), value: 8 },
+])
 const normalizeOptions = computed(() => [
   { label: t('workflows.inferenceFollowGlobal'), value: 'global' },
   { label: t('workflows.inferenceEnabled'), value: 'enabled' },
@@ -966,6 +970,22 @@ watch([workflows, selectedWorkflowId], () => {
                     @update:value="updateSelectedDefaultFormat"
                   />
                 </div>
+                <div v-if="selectedDraft.defaultFormat === 'ogg'" class="wf-param">
+                  <span>{{ t('audio.oggQuality') }}</span>
+                  <n-select
+                    v-model:value="settings.oggQuality"
+                    size="small"
+                    :options="oggQualityOptions"
+                    :disabled="isNodeEditorOpen || settings.oggMinBitrate"
+                  />
+                  <small class="wf-param__hint">{{ t('audio.oggQualityHint') }}</small>
+                </div>
+                <div v-if="selectedDraft.defaultFormat === 'ogg'" class="wf-param wf-param--wide">
+                  <span>{{ t('audio.oggMinBitrate') }}</span>
+                  <n-checkbox v-model:checked="settings.oggMinBitrate" :disabled="isNodeEditorOpen">
+                    {{ t('audio.oggMinBitrateHint') }}
+                  </n-checkbox>
+                </div>
                 <div class="wf-param">
                   <span>{{ t('workflows.defaultNormalize') }}</span>
                   <n-select
@@ -1732,6 +1752,17 @@ watch([workflows, selectedWorkflowId], () => {
 .wf-param strong {
   font-size: 14px;
   font-weight: 600;
+}
+
+.wf-param--wide {
+  grid-column: 1 / -1;
+}
+
+.wf-param__hint {
+  color: var(--on-surface-muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
 }
 
 .wf-batch-list {

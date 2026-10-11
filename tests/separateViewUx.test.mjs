@@ -143,7 +143,7 @@ test('a relative output directory disables submission and blocks the start actio
     outputDirectoryPlatform: ref('windows'), t: key => key,
     submittingJob: ref(false), workflowStructureInvalid: ref(false), runMode: ref('model'),
     ensembleEnabled: ref(false), modelDownloaded: ref(true), inputFiles: ref(['D:/Audio/song.wav']),
-    hasOutputStemSelection: ref(true), message: { warning: value => warnings.push(value) },
+    hasOutputStemSelection: ref(true), djOutputActive: ref(false), message: { warning: value => warnings.push(value) },
   }
   const { canStart, start } = vm.runInNewContext(`${outputDirectoryCode}\n({ canStart, start })`, context)
   assert.equal(canStart.value, false)
@@ -316,7 +316,7 @@ test('large output stem lists expose compact bulk selection actions', () => {
   assert.ok(template.includes("t('separate.selectAllStems')"))
   assert.ok(template.includes("t('separate.clearStemSelection')"))
   assert.ok(scriptSource.includes('outputStemSelectionCleared.value = true'))
-  assert.ok(scriptSource.includes('&& hasOutputStemSelection.value'))
+  assert.ok(scriptSource.includes('&& !djOutputActive.value && !hasOutputStemSelection.value'))
 })
 
 test('output stem selection is restored from the model cache', () => {

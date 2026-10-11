@@ -103,6 +103,8 @@ type StoredSettings = {
   mp3BitRate?: string
   m4aBitRate?: string
   m4aCodec?: string
+  oggQuality?: number
+  oggMinBitrate?: boolean
   startupOnboardingSeen?: boolean
   startupOnboardingSeenVersion?: string
   proxyMode?: ProxyMode
@@ -149,6 +151,7 @@ const DEFAULT_FLAC_BIT_DEPTH = 'PCM_24'
 const DEFAULT_MP3_BIT_RATE = '320k'
 const DEFAULT_M4A_BIT_RATE = '512k'
 const DEFAULT_M4A_CODEC = 'aac'
+const DEFAULT_OGG_QUALITY = 6
 
 function normalizeM4aCodec(value: unknown): string {
   return String(value || '').trim().toLowerCase() === 'aac' ? 'aac' : DEFAULT_M4A_CODEC
@@ -199,6 +202,8 @@ export type AudioParams = {
   mp3BitRate: string
   m4aBitRate: string
   m4aCodec: string
+  oggQuality: number
+  oggMinBitrate: boolean
 }
 
 /**
@@ -250,6 +255,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const mp3BitRate = ref(DEFAULT_MP3_BIT_RATE)
   const m4aBitRate = ref(DEFAULT_M4A_BIT_RATE)
   const m4aCodec = ref(DEFAULT_M4A_CODEC)
+  const oggQuality = ref(DEFAULT_OGG_QUALITY)
+  const oggMinBitrate = ref(false)
   const proxyMode = ref<ProxyMode>(DEFAULT_PROXY_MODE)
   const proxyUrl = ref(DEFAULT_PROXY_URL)
   const proxyBypass = ref('')
@@ -286,6 +293,8 @@ export const useSettingsStore = defineStore('settings', () => {
     mp3BitRate: mp3BitRate.value,
     m4aBitRate: m4aBitRate.value,
     m4aCodec: m4aCodec.value,
+    oggQuality: oggQuality.value,
+    oggMinBitrate: oggMinBitrate.value,
     startupOnboardingSeen: startupOnboardingSeen.value,
     proxyMode: proxyMode.value,
     proxyUrl: proxyUrl.value,
@@ -350,6 +359,8 @@ export const useSettingsStore = defineStore('settings', () => {
     mp3BitRate.value = stored?.mp3BitRate || DEFAULT_MP3_BIT_RATE
     m4aBitRate.value = stored?.m4aBitRate || DEFAULT_M4A_BIT_RATE
     m4aCodec.value = normalizeM4aCodec(stored?.m4aCodec)
+    oggQuality.value = [5, 6, 7, 8].includes(Number(stored?.oggQuality)) ? Number(stored?.oggQuality) : DEFAULT_OGG_QUALITY
+    oggMinBitrate.value = stored?.oggMinBitrate === true
     proxyMode.value = (stored?.proxyMode && ['system', 'none', 'custom'].includes(stored.proxyMode))
       ? stored.proxyMode
       : DEFAULT_PROXY_MODE
@@ -416,6 +427,8 @@ export const useSettingsStore = defineStore('settings', () => {
       mp3BitRate,
       m4aBitRate,
       m4aCodec,
+      oggQuality,
+      oggMinBitrate,
       proxyMode,
       proxyUrl,
       proxyBypass,
@@ -508,6 +521,8 @@ export const useSettingsStore = defineStore('settings', () => {
       mp3_bit_rate: mp3BitRate.value,
       m4a_bit_rate: m4aBitRate.value,
       m4a_codec: m4aCodec.value,
+      ogg_quality: oggMinBitrate.value ? 8 : oggQuality.value,
+      ogg_min_bitrate: oggMinBitrate.value ? 1 : 0,
     }
   }
 
@@ -915,6 +930,8 @@ export const useSettingsStore = defineStore('settings', () => {
     mp3BitRate,
     m4aBitRate,
     m4aCodec,
+    oggQuality,
+    oggMinBitrate,
     proxyMode,
     proxyUrl,
     proxyBypass,

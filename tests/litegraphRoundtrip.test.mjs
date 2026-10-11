@@ -392,14 +392,14 @@ test('new save nodes and upstream five-value imports use the same widget order',
   save.inputs = save.inputs.filter(input => input.name !== 'output_folder')
   const graph = load(source)
   const node = graph.getNodeById(save.id)
-  assert.deepEqual(node.widgets.map(w => w.name), ['output_format', 'sample_rate', 'wav_bit_depth', 'flac_bit_depth', 'mp3_bit_rate'])
-  assert.deepEqual(node.widgets.map(w => w.value), values)
+  assert.deepEqual(node.widgets.map(w => w.name), ['output_format', 'sample_rate', 'wav_bit_depth', 'flac_bit_depth', 'mp3_bit_rate', 'ogg_quality'])
+  assert.deepEqual(node.widgets.map(w => w.value), [...values, 'q6'])
   assert.deepEqual(LiteGraph.createNode('pymss_save_audio').widgets.map(w => w.name), node.widgets.map(w => w.name))
   node.widgets.find(w => w.name === 'sample_rate').value = '48000'
   const exported = exportGraph(graph)
-  assert.deepEqual(exported.nodes.find(n => n.id === save.id).widgets_values, ['flac', '48000', 'PCM_16', 'PCM_24', '192k'])
+  assert.deepEqual(exported.nodes.find(n => n.id === save.id).widgets_values, ['flac', '48000', 'PCM_16', 'PCM_24', '192k', 'q6'])
   assert.deepEqual(exportGraph(load(exported)).links, exported.links)
-  assert.deepEqual(load(exported).getNodeById(save.id).widgets.map(w => w.value), ['flac', '48000', 'PCM_16', 'PCM_24', '192k'])
+  assert.deepEqual(load(exported).getNodeById(save.id).widgets.map(w => w.value), ['flac', '48000', 'PCM_16', 'PCM_24', '192k', 'q6'])
 })
 
 test('legacy six-value save nodes retain their output folder across editing and reload', () => {
@@ -412,8 +412,9 @@ test('legacy six-value save nodes retain their output folder across editing and 
   assert.equal(node.widgets.find(w => w.name === 'output_folder').value, 'stems')
   assert.equal(node.widgets.find(w => w.name === 'sample_rate').value, '48000')
   const exported = exportGraph(graph)
-  assert.deepEqual(exported.nodes.find(n => n.id === save.id).widgets_values, values)
-  assert.deepEqual(load(exported).getNodeById(save.id).widgets.map(w => w.value), values)
+  const withQuality = [...values, 'q6']
+  assert.deepEqual(exported.nodes.find(n => n.id === save.id).widgets_values, withQuality)
+  assert.deepEqual(load(exported).getNodeById(save.id).widgets.map(w => w.value), withQuality)
 })
 
 test('save layouts distinguish numeric folders from trailing ComfyUI button values', () => {
@@ -428,8 +429,8 @@ test('save layouts distinguish numeric folders from trailing ComfyUI button valu
     const folder = node.widgets.find(w => w.name === 'output_folder')
     assert.equal(folder?.value, values[1] === '2026' ? '2026' : undefined)
     assert.equal(node.widgets.find(w => w.name === 'sample_rate').value, '48000')
-    const expected = folder ? values : values.slice(0, 5)
-    assert.deepEqual(exportGraph(load(exportGraph(graph))).nodes[0].widgets_values, expected)
+    const stored = folder ? [...values, 'q6'] : [...values.slice(0, 5), 'q6']
+    assert.deepEqual(exportGraph(load(exportGraph(graph))).nodes[0].widgets_values, stored)
   }
 })
 

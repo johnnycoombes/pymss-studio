@@ -376,7 +376,7 @@ def _workflow_output_stem(path: str, input_path: str | None = None) -> str:
 
 
 _SIMPLE_FILENAME_TOKENS = re.compile(r"%([A-Za-z_][A-Za-z0-9_]*)%")
-_AUDIO_SUFFIX = re.compile(r"\.(?:wav|flac|mp3|m4a)$", re.IGNORECASE)
+_AUDIO_SUFFIX = re.compile(r"\.(?:wav|flac|mp3|m4a|ogg)$", re.IGNORECASE)
 _INVALID_FILENAME_CHARS = re.compile(r'[\x00-\x1f<>:"/\\|?*]+')
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -588,7 +588,8 @@ def _apply_simple_output_names(dag: Any, definition: dict[str, Any], *, input_pa
                                output_format: str, output_dir: Path | None = None,
                                reserved_names: set[str] | None = None,
                                start_index: int = 0,
-                               apply_names: bool = True) -> list[dict[str, str]]:
+                               apply_names: bool = True,
+                               filename_formats: dict[str, str] | None = None) -> list[dict[str, str]]:
     """Collect simple saves and optionally wire Studio filename constants.
 
     Each record carries the save-node ID so execution order cannot change its
@@ -617,7 +618,7 @@ def _apply_simple_output_names(dag: Any, definition: dict[str, Any], *, input_pa
         if not step_id or not isinstance(save, dict):
             continue
         model = str(step.get("model") or "").strip()
-        step_output_format = str(step.get("output_format") or output_format).strip().lower() or output_format
+        step_output_format = str((filename_formats or {}).get(step_id) or step.get("output_format") or output_format).strip().lower() or output_format
         for stem, target in save.items():
             if target in (None, False, ""):
                 continue
@@ -759,7 +760,9 @@ def _validate_simple_audio_dependencies(steps: list[Any], extensions: list[Any])
 def _apply_simple_ensembles(dag: Any, definition: dict[str, Any], *, input_path: str,
                             output_format: str, output_dir: Path | None = None,
                             reserved_names: set[str] | None = None,
-                            start_index: int = 0) -> list[dict[str, str]]:
+                            start_index: int = 0,
+                            source_overrides: dict[str, tuple[str, int]] | None = None,
+                            widget_format: str | None = None) -> list[dict[str, str]]:
     """Compile simple Ensemble and audio-operation records into native nodes."""
     import pymss.graph as graph
 
@@ -783,6 +786,10 @@ def _apply_simple_ensembles(dag: Any, definition: dict[str, Any], *, input_path:
             stem_name = str(stem or "").strip()
             if stem_name:
                 produced[f"{step_id}.{stem_name}".casefold()] = (f"step:{step_id}", stem_index * 2)
+    if source_overrides:
+        for ref, source in source_overrides.items():
+            produced[str(ref).casefold()] = source
+    save_widget_format = str(widget_format or output_format).strip().lower() or output_format
 
     next_link_id = max(
         (int(link.link_id) for node in dag.nodes for link in node.inputs
@@ -945,7 +952,7 @@ def _apply_simple_ensembles(dag: Any, definition: dict[str, Any], *, input_path:
             id=save_id,
             type="pymss_save_audio",
             inputs=save_inputs,
-            data={"widgets_values": [output_format, "Default", "44100", "FLOAT", "PCM_24", "320k"]},
+            data={"widgets_values": [save_widget_format, "Default", "44100", "FLOAT", "PCM_24", "320k"]},
             title=save_id,
         ))
 
@@ -1191,8 +1198,21 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         raise RuntimeError("Workflow definition is required")
 
     simple_output_metadata: list[dict[str, str]] = []
+    audio_params = payload.get("audioParams") if isinstance(payload.get("audioParams"), dict) else {}
     output_format = str(payload.get("outputFormat") or "").strip().lower()
     output_format = output_format or "wav"
+    from workflow_delivery import (
+        apply_simple_dj_folds,
+        encode_deferred_ogg,
+        ensure_dj_fold_node,
+        mark_compiled_ogg_saves,
+        rewrite_graph_ogg,
+        rewrite_yaml_ogg,
+    )
+
+    ensure_dj_fold_node(graph)
+    ogg_plan = None
+    dj_sources: dict[str, tuple[str, int]] = {}
     if fmt == "yaml":
         import pymss.workflow as pwf
         data = json.loads(workflow_path.read_text(encoding="utf-8"))
@@ -1200,6 +1220,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             defaults = data.get("defaults")
             if isinstance(defaults, dict):
                 output_format = str(defaults.get("output_format") or output_format).strip().lower() or output_format
+        ogg_plan = rewrite_yaml_ogg(data, audio_params, output_format)
         if data.get("steps") == [] and simple_definition is not None and simple_definition.get("ensembles"):
             # pymss' YAML loader requires a separation step. Its native DAG
             # compiler accepts an empty Workflow, allowing pure audio processing
@@ -1215,28 +1236,35 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         inference_params = _simple_inference_params(wf)
         dag = graph.compile_workflow_to_dag(wf)
         _apply_simple_inference_params(dag, inference_params)
+        dj_sources = apply_simple_dj_folds(dag, data)
         reserved_simple_names: set[str] = set()
+        filename_format = "ogg" if ogg_plan.run_wants_ogg else output_format
         simple_output_metadata = _apply_simple_output_names(
             dag,
             data,
             input_path=primary,
-            output_format=output_format,
+            output_format=filename_format,
             output_dir=task_output_dir,
             reserved_names=reserved_simple_names,
             apply_names=_simple_output_names(simple_definition if simple_definition is not None else data),
+            filename_formats=ogg_plan.step_formats,
         )
         if simple_definition is not None:
             simple_output_metadata.extend(_apply_simple_ensembles(
                 dag,
                 simple_definition,
                 input_path=primary,
-                output_format=output_format,
+                output_format=filename_format,
                 output_dir=task_output_dir,
                 reserved_names=reserved_simple_names,
                 start_index=len(simple_output_metadata),
+                source_overrides=dj_sources,
+                widget_format="wav" if ogg_plan.run_wants_ogg else output_format,
             ))
+        mark_compiled_ogg_saves(dag, ogg_plan, audio_params)
     else:
         dag = graph.load_comfy_file(workflow_path)
+        ogg_plan = rewrite_graph_ogg(dag, audio_params, output_format)
 
     _apply_runtime_device(dag, payload, simple=simple_definition is not None)
     dynamic_folders: dict[str, str] = {}
@@ -1270,6 +1298,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         callbacks = {"execution_event_callback": _emit_execution(task_id, log_scope)} \
             if fmt != "yaml" and getattr(graph, "EXECUTION_EVENT_VERSION", 0) >= 1 \
             else {"progress_event_callback": _emit_progress(task_id, log_scope)}
+        reported_format = "ogg" if ogg_plan is not None and ogg_plan.run_wants_ogg else output_format
         saved = graph.run_dag(
             dag,
             output_dir=graph_output_dir,
@@ -1281,12 +1310,14 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             model_dir=payload.get("modelDir") or None,
             download=bool(payload.get("downloadMethod") and payload.get("downloadMethod") != "never"),
             source=str(payload.get("source") or "modelscope"),
-            output_format=output_format,
-            audio_params=payload.get("audioParams") if isinstance(payload.get("audioParams"), dict) else None,
+            output_format="wav" if ogg_plan is not None and (ogg_plan.run_wants_ogg or ogg_plan.node_quality) else output_format,
+            audio_params=audio_params or None,
             debug=bool(payload.get("debug")),
             strict=True,
             separator_cache=separator_cache,
         )
+        if ogg_plan is not None and ogg_plan.node_quality:
+            saved = encode_deferred_ogg(saved, ogg_plan, audio_params)
         if ensemble_stem is not None:
             return _finalize_ensemble_output(
                 saved, payload=payload, input_path=primary, stem=ensemble_stem,
@@ -1340,7 +1371,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         "outputs": outputs,
         "outputDir": str(Path(saved_paths[0]).parent.resolve()) if workbench and saved_paths else str(task_output_dir.resolve()),
         **({"outputDirectories": sorted({str(Path(path).parent.resolve()) for path in saved_paths})} if workbench else {}),
-        "outputFormat": output_format,
+        "outputFormat": reported_format,
     }
 
 
