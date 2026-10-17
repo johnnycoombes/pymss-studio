@@ -8,11 +8,13 @@ asked to invent those choices.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
 import wave
 from pathlib import Path
+from uuid import uuid4
 from typing import Any, Callable
 
 OGG_SAMPLE_RATE = 44100
@@ -23,6 +25,20 @@ OGG_QUALITY_DEFAULT = 6
 OGG_MIN_BITRATE_QUALITY = 8
 OGG_PEAK_CEILING_DB = -1.0
 DJ_STEM_NAMES = ("Vocals", "Melody", "Bass", "Drums")
+# AZ-MODS matches the first of vocal, then instrument/inst/other, then bass, then drum.
+# Melody is the residual, and the deck only sees it when the file is named other.ogg.
+DJ_OGG_FILE_STEMS = {
+    "Vocals": "vocals",
+    "Melody": "other",
+    "Bass": "bass",
+    "Drums": "drums",
+}
+_XDJ_OGG_NAMES = frozenset({"vocals.ogg", "other.ogg", "bass.ogg", "drums.ogg"})
+_XDJ_RESERVED_NAMES = frozenset({
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+})
 
 _VOCAL_ALIASES = frozenset({"vocals", "vocal", "voice"})
 _BASS_ALIASES = frozenset({"bass"})
@@ -258,11 +274,128 @@ def is_stock_naming_template(template: Any, *, enabled: bool = True) -> bool:
 
 
 def naming_template_for_dj(template: Any, enabled: bool) -> tuple[str, bool]:
-    """Use ``<input> - <stem>`` for stock rules and keep a custom template."""
+    """Use ``<input> - <stem>`` for stock rules and keep a custom template.
+
+    OGG DJ files do not use this template. The deck matches substrings in the
+    filename, so those four files are ``vocals.ogg``, ``other.ogg``,
+    ``bass.ogg``, and ``drums.ogg``.
+    """
     text = str(template or "").strip()
     if is_stock_naming_template(text, enabled=enabled):
         return "%filename% - %stem%", True
     return text, True
+
+
+def dj_ogg_file_stem(name: Any) -> str:
+    """Return the XDJ-AZ filename stem for one DJ display stem."""
+    text = str(name or "").strip()
+    mapped = DJ_OGG_FILE_STEMS.get(text)
+    if mapped:
+        return mapped
+    role = dj_role(text)
+    if role == "vocals":
+        return "vocals"
+    if role == "bass":
+        return "bass"
+    if role == "drums":
+        return "drums"
+    if role == "melody":
+        return "other"
+    lowered = text.lower()
+    if lowered in {"vocals", "other", "bass", "drums"}:
+        return lowered
+    raise StemDeliveryError(f"Cannot name an XDJ-AZ stem for {text!r}.")
+
+
+def xdj_track_folder_name(track_filename: Any) -> str:
+    """``STEMS`` folder name from a track filename, without its extension.
+
+    A trailing space or dot, or a Windows device name such as CON or COM1,
+    gets a trailing ``_`` so the folder can be created on Windows.
+    """
+    text = Path(str(track_filename or "")).stem
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
+    if text in {"", ".", ".."}:
+        text = "track"
+    device = text.rstrip(" .").split(".", 1)[0].upper()
+    if text.endswith(" ") or text.endswith(".") or device in _XDJ_RESERVED_NAMES:
+        text = f"{text}_"
+    return text
+
+
+def open_xdj_stage(output_root: str | Path, track_filename: Any) -> tuple[Path, Path]:
+    """Create a hidden ``STEMS/.<track>-<id>`` directory and return it with the final path."""
+    folder = xdj_track_folder_name(track_filename)
+    stems_root = Path(output_root) / "STEMS"
+    stems_root.mkdir(parents=True, exist_ok=True)
+    stage = stems_root / f".{folder}-{uuid4().hex}"
+    stage.mkdir()
+    return stage, stems_root / folder
+
+
+def publish_xdj_stage(stage: Path, target: Path) -> Path:
+    """Rename a staged stem folder into place, dropping a previous ``azstem.env``."""
+    stage = Path(stage)
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        env_path = target / "azstem.env"
+        if env_path.is_file():
+            env_path.unlink()
+        trash = target.parent / f".{target.name}-old-{uuid4().hex}"
+        target.rename(trash)
+        try:
+            stage.rename(target)
+        except Exception:
+            if not target.exists() and trash.exists():
+                trash.rename(target)
+            raise
+        shutil.rmtree(trash, ignore_errors=True)
+        return target
+    stage.rename(target)
+    return target
+
+
+def is_xdj_ogg_output(stem: Any, path: Any) -> bool:
+    """True for a DJ OGG file whose name is exactly one of the four deck names."""
+    name = Path(str(path or "")).name.lower()
+    if name not in _XDJ_OGG_NAMES:
+        return False
+    label = str(stem or "").strip()
+    if not label:
+        return True
+    if label in DJ_STEM_NAMES or label.lower() in {"vocals", "melody", "other", "bass", "drums"}:
+        return True
+    return dj_role(label) in {"vocals", "melody", "bass", "drums"}
+
+
+def relocate_xdj_outputs(outputs: list[dict[str, Any]], output_root: str | Path, track_filename: Any) -> list[dict[str, Any]]:
+    """Move finished DJ OGG files into ``STEMS/<track>/`` without re-encoding them."""
+    chosen = [item for item in outputs if is_xdj_ogg_output(item.get("stem"), item.get("path"))]
+    if not chosen:
+        return outputs
+    stage, target = open_xdj_stage(output_root, track_filename)
+    moved: list[tuple[dict[str, Any], Path, Path]] = []
+    try:
+        for item in chosen:
+            source = Path(str(item.get("path") or ""))
+            destination = stage / source.name.lower()
+            source.replace(destination)
+            moved.append((item, source, destination))
+        publish_xdj_stage(stage, target)
+    except Exception:
+        for item, source, destination in moved:
+            if destination.exists() and not source.exists():
+                source.parent.mkdir(parents=True, exist_ok=True)
+                destination.replace(source)
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        raise
+    for item, _source, destination in moved:
+        final = target / destination.name
+        item["path"] = str(final)
+        item["name"] = final.name
+    return outputs
 
 
 def fold_dj_stems(

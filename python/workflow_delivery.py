@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from stem_delivery import (
+    DJ_OGG_FILE_STEMS,
     DJ_STEM_NAMES,
     StemDeliveryError,
     dj_role,
@@ -44,6 +45,7 @@ class OggSavePlan:
     def __init__(self) -> None:
         self.node_quality: dict[str, int] = {}
         self.step_formats: dict[str, str] = {}
+        self.dj_file_stems: dict[str, str] = {}
         self.run_wants_ogg = False
 
     @property
@@ -234,7 +236,35 @@ def _dj_output_template(names: dict[str, Any], source_stem: str | None) -> str:
     return template
 
 
-def apply_simple_dj_folds(dag: Any, definition: dict[str, Any]) -> dict[str, tuple[str, int]]:
+def collect_dj_ogg_save_names(dag: Any) -> dict[str, str]:
+    """Map a save node fed by the DJ fold to ``vocals``, ``other``, ``bass``, or ``drums``."""
+    file_stem_by_slot = {0: "vocals", 1: "other", 2: "bass", 3: "drums"}
+    fold_ids = {
+        str(node.id)
+        for node in getattr(dag, "nodes", []) or []
+        if str(getattr(node, "type", "")) == "studio_dj_fold"
+    }
+    mapping: dict[str, str] = {}
+    if not fold_ids:
+        return mapping
+    for node in getattr(dag, "nodes", []) or []:
+        if str(getattr(node, "type", "")) not in _SAVE_NODE_TYPES:
+            continue
+        link = node.inputs[0] if getattr(node, "inputs", None) else None
+        if link is None or str(getattr(link, "source_node_id", "")) not in fold_ids:
+            continue
+        file_stem = file_stem_by_slot.get(int(getattr(link, "source_slot", -1)))
+        if file_stem:
+            mapping[str(node.id)] = file_stem
+    return mapping
+
+
+def apply_simple_dj_folds(
+    dag: Any,
+    definition: dict[str, Any],
+    *,
+    ogg_step_ids: set[str] | None = None,
+) -> dict[str, tuple[str, int]]:
     """Insert a residual fold for simple steps that opted into 4-stem DJ output.
 
     Returns ``step.stem`` source overrides so ensembles and downstream steps
@@ -383,15 +413,19 @@ def apply_simple_dj_folds(dag: Any, definition: dict[str, Any]) -> dict[str, tup
         if kept:
             names = step.get("output_names") if isinstance(step.get("output_names"), dict) else {}
             step["save"] = {display: "Default" for display in DJ_STEM_NAMES}
-            step["output_names"] = {
-                display: _dj_output_template(names, role_source.get(role))
-                for display, role in (
-                    ("Vocals", "vocals"),
-                    ("Melody", "melody"),
-                    ("Bass", "bass"),
-                    ("Drums", "drums"),
-                )
-            }
+            writes_ogg = step_id in (ogg_step_ids or set())
+            if writes_ogg:
+                step["output_names"] = dict(DJ_OGG_FILE_STEMS)
+            else:
+                step["output_names"] = {
+                    display: _dj_output_template(names, role_source.get(role))
+                    for display, role in (
+                        ("Vocals", "vocals"),
+                        ("Melody", "melody"),
+                        ("Bass", "bass"),
+                        ("Drums", "drums"),
+                    )
+                }
 
         for stem in stems:
             role = dj_role(stem) or "melody"
@@ -494,7 +528,13 @@ def encode_deferred_ogg(saved: Any, plan: OggSavePlan, audio_params: Any) -> Any
         for _index, record in members:
             audio, sample_rate = load_audio_channels(record.path)
             loaded.append((str(getattr(record, "stem", "") or Path(record.path).stem), audio, sample_rate))
-        targets = [Path(record.path).with_suffix(".ogg") for _index, record in members]
+        targets = []
+        for _index, record in members:
+            file_stem = plan.dj_file_stems.get(str(getattr(record, "node_id", "") or ""))
+            if file_stem:
+                targets.append(Path(record.path).with_name(f"{file_stem}.ogg"))
+            else:
+                targets.append(Path(record.path).with_suffix(".ogg"))
         # A group can mix per-node qualities. Encode at each node's quality
         # after the shared gain, so the ceiling stays common.
         qualities = [plan.quality_for(str(record.node_id), fallback_quality) for _index, record in members]
