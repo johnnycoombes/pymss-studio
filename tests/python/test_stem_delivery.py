@@ -16,21 +16,26 @@ else:
 import numpy as np
 
 from stem_delivery import (
+    DJ_OGG_FILE_STEMS,
     DJ_STEM_NAMES,
     OGG_SAMPLE_RATE,
     StemDeliveryError,
     conform_44k_stereo,
     decode_peak,
+    dj_ogg_file_stem,
     encode_stem_group,
     ffprobe_bitrate_kbps,
     fold_dj_stems,
     linear_resample,
     missing_dj_roles,
     naming_template_for_dj,
+    open_xdj_stage,
     peak_ceiling,
+    publish_xdj_stage,
     quality_to_compression_level,
     resolve_ogg_quality,
     shared_gain,
+    xdj_track_folder_name,
 )
 
 
@@ -149,6 +154,55 @@ class StemDeliveryTests(unittest.TestCase):
     def test_stock_names_become_the_dj_pattern(self) -> None:
         self.assertEqual(naming_template_for_dj("%index%_%filename%_%stem%", True), ("%filename% - %stem%", True))
         self.assertEqual(naming_template_for_dj("Live %stem%", True), ("Live %stem%", True))
+
+    def test_dj_ogg_names_match_xdj_az_tokens(self) -> None:
+        self.assertEqual(
+            [dj_ogg_file_stem(name) for name in DJ_STEM_NAMES],
+            ["vocals", "other", "bass", "drums"],
+        )
+        for display, file_stem in DJ_OGG_FILE_STEMS.items():
+            self.assertNotIn("inst", file_stem)
+            if display != "Melody":
+                self.assertNotIn("other", file_stem)
+            if display != "Vocals":
+                self.assertNotIn("vocal", file_stem)
+        self.assertEqual(DJ_OGG_FILE_STEMS["Melody"], "other")
+
+    def test_xdj_folder_names_escape_windows_devices(self) -> None:
+        self.assertEqual(xdj_track_folder_name("song.wav"), "song")
+        self.assertEqual(xdj_track_folder_name("My Track.flac"), "My Track")
+        self.assertEqual(xdj_track_folder_name("song."), "song._")
+        self.assertEqual(xdj_track_folder_name("song "), "song _")
+        self.assertEqual(xdj_track_folder_name("CON"), "CON_")
+        self.assertEqual(xdj_track_folder_name("nul.wav"), "nul_")
+        self.assertEqual(xdj_track_folder_name("COM1."), "COM1._")
+        self.assertEqual(xdj_track_folder_name("folder/COM1.live.wav"), "COM1.live_")
+        self.assertEqual(xdj_track_folder_name("AUX"), "AUX_")
+        self.assertEqual(xdj_track_folder_name("PRN.wav"), "PRN_")
+        self.assertEqual(xdj_track_folder_name("LPT1"), "LPT1_")
+
+    def test_publish_replaces_the_folder_and_drops_azstem_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "STEMS" / "song"
+            target.mkdir(parents=True)
+            (target / "azstem.env").write_text("old", encoding="utf-8")
+            (target / "vocals.ogg").write_bytes(b"old-vocals")
+            stage, final = open_xdj_stage(root, "song.wav")
+            self.assertEqual(final, target)
+            self.assertTrue(stage.name.startswith(".song-"))
+            self.assertTrue(stage.name.startswith("."))
+            (stage / "vocals.ogg").write_bytes(b"new-vocals")
+            (stage / "other.ogg").write_bytes(b"melody")
+            (stage / "bass.ogg").write_bytes(b"bass")
+            (stage / "drums.ogg").write_bytes(b"drums")
+            published = publish_xdj_stage(stage, final)
+            self.assertEqual(published, target)
+            self.assertFalse(stage.exists())
+            self.assertFalse((target / "azstem.env").exists())
+            self.assertEqual((target / "vocals.ogg").read_bytes(), b"new-vocals")
+            self.assertEqual((target / "other.ogg").read_bytes(), b"melody")
+            self.assertFalse(list((root / "STEMS").glob(".*")))
 
     def test_ogg_group_is_44100_stereo_with_one_peak_ceiling(self) -> None:
         rate = 48000
