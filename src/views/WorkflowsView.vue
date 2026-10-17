@@ -37,6 +37,7 @@ import { hasInvalidSimpleStructure, isGraphWorkflowDefinition, isSimpleWorkflowD
 import { litegraphToComfy } from '@/litegraph/graphAdapter'
 import { OUTPUT_FORMAT_OPTIONS } from '@/audio/delivery'
 import { useSettingsStore } from '@/stores/settings'
+import { useTaskStore } from '@/stores/task'
 import {
   countWorkflowSaveOutputs,
   getWorkflowDefinitionIssue,
@@ -48,7 +49,9 @@ const dialog = useDialog()
 const workflow = useWorkflowStore()
 const model = useModelStore()
 const settings = useSettingsStore()
+const taskStore = useTaskStore()
 const { workflows, selectedWorkflowId, selectedWorkflow, simpleEditorOpenWorkflowId } = storeToRefs(workflow)
+const { xdjLayout } = storeToRefs(taskStore)
 const { downloadedModels } = storeToRefs(model)
 const editingId = ref('')
 const name = ref('')
@@ -976,6 +979,13 @@ watch([workflows, selectedWorkflowId], () => {
                 <n-checkbox v-model:checked="settings.oggMinBitrate" :disabled="isNodeEditorOpen">
                   {{ t('audio.oggMinBitrateHint') }}
                 </n-checkbox>
+              </div>
+              <div class="wf-param wf-param--wide">
+                <label>{{ t('workflows.xdjLayout') }}</label>
+                <n-checkbox v-model:checked="xdjLayout" :disabled="isNodeEditorOpen" :title="t('workflows.xdjLayoutHint')">
+                  {{ t('workflows.xdjLayoutHint') }}
+                </n-checkbox>
+                <small class="wf-param__hint">{{ t('workflows.djMelodyFileNote') }}</small>
               </div>
               <div class="wf-param">
                 <label>{{ t('workflows.defaultNormalize') }}</label>

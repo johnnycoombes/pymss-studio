@@ -573,7 +573,8 @@ function nodeStyle(id: string) {
 }
 
 function stepHeight(step: SimpleStepDraft) {
-  return NODE_HEIGHT_BASE + 52 + Math.max(0, step.stems.length - 2) * PORT_GAP
+  const melodyNote = step.djOutput ? 40 : 0
+  return NODE_HEIGHT_BASE + 52 + melodyNote + Math.max(0, step.stems.length - 2) * PORT_GAP
 }
 
 function stepDjAvailable(step: SimpleStepDraft) {
@@ -1529,6 +1530,7 @@ onBeforeUnmount(() => {
               <n-checkbox :checked="step.djOutput" :disabled="readonly || !stepDjAvailable(step)" @update:checked="updateDjOutput(step, $event)" />
             </label>
             <p v-if="step.djOutput" class="simple-dj-output__hint">{{ t('workflows.djOutputHint') }}</p>
+            <p v-if="step.djOutput" class="simple-dj-output__hint" :title="t('workflows.djMelodyFileNote')">{{ t('workflows.djMelodyFileNote') }}</p>
             <p v-else-if="!stepDjAvailable(step)" class="simple-dj-output__hint">{{ t('workflows.djOutputUnavailable') }}</p>
           </div>
           <div class="simple-node__outputs">

@@ -54,10 +54,12 @@ import TaskLogConsole from '@/components/TaskLogConsole.vue'
 import AlignedInferenceInputNumber from '@/components/AlignedInferenceInputNumber.vue'
 import {
   DJ_NAMING_TEMPLATE,
+  DJ_OGG_FILE_STEMS,
   DJ_STEMS,
   OUTPUT_FORMAT_OPTIONS,
   isStockNamingTemplate,
   modelSupportsDjStems,
+  xdjTrackFolderName,
 } from '@/audio/delivery'
 import InferenceParameterLesson from '@/components/InferenceParameterLesson.vue'
 import { parameterHelpTopics } from '@/features/inference/parameterHelp'
@@ -96,6 +98,7 @@ const {
   separateCustomStemOrder: customStemOrder,
   useTta,
   djOutput,
+  xdjLayout,
   batch_size,
   overlap_size,
   num_overlap,
@@ -1254,6 +1257,13 @@ function formatOutputNamingPreviewFile(stem: string, stemIndex: number) {
 
 function formatOutputNamingPreviewParts(stem: string, stemIndex: number) {
   const inputPath = inputFiles.value[0] || t('separate.resultFolderPreview')
+  if (djOutputActive.value && effectiveFormat.value === 'ogg') {
+    const fileStem = DJ_OGG_FILE_STEMS[stem as keyof typeof DJ_OGG_FILE_STEMS] || stem.toLowerCase()
+    const parts = xdjLayout.value
+      ? [{ text: `STEMS/${xdjTrackFolderName(inputPath)}/`, token: 'literal' }, { text: fileStem, token: 'literal' }]
+      : [{ text: fileStem, token: 'literal' }]
+    return [...parts, { text: '.ogg', token: 'extension' }]
+  }
   const modelName = runMode.value === 'workflow'
     ? selectedWorkflow.value?.name || t('separate.workflow')
     : ensembleEnabled.value ? 'Ensemble' : selectedModelName.value || t('separate.model')
@@ -2907,8 +2917,11 @@ async function retryCurrentTask() {
             <div class="check-list">
               <n-checkbox v-model:checked="useTta" data-parameter-guide="tta" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'tta' }">{{ t('separate.tta') }}</n-checkbox>
               <n-checkbox v-model:checked="djOutput" :disabled="ensembleEnabled || !djModelSupported">{{ t('separate.djOutput') }}</n-checkbox>
+              <n-checkbox v-model:checked="xdjLayout" :disabled="ensembleEnabled || !djOutput || effectiveFormat !== 'ogg'" :title="t('separate.xdjLayoutHint')">{{ t('separate.xdjLayout') }}</n-checkbox>
             </div>
             <p class="settings-group__note">{{ djModelSupported ? t('separate.djOutputHint') : t('separate.djOutputUnavailable') }}</p>
+            <p v-if="djOutput" class="settings-group__note" :title="t('separate.djMelodyFileNote')">{{ t('separate.djMelodyFileNote') }}</p>
+            <p v-if="djOutput" class="settings-group__note">{{ t('separate.xdjLayoutHint') }}</p>
           </div>
 
           <div class="settings-group">

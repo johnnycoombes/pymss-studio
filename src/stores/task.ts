@@ -65,6 +65,7 @@ export type SeparationRunConfig = {
   selectedStems: string[]
   useTta: boolean
   djOutput: boolean
+  xdjLayout: boolean
   debug: boolean
   audioParams: Record<string, string | number>
   inferenceParamsVersion?: number
@@ -170,6 +171,7 @@ type PersistedSeparateState = {
   modelListPageSize?: number
   useTta?: boolean
   djOutput?: boolean
+  xdjLayout?: boolean
   inferenceParamsByModel?: Record<string, PersistedSeparateModelState>
 }
 
@@ -457,6 +459,7 @@ function normalizeRunConfig(runConfig?: SeparationRunConfig): SeparationRunConfi
   if (!runConfig) return undefined
   const next: SeparationRunConfig = {
     ...runConfig,
+    xdjLayout: runConfig.xdjLayout === true,
     downloadMethod: runConfig.downloadMethod || 'aria2c',
     outputLayout: normalizeOutputLayout(runConfig.outputLayout),
     outputNaming: normalizeOutputNaming(runConfig.outputNaming),
@@ -630,6 +633,7 @@ export const useTaskStore = defineStore('task', () => {
   const modelListPageSize = ref(12)
   const useTta = ref(false)
   const djOutput = ref(false)
+  const xdjLayout = ref(false)
   const batch_size = ref<number | null>(1)
   const overlap_size = ref<number | null>(0)
   const num_overlap = ref<number | null>(0)
@@ -688,6 +692,7 @@ export const useTaskStore = defineStore('task', () => {
       modelListPageSize: modelListPageSize.value,
       useTta: useTta.value,
       djOutput: djOutput.value,
+      xdjLayout: xdjLayout.value,
       inferenceParamsByModel: JSON.parse(JSON.stringify(persistedSeparateModelState.value)),
     }
   }
@@ -864,6 +869,7 @@ export const useTaskStore = defineStore('task', () => {
     modelListPageSize.value = normalizePageSize(separateStored?.modelListPageSize, SEPARATE_MODEL_PAGE_SIZES, 12)
     useTta.value = separateStored?.useTta === true
     djOutput.value = separateStored?.djOutput === true
+    xdjLayout.value = separateStored?.xdjLayout === true
     persistedSeparateModelState.value = Object.fromEntries(
       Object.entries(separateStored?.inferenceParamsByModel || {})
         .map(([name, value]) => {
@@ -880,7 +886,7 @@ export const useTaskStore = defineStore('task', () => {
 
   watch(
     [separateRunMode, ensembleEnabled, ensembleModels, ensembleStem, ensembleModelStems, ensembleType, ensembleWeights,
-      separateOutputLayout, separateOutputNamingTemplate, separateCustomStemOrder, modelListViewMode, modelListSortMode, modelListPageSize, useTta, djOutput],
+      separateOutputLayout, separateOutputNamingTemplate, separateCustomStemOrder, modelListViewMode, modelListSortMode, modelListPageSize, useTta, djOutput, xdjLayout],
     () => {
       if (applyingModelDefaults) return
       queueSeparateStatePersist()
@@ -1060,6 +1066,7 @@ export const useTaskStore = defineStore('task', () => {
       selectedStems: [...selectedStems.value],
       useTta: useTta.value,
       djOutput: djOutput.value,
+      xdjLayout: xdjLayout.value,
       debug: settings.developerMode,
       audioParams: settings.getAudioParams(),
       inferenceParamsVersion: CURRENT_INFERENCE_PARAMS_VERSION,
@@ -1134,6 +1141,7 @@ export const useTaskStore = defineStore('task', () => {
       outputFormat: defaults.outputFormat,
       selectedStems: [],
       djOutput: false,
+      xdjLayout: xdjLayout.value,
       useTta: useTta.value,
       debug: settings.developerMode,
       audioParams: settings.getAudioParams(),
@@ -1239,6 +1247,7 @@ export const useTaskStore = defineStore('task', () => {
             outputLayout: config.outputLayout,
             outputNaming: config.outputNaming,
             useTta: config.useTta,
+            xdjLayout: config.xdjLayout === true,
             debug: config.debug,
             audioParams: config.audioParams,
           },
@@ -1264,6 +1273,7 @@ export const useTaskStore = defineStore('task', () => {
           selectedStems: config.selectedStems || [],
           useTta: config.useTta,
           djOutput: config.djOutput,
+          xdjLayout: config.xdjLayout === true,
           debug: config.debug,
           audioParams: config.audioParams,
           inferenceParamsVersion: config.inferenceParamsVersion ?? CURRENT_INFERENCE_PARAMS_VERSION,
@@ -1319,6 +1329,7 @@ export const useTaskStore = defineStore('task', () => {
           selectedStems: config.selectedStems || [],
           useTta: config.useTta,
           djOutput: config.djOutput,
+          xdjLayout: config.xdjLayout === true,
           debug: config.debug,
           audioParams: config.audioParams,
           inferenceParamsVersion: config.inferenceParamsVersion ?? CURRENT_INFERENCE_PARAMS_VERSION,
@@ -1377,6 +1388,7 @@ export const useTaskStore = defineStore('task', () => {
           outputLayout: config.outputLayout,
           outputNaming: config.outputNaming,
           useTta: config.useTta,
+          xdjLayout: config.xdjLayout === true,
           debug: config.debug,
           audioParams: config.audioParams,
         },
@@ -2379,6 +2391,7 @@ export const useTaskStore = defineStore('task', () => {
     modelListPageSize,
     useTta,
     djOutput,
+    xdjLayout,
     batch_size,
     overlap_size,
     num_overlap,
