@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { isTutorialFrame, tutorialAdapter } from '../features/onboarding/demoContext.ts'
 
 export type AppStoreName = 'app-settings' | 'task-history' | 'model-state' | 'editor-ui' | 'audio-tools' | 'workflow-state' | 'separate-state' | 'update-state'
 
@@ -36,6 +37,7 @@ function readLocalStore<T>(name: AppStoreName): T | null {
 }
 
 export async function loadAppStore<T>(name: AppStoreName): Promise<T | null> {
+  if (isTutorialFrame()) return tutorialAdapter().invoke('load_app_store', { name }) as Promise<T | null>
   if (!isTauriRuntime()) {
     return readLocalStore<T>(name)
   }
@@ -51,6 +53,7 @@ export async function loadAppStore<T>(name: AppStoreName): Promise<T | null> {
 }
 
 async function writeAppStore(name: AppStoreName, data: unknown, serialized: string) {
+  if (isTutorialFrame()) { await tutorialAdapter().invoke('save_app_store', { name, data }); return }
   if (!isTauriRuntime()) {
     localStorage.setItem(localStoreKey(name), serialized)
     return

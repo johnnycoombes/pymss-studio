@@ -1,0 +1,10 @@
+.guide-coach { box-sizing: border-box; width: min(310px, calc(100vw - 32px)); padding: 20px; max-height: calc(100dvh - 76px); overflow: auto; background: var(--surface-2); color: var(--on-surface); border: 1px solid var(--outline-strong); border-radius: 12px; box-shadow: var(--shadow-soft); pointer-events: auto; }
+.guide-coach__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--on-surface-muted); font-size: 11px; }
+.guide-coach__count { margin-left: 8px; font-variant-numeric: tabular-nums; }
+.guide-coach__skip { border: 0; padding: 0; background: transparent; color: var(--on-surface-muted); font: inherit; cursor: pointer; }
+.guide-coach__skip:hover { color: var(--on-surface); }
+.guide-coach__skip:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+.guide-coach h3 { margin: 18px 0 8px; font-size: 18px; line-height: 1.4; font-weight: 600; }
+.guide-coach p { margin: 0; color: var(--on-surface-muted); font-size: 13px; line-height: 1.8; }
+.guide-coach__footer { margin-top: 21px; display: flex; align-items: center; justify-content: flex-end; gap: 16px; }
+.guide-coach__actions { display: flex; align-items: center; justify-content: flex-end; gap: 20px; margin-left: auto; }

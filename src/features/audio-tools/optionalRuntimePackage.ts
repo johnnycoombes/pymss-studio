@@ -2,6 +2,7 @@ import { ref, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { registerWindowCloseGuard } from '../../utils/windowCloseGuards.ts'
+import { workerLogRecord, type LogRecord } from '../../utils/logRecord.ts'
 
 export type OptionalPackageStatus = {
   package: string
@@ -10,6 +11,7 @@ export type OptionalPackageStatus = {
   present?: boolean
   version: string | null
   source: 'managed' | 'environment' | null
+  canUninstall?: boolean
   issue?: 'version_mismatch' | null
   runtimeIdentity: string
 }
@@ -21,6 +23,7 @@ export type OptionalPackageLogEntry = {
   timestamp: number
   level: 'stage' | 'output' | 'success' | 'error'
   message: string
+  record?: LogRecord
 }
 
 type OptionalPackageEvent = {
@@ -30,6 +33,7 @@ type OptionalPackageEvent = {
     package?: string
     action?: OptionalPackageAction
     message?: string
+    logRecord?: LogRecord
   }
 }
 
@@ -108,6 +112,8 @@ function createOptionalRuntimePackage(packageName: string): OptionalRuntimePacka
             String(payload.message || ''),
             workerEvent.type === 'optional_package_stage' ? 'stage' : 'output',
           )
+          const last = logs.value.at(-1)
+          if (last && payload.logRecord) last.record = workerLogRecord({ ...workerEvent, taskId: workerEvent.taskId || undefined, payload })
           return
         }
         if (workerEvent.type === 'optional_package_status' && payload?.package === packageName) {
@@ -177,7 +183,7 @@ function createOptionalRuntimePackage(packageName: string): OptionalRuntimePacka
     if (busy.value) throw new Error(`${packageName} package management is already running`)
     refreshSequence += 1
     checking.value = false
-    status.value = null
+    if (packageAction === 'install') status.value = null
     logs.value = []
     action.value = packageAction
     taskId.value = `optional_package_${packageName}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`

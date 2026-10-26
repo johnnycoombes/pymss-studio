@@ -95,8 +95,8 @@ function select(type: WorkflowCreateType) {
 
 <style scoped>
 .workflow-create-chooser {
-  width: min(720px, calc(100vw - 32px));
-  max-height: calc(100vh - 48px);
+  width: var(--modal-width-md);
+  max-height: var(--modal-max-height);
   display: grid;
   gap: 20px;
   padding: 22px;

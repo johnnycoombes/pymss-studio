@@ -1,6 +1,6 @@
 import type { Component } from 'vue'
 
-export type AudioToolKey = 'convert' | 'merge' | 'sdr' | 'midi' | 'inspect' | 'slicer' | 'asr'
+export type AudioToolKey = 'convert' | 'merge' | 'sdr' | 'midi' | 'inspect' | 'slicer' | 'asr' | 'loudness' | 'tempo_key'
 export type AudioToolCategory = 'convert' | 'analyze' | 'recognize' | 'edit'
 
 export type AudioToolPhase =
@@ -22,6 +22,7 @@ export type AudioToolPhase =
   | 'loading_asr_model'
   | 'recognizing_speech'
   | 'writing_transcript'
+  | 'analyzing_tempo_key'
   | 'completed'
   | 'cancelled'
   | 'failed'
@@ -41,6 +42,22 @@ export type AudioToolResultBase = {
 }
 
 export type ConvertResult = AudioToolResultBase & { operation: 'convert' }
+export type LoudnessResult = AudioToolResultBase & {
+  operation: 'loudness'
+  measurement: string
+  target: number
+  measurements?: Array<{
+    path: string
+    inputLevel: number
+    outputLevel: number
+    target: number
+    unit: 'LUFS' | 'dB' | 'dBTP'
+    withinTolerance: boolean
+    outputTruePeak?: number | null
+    maxTruePeak?: number
+    withinTruePeakLimit?: boolean
+  }>
+}
 export type MergeResult = AudioToolResultBase & {
   operation: 'merge'; merged?: number; sortBy?: 'name' | 'modified' | 'regex'; sortDirection?: 'asc' | 'desc'
 }
@@ -48,8 +65,11 @@ export type SdrResult = AudioToolResultBase & {
   operation: 'sdr'; sampleRate: number; sdr: number[]; averageSdr: number; siSdr: number[]; averageSiSdr: number
 }
 export type MidiResult = AudioToolResultBase & {
-  operation: 'midi'; bpm: number; language: string; noteCount: number; inputDuration: number
+  operation: 'midi'; action?: 'transcribe'; bpm: number; noteCount: number; inputDuration: number
   firstNoteAt: number | null; lastNoteAt: number | null
+}
+export type MidiBpmResult = AudioToolResultBase & {
+  operation: 'midi'; action: 'detect_bpm'; bpm: number; roundedBpm: number
 }
 export type AudioFormatInfo = {
   name: string; longName: string; duration: number | null; startTime: number | null
@@ -74,7 +94,9 @@ export type AsrResult = AudioToolResultBase & {
   operation: 'asr'; text: string; sentences: AsrSentence[]; segmentCount: number
   modelPreset?: string; requestedLanguage?: string; detectedLanguage?: string
 }
-export type AudioToolResult = ConvertResult | MergeResult | SdrResult | MidiResult | InspectResult | SlicerResult | AsrResult
+export type TempoKeyItem = { path: string; fileName: string; bpm: number; key: string; duration: number }
+export type TempoKeyResult = AudioToolResultBase & { operation: 'tempo_key'; items: TempoKeyItem[] }
+export type AudioToolResult = TempoKeyResult | ConvertResult | LoudnessResult | MergeResult | SdrResult | MidiResult | MidiBpmResult | InspectResult | SlicerResult | AsrResult
 
 export type AudioToolProgress = { completed: number; total: number; current: string; phase: AudioToolPhase }
 export type AudioToolLogEntry = AudioToolProgress & {

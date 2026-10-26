@@ -48,9 +48,18 @@
     },
     "rocm": {
       "platforms": [
-        "win32"
+        "win32",
+        "linux"
       ],
       "python": "3.12",
+      "platformOverrides": {
+        "linux": {
+          "torch": {
+            "requirement": "torch==2.10.0",
+            "indexUrl": "https://download.pytorch.org/whl/rocm7.1"
+          }
+        }
+      },
       "torch": {
         "requirement": "torch==2.9.1",
         "rocmRequirements": [

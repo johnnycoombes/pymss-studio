@@ -4,6 +4,9 @@ import hashlib
 import json
 import math
 import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -95,6 +98,34 @@ class _DiskMixBuffer:
         self.path.unlink(missing_ok=True)
 
 
+def _rename_export_path(temporary: Path, path: Path) -> None:
+    """Move a completed file without replacing a concurrent output."""
+    if os.name == 'nt':
+        os.rename(temporary, path)
+        return
+    import ctypes
+    import errno
+
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        rename = getattr(library, 'renamex_np', None)
+        arguments = (os.fsencode(temporary), os.fsencode(path), 0x4)  # RENAME_EXCL
+        signature = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    elif sys.platform.startswith('linux'):
+        rename = getattr(library, 'renameat2', None)
+        arguments = (-100, os.fsencode(temporary), -100, os.fsencode(path), 1)  # AT_FDCWD, RENAME_NOREPLACE
+        signature = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    else:
+        rename = None
+    if rename is None:
+        raise OSError(errno.ENOTSUP, 'Atomic output publishing is unavailable', str(path))
+    rename.argtypes = signature
+    rename.restype = ctypes.c_int
+    if rename(*arguments) != 0:
+        code = ctypes.get_errno() or errno.EIO
+        raise OSError(code, os.strerror(code), str(path))
+
+
 def _publish_export_path(temporary: Path, path: Path) -> Path:
     """Atomically publish a completed export without overwriting an earlier mix."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,17 +136,12 @@ def _publish_export_path(temporary: Path, path: Path) -> Path:
         except FileExistsError:
             continue
         except OSError:
-            # Hard links may be unavailable on some network/removable filesystems.
-            # Keep the same no-overwrite behavior, then replace only our own placeholder.
+            # Filesystems without hard links use the platform's exclusive
+            # rename operation; never expose an empty final placeholder.
             try:
-                candidate.touch(exist_ok=False)
+                _rename_export_path(temporary, candidate)
             except FileExistsError:
                 continue
-            try:
-                os.replace(temporary, candidate)
-            except Exception:
-                candidate.unlink(missing_ok=True)
-                raise
             return candidate
         try:
             temporary.unlink(missing_ok=True)
@@ -213,21 +239,78 @@ def _waveform_peaks_soundfile(path: Path, resolution: int) -> tuple[list[float],
 def _resample_audio(audio: Any, source_rate: int, target_rate: int) -> Any:
     if source_rate == target_rate:
         return audio
-    import librosa  # type: ignore
+    import numpy as np  # type: ignore
 
-    return librosa.resample(audio, orig_sr=source_rate, target_sr=target_rate)
+    try:
+        import soxr  # type: ignore
+    except ImportError:
+        import librosa  # type: ignore
+
+        return librosa.resample(audio, orig_sr=source_rate, target_sr=target_rate)
+
+    # Use the same HQ resampler as librosa without initializing its analysis/JIT
+    # modules. SoXR expects frame-first arrays; the editor uses channel-first.
+    samples = np.asarray(audio)
+    if samples.shape[-1] == 0:
+        return samples.copy()
+    resampled = soxr.resample(samples.T, source_rate, target_rate, quality="HQ").T
+    expected_frames = math.ceil(samples.shape[-1] * target_rate / source_rate)
+    if resampled.shape[-1] < expected_frames:
+        padding = [(0, 0)] * resampled.ndim
+        padding[-1] = (0, expected_frames - resampled.shape[-1])
+        resampled = np.pad(resampled, padding)
+    return resampled[..., :expected_frames]
 
 
 def _read_audio(path: Path, target_rate: int | None = None) -> tuple[Any, int]:
-    import librosa  # type: ignore
+    import soundfile as sf  # type: ignore
 
-    audio, sr = librosa.load(str(path), sr=target_rate, mono=False)
+    try:
+        audio, sr = sf.read(str(path), dtype="float32", always_2d=True)
+    except (OSError, RuntimeError):
+        # Keep librosa's decoder fallback for formats not supported by libsndfile.
+        import librosa  # type: ignore
+        import numpy as np  # type: ignore
+
+        audio, sr = librosa.load(str(path), sr=target_rate, mono=False)
+        audio = np.asarray(audio, dtype=np.float32)
+        if audio.ndim == 1:
+            audio = audio.reshape(1, -1)
+        return audio, int(sr)
+
+    audio = audio.T
+    if target_rate is not None and sr != target_rate:
+        audio = _resample_audio(audio, int(sr), target_rate)
+        sr = target_rate
+    return audio, int(sr)
+
+
+def _read_editor_audio(path: Path, target_rate: int | None = None) -> tuple[Any, int]:
+    metadata = _audio_metadata(path)
+    if int(metadata.get("channels") or 0) <= 2:
+        return _read_audio(path, target_rate)
+
+    # Use the preview decoder's layout-aware stereo downmix before applying
+    # track gain and pan. Keeping six source channels here bypasses those controls.
     import numpy as np  # type: ignore
 
-    audio = np.asarray(audio, dtype=np.float32)
-    if audio.ndim == 1:
-        audio = audio.reshape(1, -1)
-    return audio, int(sr)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to export multichannel audio")
+    rate = int(target_rate or metadata.get("sampleRate") or 0)
+    if rate <= 0:
+        raise RuntimeError("The audio source has an invalid sample rate")
+    result = subprocess.run([
+        ffmpeg, "-nostdin", "-v", "error", "-threads", "1", "-i", str(path),
+        "-map", "0:a:0", "-vn", "-ar", str(rate), "-ac", "2",
+        "-c:a", "pcm_f32le", "-f", "f32le", "pipe:1",
+    ], capture_output=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()[-2000:]
+        raise RuntimeError(f"Unable to decode multichannel audio: {detail or result.returncode}")
+    if len(result.stdout) % 8:
+        raise RuntimeError("The audio decoder returned invalid stereo PCM data")
+    return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, 2).T.copy(), rate
 
 
 def _equal_power_fade(length: int, fade_in: bool) -> Any:
@@ -267,75 +350,6 @@ def _apply_stereo_pan(audio: Any, pan: float) -> Any:
     output = audio.copy()
     output[0] *= left_gain
     output[1] *= right_gain
-    return output
-
-
-def _apply_track_effects(audio: Any, effects: Any, sample_rate: int) -> Any:
-    """Apply the editor's lightweight, non-destructive track effects."""
-    if not isinstance(effects, dict):
-        return audio
-    reverb = max(0.0, min(1.0, float(effects.get("reverb", 0) or 0)))
-    delay = max(0.0, min(1.0, float(effects.get("delay", 0) or 0)))
-    delay_time = max(0.05, min(1.2, float(effects.get("delayTime", 0.24) or 0.24)))
-    clarity = max(0.0, min(1.0, float(effects.get("clarity", 0) or 0)))
-    compressor = max(0.0, min(1.0, float(effects.get("compressor", 0) or 0)))
-    if reverb <= 0 and delay <= 0 and clarity <= 0 and compressor <= 0:
-        return audio
-
-    import numpy as np  # type: ignore
-
-    if audio.ndim == 1:
-        audio = audio.reshape(1, -1)
-    base = audio.astype(np.float32, copy=False)
-    rate = max(1, int(sample_rate))
-
-    if clarity > 0:
-        try:
-            from scipy.signal import lfilter  # type: ignore
-
-            cutoff = 20.0 + clarity * 180.0
-            rc = 1.0 / (2.0 * math.pi * cutoff)
-            alpha = rc / (rc + 1.0 / rate)
-            filtered = np.empty_like(base)
-            for channel in range(base.shape[0]):
-                filtered[channel] = lfilter([alpha, -alpha], [1.0, -alpha], base[channel])
-            base = filtered
-        except Exception:
-            # Keep export available in minimal runtimes without scipy.
-            pass
-
-    output_base = base.copy()
-    if compressor > 0:
-        threshold = 10.0 ** ((-36.0 + compressor * 14.0) / 20.0)
-        ratio = 1.0 + compressor * 7.0
-        magnitude = np.abs(output_base)
-        compressed = np.where(
-            magnitude > threshold,
-            threshold + (magnitude - threshold) / ratio,
-            magnitude,
-        )
-        output_base *= compressed / np.maximum(magnitude, 1e-6)
-
-    taps: list[tuple[int, float]] = []
-
-    # A short, deterministic multi-tap tail gives offline export the same
-    # musical character as the live Web Audio convolution preview without
-    # requiring an additional DSP dependency.
-    if reverb > 0:
-        for seconds, tap_gain in ((0.071, 0.34), (0.113, 0.27), (0.181, 0.21), (0.293, 0.15), (0.457, 0.10), (0.691, 0.06)):
-            taps.append((int(rate * seconds), reverb * tap_gain))
-
-    if delay > 0:
-        for repeat in range(1, 6):
-            taps.append((int(rate * delay_time * repeat), delay * (0.46 ** repeat)))
-
-    tail = max((delay_samples for delay_samples, _ in taps), default=0)
-    output = np.zeros((output_base.shape[0], output_base.shape[-1] + tail), dtype=np.float32)
-    output[:, :output_base.shape[-1]] = output_base
-    for delay_samples, gain in taps:
-        delay = max(1, delay_samples)
-        output[:, delay:delay + output_base.shape[-1]] += output_base * gain
-
     return output
 
 
@@ -482,7 +496,7 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             track for track in tracks
             if not track.get("muted") and (track.get("sourceId") or track.get("clips"))
         ]
-        has_solo = any(bool(track.get("solo")) for track in active_tracks)
+        has_solo = any(bool(track.get("solo")) for track in tracks)
         audio_cache: dict[str, tuple[Any, int]] = {}
         target_rate: int | None = None
         rendered_clip_count = 0
@@ -525,7 +539,7 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             if not path.is_file():
                 raise FileNotFoundError(str(path))
 
-            audio, sr = _read_audio(path, target_rate)
+            audio, sr = _read_editor_audio(path, target_rate)
             if target_rate is None:
                 target_rate = sr
             elif sr != target_rate:
@@ -575,6 +589,11 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
                 for _, _, source in render_items
                 if int(source.get("sampleRate") or 0) > 0
             }
+            # Native plugin renders use the preview clock; keep the original sources'
+            # sample-rate selection for the final automatic export encoding.
+            original_rate = int(project.get("sourceSampleRate") or 0)
+            if 8000 <= original_rate <= 48000:
+                source_rates = {original_rate}
             if not source_rates:
                 for source in {str(item[2].get("id") or item[2].get("path")): item[2] for item in render_items}.values():
                     metadata = _audio_metadata(Path(source.get("path") or ""))
@@ -589,7 +608,7 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             planned_channels = 1
             planned_samples = 0
             for track, clip, source in render_items:
-                source_channels = max(1, int(source.get("channels") or 1))
+                source_channels = min(2, max(1, int(source.get("channels") or 1)))
                 if source_channels == 1 and abs(float(track.get("pan", 0.0) or 0.0)) > 1e-6:
                     source_channels = 2
                 planned_channels = max(planned_channels, source_channels)
@@ -598,16 +617,9 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
                 duration_seconds = float(clip.get("duration", 0) or 0)
                 if duration_seconds <= 0:
                     duration_seconds = max(0.0, float(source.get("duration", 0) or 0) - offset_seconds)
-                effects = track.get("effects") if isinstance(track.get("effects"), dict) else {}
-                tail_samples = 0
-                if float(effects.get("reverb", 0) or 0) > 0:
-                    tail_samples = max(tail_samples, int(target_rate * 0.691))
-                if float(effects.get("delay", 0) or 0) > 0:
-                    delay_time = max(0.05, min(1.2, float(effects.get("delayTime", 0.24) or 0.24)))
-                    tail_samples = max(tail_samples, int(target_rate * delay_time * 5))
                 planned_samples = max(
                     planned_samples,
-                    start_samples + max(0, int(duration_seconds * target_rate)) + tail_samples,
+                    start_samples + max(0, int(duration_seconds * target_rate)),
                 )
             if planned_samples > 0:
                 mix_buffer = _DiskMixBuffer(
@@ -661,7 +673,6 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
                 if fade_out_samples > 0:
                     segment[:, -fade_out_samples:] *= _linear_fade(fade_out_samples, False)
 
-                segment = _apply_track_effects(segment, track.get("effects"), sr)
                 end = start + segment.shape[-1]
                 segment_channels = segment.shape[0]
                 rendered_channels = max(rendered_channels, segment_channels)
@@ -716,7 +727,12 @@ def cmd_export_editor_mix(payload: dict[str, Any]) -> int:
             audio_params.get("wav_bit_depth") or audio_params.get("wavBitDepth") or "PCM_24"
         ).upper()
         float_output = output_format == "wav" and requested_wav_subtype == "FLOAT"
-        peak_protection = True if not float_output or peak_protection_value is None else bool(peak_protection_value)
+        peak_protection = bool(peak_protection_value)
+        if not float_output and peak > 1.0 and not peak_protection:
+            return fail(
+                "EDITOR_EXPORT_PEAK_EXCEEDED",
+                "Mix peaks exceed the output format's range. Lower the master volume, use WAV FLOAT, or enable peak protection.",
+            )
         peak_adjustment_db = 0.0
         peak_protection_applied = peak_protection and peak > 1.0
         output_gain = 1.0

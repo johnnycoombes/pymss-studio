@@ -18,7 +18,6 @@ def _vocal_to_midi(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("BPM must be between 30 and 300") from error
     if not math.isfinite(bpm) or bpm < 30 or bpm > 300:
         raise ValueError("BPM must be between 30 and 300")
-    language = str(payload.get("language") or "").strip().lower() or None
 
     emit("audio_tool_progress", {
         "operation": "midi",
@@ -47,7 +46,6 @@ def _vocal_to_midi(payload: dict[str, Any]) -> dict[str, Any]:
             audio_path=input_path,
             output_dir=output_dir,
             tempo=bpm,
-            language=language,
             progress_callback=report_progress,
         )
         output_path = inference_result.output_path.resolve()
@@ -56,7 +54,6 @@ def _vocal_to_midi(payload: dict[str, Any]) -> dict[str, Any]:
         "outputDir": str(output_dir),
         "outputPath": str(output_path),
         "bpm": bpm,
-        "language": inference_result.language or "auto",
         "noteCount": inference_result.note_count,
         "inputDuration": inference_result.input_duration,
         "firstNoteAt": inference_result.first_note_at,

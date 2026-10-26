@@ -50,6 +50,27 @@ class WorkerToolsTests(unittest.TestCase):
         self.assertEqual(event["payload"]["operation"], "asr")
         self.assertEqual(event["payload"]["recovery"]["modelIds"], ["model-id"])
 
+    def test_audio_tool_progress_events_inherit_request_id(self) -> None:
+        def handler(_: object) -> dict[str, str]:
+            worker_tools.emit("audio_tool_progress", {"phase": "working"})
+            return {"operation": "loudness"}
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(worker_tools, "get_audio_tool_handler", return_value=handler),
+            redirect_stdout(output),
+        ):
+            code = worker_tools.cmd_audio_tools({"operation": "loudness", "requestId": "loudness-request-1"})
+            worker_tools.emit("audio_tool_progress", {"phase": "after"})
+
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(code, 0)
+        self.assertEqual([event["type"] for event in events], ["audio_tool_progress", "audio_tool_result", "audio_tool_progress"])
+        self.assertEqual(events[0]["requestId"], "loudness-request-1")
+        self.assertEqual(events[1]["requestId"], "loudness-request-1")
+        # The binding is scoped to the handler call and must not leak afterwards.
+        self.assertIsNone(events[2]["requestId"])
+
     def test_mp3_and_ogg_bitrate_capabilities_are_distinct(self) -> None:
         self.assertNotIn("450k", tool_convert.MP3_BIT_RATES)
         self.assertIn("450k", tool_convert.OGG_BIT_RATES)
@@ -112,7 +133,7 @@ class WorkerToolsTests(unittest.TestCase):
                 (input_dir / name).write_bytes(b"")
 
             with (
-                mock.patch.object(tool_merge, "_run_ffmpeg") as run_ffmpeg,
+                mock.patch.object(tool_merge, "_run_ffmpeg", side_effect=lambda arguments: Path(arguments[-1]).write_bytes(b'audio')) as run_ffmpeg,
                 mock.patch.object(tool_merge, "emit"),
             ):
                 result = tool_merge._merge_audio({
@@ -209,7 +230,6 @@ class WorkerToolsTests(unittest.TestCase):
                     first_note_at=0.5,
                     last_note_at=7.5,
                     warnings=(),
-                    language="zh",
                 )
 
             stdout = io.StringIO()
@@ -233,11 +253,11 @@ class WorkerToolsTests(unittest.TestCase):
         self.assertEqual(call["model_path"], model_path.resolve())
         self.assertEqual(call["audio_path"], input_path.resolve())
         self.assertEqual(call["tempo"], 128)
-        self.assertEqual(call["language"], "zh")
+        self.assertNotIn("language", call)
         self.assertTrue(callable(call["progress_callback"]))
         self.assertEqual(result["outputPath"], str(output_path.resolve()))
         self.assertEqual(result["noteCount"], 12)
-        self.assertEqual(result["language"], "zh")
+        self.assertNotIn("language", result)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("third-party diagnostic", stderr.getvalue())
         worker_emit.assert_any_call("audio_tool_progress", {

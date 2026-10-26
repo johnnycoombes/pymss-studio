@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["audio-host", "vst2-host", "aax-probe", "vendor/soundcraft-au-host", "vendor/soundcraft-vst3-host", "vendor/soundcraft-dsp"]
+
+[workspace.package]
+version = "0.12.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+repository = "https://github.com/storytold/soundcraft"
+
+[workspace.dependencies]
+soundcraft-dsp = { path = "vendor/soundcraft-dsp" }
+soundcraft-vst3-host = { path = "vendor/soundcraft-vst3-host" }
+soundcraft-au-host = { path = "vendor/soundcraft-au-host" }
+pymss-vst2-host = { path = "vst2-host" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+log = "0.4"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.dev.package."*"]
+opt-level = 2

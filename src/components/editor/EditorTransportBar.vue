@@ -18,6 +18,7 @@ import {
 } from '@vicons/ionicons5'
 import { formatTime } from '@/utils/editorTime'
 import type { TransportPendingAction, TransportVisualState } from '@/stores/editorPlayback'
+import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
 
 const props = defineProps<{
   sessionName: string
@@ -39,6 +40,7 @@ const props = defineProps<{
   missingAssetPreview?: string[]
   relinkingMissingAssets?: boolean
   recordingState?: 'idle' | 'preparing' | 'recording' | 'stopping'
+  recordingStartDisabled?: boolean
   recordingDevices?: Array<{ deviceId: string; label: string }>
   recordingDeviceId?: string
   recordingInputLevel?: number
@@ -216,9 +218,9 @@ function clearTransportPressed() {
                   class="transport-record"
                   type="button"
                   :class="{ 'transport-record--active': recordingActive }"
-                  :disabled="disabled || recordingPending"
+                  :disabled="disabled || recordingPending || (!recordingActive && recordingStartDisabled)"
                   :aria-label="recordingActive ? t('editor.recordingStop') : t('editor.recordingStart')"
-                  :title="recordingActive ? t('editor.recordingStop') : t('editor.recordingStart')"
+                  :title="recordingActive ? t('editor.recordingStop') : t(recordingStartDisabled ? 'editor.recordingImportPending' : 'editor.recordingStart')"
                   @click.stop="emit('toggleRecording')"
                 >
                   <n-icon :component="recordingActive ? StopOutline : Mic" />
@@ -310,8 +312,11 @@ function clearTransportPressed() {
               <strong>{{ t('editor.masterVolume') }}</strong>
               <span>{{ masterVolumePercent }}</span>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="masterVolume"
+              :reset-value="1"
+              :label="t('editor.masterVolume')"
+              :reset-label="t('editor.sliderDefaultVolume')"
               :min="0"
               :max="2"
               :step="0.01"
@@ -325,8 +330,11 @@ function clearTransportPressed() {
               <strong>{{ t('editor.balanceShort') }}</strong>
               <span>{{ formatTrackPan(masterPan) }}</span>
             </div>
-            <n-slider
+            <EditorParameterSlider
               :value="masterPan"
+              :reset-value="0"
+              :label="t('editor.balanceShort')"
+              :reset-label="t('editor.sliderDefaultCenter')"
               :min="-1"
               :max="1"
               :step="0.01"
@@ -343,7 +351,7 @@ function clearTransportPressed() {
             <template #icon><n-icon :component="SaveOutline" /></template>
             {{ t('editor.save') }}
           </n-button>
-          <n-button type="primary" size="small" :loading="exporting" :disabled="disabled || recordingActive || recordingPending" @click="emit('export')">
+          <n-button class="transport-export" type="primary" size="small" :loading="exporting" :disabled="disabled || recordingActive || recordingPending" @click="emit('export')">
             <template #icon><n-icon :component="DownloadOutline" /></template>
             {{ t('editor.export') }}
           </n-button>
@@ -499,6 +507,18 @@ function clearTransportPressed() {
 
 .transport-history {
   justify-content: flex-end;
+}
+
+@container editor-shell (max-width: 1100px) {
+  .editor-transport__brand { flex: 1 1 140px; }
+  .editor-transport__center { grid-template-columns: auto auto max-content; gap: 8px; }
+  .editor-transport__actions { gap: 6px; }
+}
+
+@container editor-shell (max-width: 900px) {
+  .editor-transport__brand { flex-basis: 35%; }
+  .editor-transport__actions { flex: 1 0 auto; }
+  .editor-transport__center { order: 1; flex: 1 0 100%; justify-content: center; }
 }
 
 .transport-chip,

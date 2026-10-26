@@ -13,6 +13,20 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SIGNING_TEMP="$(mktemp -d)"
+cleanup_signing_temp() {
+  rm -f -- "$SIGNING_TEMP/existing.plist" "$SIGNING_TEMP/merged.plist"
+  rmdir -- "$SIGNING_TEMP"
+}
+trap cleanup_signing_temp EXIT
+
+# Read before signing nested code: the app signature owns the entry point's
+# entitlements, and re-signing it must preserve unrelated permissions.
+codesign --display --entitlements :- "$APP_PATH" > "$SIGNING_TEMP/existing.plist"
+python3 "$SCRIPT_ROOT/merge-macos-plugin-entitlements.py" \
+  "$SIGNING_TEMP/existing.plist" "$SCRIPT_ROOT/../src-tauri/entitlements.plugins.plist" \
+  "$SIGNING_TEMP/merged.plist"
 
 sign_file() {
   local path="$1"
@@ -66,4 +80,5 @@ for path in sorted(paths, key=lambda item: (item.count(os.sep), len(item)), reve
 PY
 )
 
-codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP_PATH"
+codesign --force --sign "$SIGN_IDENTITY" --timestamp=none --options runtime \
+  --entitlements "$SIGNING_TEMP/merged.plist" "$APP_PATH"

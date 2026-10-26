@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -78,7 +79,7 @@ class WorkerOutputPathTests(unittest.TestCase):
         source.write_bytes(b"input")
         target = (self.default.parent / " delivery ").resolve()
         pymss = ModuleType("pymss")
-        pymss.get_separation_logger = mock.Mock(return_value=mock.Mock())
+        pymss.get_separation_logger = mock.Mock(return_value=logging.Logger("output-path-test"))
         separator = SimpleNamespace(
             process_folder=mock.Mock(return_value=[source.name]),
             studio_outputs=mock.Mock(return_value=[]), close=mock.Mock(),
@@ -136,7 +137,7 @@ class WorkerOutputPathTests(unittest.TestCase):
         source = self.root / "song.wav"
         source.touch()
         pymss = ModuleType("pymss")
-        pymss.get_separation_logger = mock.Mock(return_value=mock.Mock())
+        pymss.get_separation_logger = mock.Mock(return_value=logging.Logger("output-path-test"))
         separator = SimpleNamespace(
             process_folder=mock.Mock(return_value=[source.name]),
             studio_outputs=mock.Mock(return_value=[]), close=mock.Mock(),

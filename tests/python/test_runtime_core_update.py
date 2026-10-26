@@ -64,20 +64,63 @@ def probe(backend: str, *, pymss: str = "2.1.4", core: str = "0.1.6", graph: boo
     }
 
 
+class RuntimeCoreVersionTests(unittest.TestCase):
+    def test_version_queries_use_pypi_even_when_release_versions_are_pinned(self):
+        pinned = manifest()
+        pinned["common"].update({"pymss": "pymss[proxy]==2.1.4", "pymss-core": "pymss-core==0.1.6"})
+        with mock.patch.object(worker_bootstrap, "_manifest", return_value=pinned), \
+             mock.patch.object(worker_bootstrap, "_latest_pypi_version", side_effect=["2.2.0", "0.2.0"]) as latest, \
+             mock.patch.object(worker_bootstrap, "_emit") as emit:
+            self.assertEqual(worker_bootstrap.cmd_runtime_core_versions({}), 0)
+        self.assertEqual(latest.call_args_list, [mock.call("pymss", "stable"), mock.call("pymss-core", "stable")])
+        self.assertEqual(emit.call_args.args[1]["packages"]["pymss"]["latestVersion"], "2.2.0")
+
+    def test_unavailable_index_is_not_reported_as_the_bundled_latest(self):
+        with mock.patch.object(worker_bootstrap, "_latest_pypi_version", side_effect=OSError("unavailable")), \
+             mock.patch.object(worker_bootstrap, "_emit") as emit:
+            worker_bootstrap.cmd_runtime_core_versions({})
+        self.assertIsNone(emit.call_args.args[1]["packages"]["pymss"]["latestVersion"])
+        self.assertIn("error", emit.call_args.args[1]["packages"]["pymss"])
+
+    def test_newer_core_is_healthy_but_old_core_and_changed_torch_are_rejected(self):
+        pinned = manifest()
+        pinned["common"].update({"pymss": "pymss[proxy]==2.1.4", "pymss-core": "pymss-core==0.1.6"})
+        current = probe("cpu", pymss="3.0.0", core="1.0.0")
+        self.assertEqual(worker_bootstrap._runtime_health("cpu", current, pinned), "ready")
+        self.assertFalse(worker_bootstrap._manifest_versions_are_satisfied(probe("cpu", pymss="2.1.3"), pinned, "cpu")[0])
+        self.assertFalse(worker_bootstrap._manifest_versions_are_satisfied({**current, "torchVersion": "2.8.0"}, pinned, "cpu")[0])
+
+    def test_resolved_dependencies_extend_overlay_but_cannot_replace_accelerator_packages(self):
+        requirements = ["pymss[proxy]==2.2.0", "pymss-core==0.2.0"]
+        resolved = worker_bootstrap._resolved_overlay_requirements(requirements, {"version": "1", "install": [
+            {"metadata": {"name": "pymss", "version": "2.2.0"}},
+            {"metadata": {"name": "new-audio-dependency", "version": "1.0"}},
+        ]})
+        self.assertIn("pymss[proxy]==2.2.0", resolved)
+        self.assertIn("new-audio-dependency==1.0", resolved)
+        for name in ("torch", "torchvision", "torchaudio", "triton", "mlx", "mlx-metal", "nvidia-cublas-cu12", "rocm-sdk-core"):
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "base accelerator"):
+                worker_bootstrap._resolved_overlay_requirements(requirements, {"version": "1", "install": [{"metadata": {"name": name, "version": "9.0"}}]})
+        with self.assertRaisesRegex(RuntimeError, "unsupported installation report"):
+            worker_bootstrap._resolved_overlay_requirements(requirements, {"version": "2", "install": []})
+
+
 class RuntimeOverlayUpdateTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        # Temporary roots may use Windows short names or macOS /var symlinks.
+        self.root = Path(tempfile.mkdtemp()).resolve()
         self.envs = self.root / "runtime-envs"
         self.envs.mkdir()
         self.active = self.envs / "active-runtime.json"
         self.addCleanup(shutil.rmtree, self.root, True)
 
-    def make_env(self, backend="cpu", *, manifest_version="2026.09.2", bundled=False):
+    def make_env(self, backend="cpu", *, manifest_version="2026.09.2", bundled=False, platform="win32", bootstrap=False):
         runtime_root = self.root / "bundled-envs" if bundled else self.envs
         env = runtime_root / backend
-        python = env / "Scripts" / "python.exe"
+        python = runtime_root.parent / "bin/python3" if bootstrap else env / ("Scripts/python.exe" if platform == "win32" else "bin/python")
         python.parent.mkdir(parents=True, exist_ok=True)
         python.write_text("stub", encoding="utf-8")
+        env.mkdir(parents=True, exist_ok=True)
         state = {
             "backend": backend,
             "manifestVersion": manifest_version,
@@ -92,11 +135,14 @@ class RuntimeOverlayUpdateTests(unittest.TestCase):
             "pymssGraphAvailable": True,
         }
         (env / "pymss-runtime-state.json").write_text(json.dumps(state), encoding="utf-8")
-        self.active.write_text(json.dumps({
+        active_state = {
             **state,
             "pythonPath": str(python),
             "source": "bundled" if bundled else "managed",
-        }), encoding="utf-8")
+        }
+        self.active.write_text(json.dumps(active_state), encoding="utf-8")
+        if bootstrap:
+            (runtime_root / "active-runtime.json").write_text(json.dumps(active_state), encoding="utf-8")
         return runtime_root, env, python
 
     def run_update(
@@ -110,46 +156,167 @@ class RuntimeOverlayUpdateTests(unittest.TestCase):
         manifest_value=None,
         repair=False,
         audio_error=None,
+        platform="win32",
+        bootstrap=False,
+        latest_versions=None,
+        installed_probe=None,
+        resolved_packages=None,
+        prepare_only=False,
+        after_plan=None,
+        mode=None,
+        channel="stable",
+        rollback_after=False,
+        state_overrides=None,
     ):
-        bundled_root, env, python = self.make_env(backend, manifest_version=manifest_version, bundled=bundled)
+        bundled_root, env, python = self.make_env(backend, manifest_version=manifest_version, bundled=bundled, platform=platform, bootstrap=bootstrap)
+        if state_overrides:
+            for path in (self.active, env / "pymss-runtime-state.json"):
+                state = json.loads(path.read_text(encoding="utf-8"))
+                path.write_text(json.dumps({**state, **state_overrides}), encoding="utf-8")
         base = probe(backend, pymss="2.1.3")
         final = overlay_probe or probe(backend)
-        probe_calls = [base, final]
+        probe_calls = [base, base, final]
         commands = []
 
+        def live_versions(_python, _names, overlay=None):
+            if overlay:
+                active = json.loads(self.active.read_text(encoding="utf-8"))
+                if active.get("overlayPath"):
+                    return active["packageVersions"]
+            return (installed_probe or base)["packageVersions"]
+
         def popen(command, **kwargs):
-            commands.append(command)
-            del kwargs
+            command_status = 0 if "--dry-run" in command else pip_status
+            if "--dry-run" in command:
+                self.assertNotIn("--target", command)
+                self.assertNotIn("--no-deps", command)
+                constraints = Path(command[command.index("--constraint") + 1]).read_text(encoding="utf-8")
+                self.assertIn(f"torch=={base['torchVersion']}", constraints)
+                selected = {name: version for name, version in final["packageVersions"].items() if base["packageVersions"].get(name) != version}
+                selected.update(resolved_packages or {})
+                Path(command[command.index("--report") + 1]).write_text(json.dumps({"version": "1", "install": [
+                    {"metadata": {"name": name, "version": version}} for name, version in selected.items()
+                ]}), encoding="utf-8")
+            else:
+                commands.append(command)
+            if platform == "darwin" and bootstrap:
+                self.assertEqual(kwargs["env"]["PYTHONHOME"], str(bundled_root.parent))
             return mock.Mock(
                 stdout=iter(["pip output\n"]),
-                wait=mock.Mock(return_value=pip_status),
-                returncode=pip_status,
-                poll=mock.Mock(return_value=pip_status),
+                wait=mock.Mock(return_value=command_status),
+                returncode=command_status,
+                poll=mock.Mock(return_value=command_status),
             )
 
         with mock.patch.object(worker_bootstrap, "RUNTIME_ENVS_DIR", self.envs), \
              mock.patch.object(worker_bootstrap, "ACTIVE_RUNTIME_FILE", self.active), \
              mock.patch.object(worker_bootstrap, "BUNDLED_RUNTIME_ENVS_DIR", bundled_root if bundled else None), \
              mock.patch.object(worker_bootstrap, "_manifest", return_value=manifest_value or manifest()), \
-             mock.patch.object(worker_bootstrap, "_latest_pypi_version", side_effect=lambda name: {"pymss": "2.1.4", "pymss-core": "0.1.6"}[name]), \
-             mock.patch.object(worker_bootstrap, "_probe_python_runtime", side_effect=lambda *_args, **_kwargs: probe_calls.pop(0) if probe_calls else final), \
+             mock.patch.object(worker_bootstrap, "_latest_pypi_version", side_effect=lambda name, channel="stable": (latest_versions or {"pymss": "2.1.4", "pymss-core": "0.1.6"})[name]) as latest, \
+             mock.patch.object(worker_bootstrap, "_probe_python_package_versions", side_effect=live_versions), \
+             mock.patch.object(worker_bootstrap, "_probe_python_runtime", side_effect=lambda *_args, **_kwargs: probe_calls.pop(0) if probe_calls else (base if rollback_after else final)), \
              mock.patch.object(worker_bootstrap, "_verify_runtime_audio", side_effect=audio_error) as audio_probe, \
-             mock.patch.object(worker_bootstrap, "_ensure_runtime_pip"), \
+             mock.patch.object(worker_bootstrap, "_runtime_pip_works", return_value=True), \
              mock.patch.object(worker_bootstrap.subprocess, "Popen", side_effect=popen), \
-             mock.patch.object(sys, "platform", "win32"), \
+             mock.patch.object(sys, "platform", platform), \
              contextlib.redirect_stdout(io.StringIO()) as output:
-            result = worker_bootstrap.cmd_update_runtime_core({
+            payload = {
                 "backend": backend,
                 "pythonPath": str(python),
                 "mirror": "pypi",
                 "taskId": "overlay-update",
                 "repairDependencies": repair,
-            })
-            if result == 0:
-                audio_probe.assert_called_once()
+                "mode": mode,
+                "channel": channel,
+            }
+            result = worker_bootstrap.cmd_update_runtime_core({**payload, "prepareOnly": True})
+            if result == 0 and not prepare_only:
+                plan = next(json.loads(line)["payload"] for line in output.getvalue().splitlines() if json.loads(line)["type"] == "runtime_core_update_plan")
+                if after_plan:
+                    after_plan(plan, self.active)
+                result = worker_bootstrap.cmd_update_runtime_core({**payload, "planId": plan["id"]})
+                if result == 0 and rollback_after:
+                    probe_calls.extend([base, base, base])
+                    restore = {**payload, "mode": "rollback", "prepareOnly": True}
+                    result = worker_bootstrap.cmd_update_runtime_core(restore)
+                    self.assertEqual(result, 0)
+                    plans = [json.loads(line)["payload"] for line in output.getvalue().splitlines() if json.loads(line)["type"] == "runtime_core_update_plan"]
+                    result = worker_bootstrap.cmd_update_runtime_core({**payload, "mode": "rollback", "planId": plans[-1]["id"]})
+                    with mock.patch.object(worker_bootstrap, "_detect_gpu_vendors", return_value=[]):
+                        self.assertTrue(worker_bootstrap._runtime_info_payload({})["rollbackAvailable"])
+            self.assertLessEqual(latest.call_count, 2)
+            if result == 0 and not prepare_only:
+                self.assertEqual(audio_probe.call_count, 2 if rollback_after else 1)
                 self.assertEqual(audio_probe.call_args.args[0], python)
-                self.assertEqual(audio_probe.call_args.args[1].name, "site-packages")
+                if rollback_after:
+                    self.assertIsNone(audio_probe.call_args.args[1])
+                else:
+                    self.assertEqual(audio_probe.call_args.args[1].name, "site-packages")
         return result, commands, env, python, [json.loads(line) for line in output.getvalue().splitlines()]
+
+    def test_update_can_exceed_release_pins_and_install_new_dependencies(self):
+        pinned = manifest()
+        pinned["common"].update({"pymss": "pymss[proxy]==2.1.4", "pymss-core": "pymss-core==0.1.6"})
+        result, commands, _env, _python, _events = self.run_update(
+            manifest_value=pinned, latest_versions={"pymss": "2.2.0", "pymss-core": "0.2.0"},
+            overlay_probe=probe("cpu", pymss="2.2.0", core="0.2.0"),
+            resolved_packages={"new-audio-dependency": "1.0"},
+        )
+        self.assertEqual(result, 0)
+        self.assertIn("pymss[proxy]==2.2.0", commands[0])
+        self.assertIn("pymss-core==0.2.0", commands[0])
+        self.assertIn("new-audio-dependency==1.0", commands[0])
+        self.assertEqual(json.loads(self.active.read_text(encoding="utf-8"))["pymssVersion"], "2.2.0")
+
+    def test_repair_keeps_live_newer_core_instead_of_stale_state_or_release_pins(self):
+        pinned = manifest()
+        pinned["common"].update({"pymss": "pymss[proxy]==2.1.4", "pymss-core": "pymss-core==0.1.6"})
+        current = probe("cpu", pymss="2.2.0", core="0.2.0")
+        result, commands, *_ = self.run_update(
+            manifest_value=pinned, repair=True, installed_probe=current, overlay_probe=current,
+            latest_versions={"pymss": None, "pymss-core": None},
+        )
+        self.assertEqual(result, 0)
+        self.assertIn("pymss[proxy]==2.2.0", commands[0])
+        self.assertIn("pymss-core==0.2.0", commands[0])
+
+    def test_synchronization_never_downgrades_a_newer_installed_core(self):
+        current = probe("cpu", pymss="2.2.0", core="0.2.0")
+        result, commands, *_ = self.run_update(mode="sync", installed_probe=current, overlay_probe=current)
+        self.assertEqual(result, 0)
+        self.assertIn("pymss[proxy]==2.2.0", commands[0])
+
+    def test_accelerator_dependency_resolution_failure_preserves_active_environment(self):
+        result, commands, *_ = self.run_update(resolved_packages={"torch": "2.8.0"})
+        self.assertNotEqual(result, 0)
+        self.assertEqual(commands, [])
+        self.assertNotIn("overlayPath", json.loads(self.active.read_text(encoding="utf-8")))
+
+    def test_missing_latest_version_does_not_install_or_modify_the_active_environment(self):
+        result, commands, *_ = self.run_update(latest_versions={"pymss": None, "pymss-core": None})
+        self.assertNotEqual(result, 0)
+        self.assertEqual(commands, [])
+        self.assertNotIn("overlayPath", json.loads(self.active.read_text(encoding="utf-8")))
+
+    def test_changed_torch_is_not_activated(self):
+        result, _commands, *_ = self.run_update(overlay_probe={**probe("cpu"), "torchVersion": "2.8.0"})
+        self.assertNotEqual(result, 0)
+        self.assertNotIn("overlayPath", json.loads(self.active.read_text(encoding="utf-8")))
+
+    def check_bundled_platform_update(self, platform, backend, *, bootstrap=False):
+        result, commands, env, python, _events = self.run_update(
+            backend, platform=platform, bundled=True, bootstrap=bootstrap,
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(commands[0][0], str(python))
+        self.assertEqual(json.loads((env / "pymss-runtime-state.json").read_text(encoding="utf-8"))["manifestVersion"], "2026.09.2")
+        self.assertTrue(Path(json.loads(self.active.read_text(encoding="utf-8"))["overlayPath"]).is_relative_to(self.envs))
+
+    def test_linux_bundled_environment_uses_a_user_overlay(self):
+        self.check_bundled_platform_update("linux", "cpu")
+
+    def test_macos_bundled_bootstrap_uses_a_user_overlay(self):
+        self.check_bundled_platform_update("darwin", "mlx", bootstrap=True)
 
     def test_success_builds_overlay_without_torch_or_base_mutation(self):
         result, commands, _env, python, events = self.run_update("cuda")
@@ -171,7 +338,7 @@ class RuntimeOverlayUpdateTests(unittest.TestCase):
         self.assertEqual(active["manifestVersion"], "2026.09.3")
         self.assertEqual(
             [event["payload"]["stage"] for event in events if event["type"] == "runtime_core_update_stage"],
-            ["prepare", "manifest", "verify", "activate"],
+            ["prepare", "resolve", "prepare", "update", "verify", "activate"],
         )
 
     def test_only_base_unsatisfied_requirements_are_added_to_overlay(self):
@@ -183,7 +350,7 @@ class RuntimeOverlayUpdateTests(unittest.TestCase):
         result, commands, *_ = self.run_update(manifest_value=current, overlay_probe=final)
         self.assertEqual(result, 0)
         command = commands[0]
-        self.assertIn("new-package>=1,<2", command)
+        self.assertIn("new-package==1.2.0", command)
         self.assertNotIn("av>=14,<15", command)
         self.assertNotIn("numpy>=1.26,<3", command)
 
@@ -240,7 +407,7 @@ class RuntimeOverlayUpdateTests(unittest.TestCase):
         result, _commands, *_ = self.run_update()
         self.assertEqual(result, 0)
         generations = [path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")]
-        self.assertEqual(len(generations), 2)
+        self.assertEqual(len(generations), 1)
         self.assertFalse(stale_staging.exists())
 
 

@@ -204,11 +204,11 @@ fn bundled_runtime_envs_from(resource: Option<&Path>, exe_dir: &Path) -> Option<
 }
 
 pub fn runtime_envs_dir(app: &AppHandle) -> AppResult<PathBuf> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(feature = "vst-lab", target_os = "macos", target_os = "linux"))]
     {
         Ok(data_root_dir(app)?.join("runtime-envs"))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(feature = "vst-lab", target_os = "macos", target_os = "linux")))]
     {
         Ok(runtime_root_dir(app)?.join("runtime-envs"))
     }
@@ -296,7 +296,65 @@ pub(crate) fn write_json_file(path: &Path, data: &Value) -> AppResult<()> {
     write_json_file_locked(path, data)
 }
 
+pub(crate) fn write_editor_project_file(path: &Path, data: &Value) -> AppResult<()> {
+    let _write_guard = JSON_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    backup_pre_plugin_project(path, data).map_err(|error| {
+        AppError::Worker(format!("Could not preserve the original editor project at {}: {error}", path.display()))
+    })?;
+    write_json_file_locked(path, data)
+}
+
+fn backup_pre_plugin_project(path: &Path, data: &Value) -> AppResult<()> {
+    let backup = path.with_file_name("project.pre-plugins.json");
+    match std::fs::symlink_metadata(&backup) {
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => return Err(AppError::Worker(format!("The project backup is not a regular file: {}", backup.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let previous: Value = serde_json::from_slice(&content)?;
+    let has_legacy_effects = previous.get("tracks").and_then(Value::as_array)
+        .is_some_and(|tracks| tracks.iter().any(|track| track.get("effects").is_some_and(Value::is_object)));
+    if previous.get("version").and_then(Value::as_u64).unwrap_or(0) >= 4
+        || (!has_legacy_effects && data.get("version").and_then(Value::as_u64).unwrap_or(0) < 4)
+    {
+        return Ok(());
+    }
+
+    // Publish a fully synced copy before replacing the project. A second writer
+    // cannot replace the first upgrade snapshot, including across processes.
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    file.write_all(&content)?;
+    file.as_file().sync_all()?;
+    match file.persist_noclobber(&backup) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if std::fs::symlink_metadata(&backup)?.is_file() {
+                Ok(())
+            } else {
+                Err(error.error.into())
+            }
+        }
+        Err(error) => Err(error.error.into()),
+    }
+}
+
 fn write_json_file_locked(path: &Path, data: &Value) -> AppResult<()> {
+    write_json_file_with_replace(path, data, replace_file)
+}
+
+fn write_json_file_with_replace(
+    path: &Path,
+    data: &Value,
+    replace: impl FnOnce(&Path, &Path) -> AppResult<()>,
+) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -319,8 +377,20 @@ fn write_json_file_locked(path: &Path, data: &Value) -> AppResult<()> {
         file.write_all(&content)?;
         file.sync_all()?;
         drop(file);
-        replace_file(&temporary, path)
+        replace(&temporary, path)
     })();
+    #[cfg(windows)]
+    if let Err(AppError::Io(error)) = &result {
+        // ReplaceFileW can remove/rename the old file before reporting these errors.
+        // The complete, synced replacement is then the only copy of the latest save.
+        if matches!(error.raw_os_error(), Some(1176 | 1177)) {
+            return Err(AppError::Worker(format!(
+                "Failed to save {}: {error}. Recovery file retained at {}",
+                path.display(),
+                temporary.display(),
+            )));
+        }
+    }
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
@@ -582,7 +652,7 @@ fn replace_file(temporary: &Path, destination: &Path) -> AppResult<()> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    for attempt in 0..4 {
+    retry_file_replacement(|| {
         let replaced = unsafe {
             ReplaceFileW(
                 destination.as_ptr(),
@@ -594,14 +664,28 @@ fn replace_file(temporary: &Path, destination: &Path) -> AppResult<()> {
             )
         };
         if replaced != 0 {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
         }
-        let error = std::io::Error::last_os_error();
-        // Antivirus/indexer scans and a just-released WebView handle can briefly hold the
-        // destination. Keep the temp file intact and retry only those transient Win32 errors.
-        let retryable = matches!(error.raw_os_error(), Some(5 | 32 | 33));
-        if !retryable || attempt == 3 {
-            return Err(error.into());
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn retry_file_replacement(mut replace: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    for attempt in 0..6 {
+        match replace() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // 1175 (ERROR_UNABLE_TO_REMOVE_REPLACED) leaves both names intact, so it
+                // is safe to retry just like sharing violations. Never retry 1176/1177:
+                // those indicate a partially completed replacement.
+                let retryable = matches!(error.raw_os_error(), Some(5 | 32 | 33 | 1175));
+                if !retryable || attempt == 5 {
+                    return Err(error);
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(40 * (attempt + 1) as u64));
     }
@@ -1012,6 +1096,217 @@ mod tests {
         assert_eq!(stored, json!({ "value": 2 }));
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_upgrade_backup_preserves_original_bytes_and_is_never_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let backup = root.path().join("project.pre-plugins.json");
+        let original = b"{\n  \"id\": \"old\", \"version\": 3, \"tracks\": [{\"effects\": {\"delay\": 0.3}}], \"future\": [1, 2]\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let mut next: serde_json::Value = serde_json::from_slice(original).unwrap();
+        // Autosave/enrichment can run before the user adds their first plugin.
+        next["name"] = json!("Renamed");
+        super::write_editor_project_file(&path, &next).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        next["version"] = json!(4);
+        next["pluginChain"] = json!([{ "id": "slot", "state": "sha256:retained" }]);
+        super::write_editor_project_file(&path, &next).unwrap();
+        super::write_editor_project_file(&path, &next).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved, next);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn editor_upgrade_backup_covers_v3_without_effects_but_not_new_or_existing_v4_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let backup = root.path().join("project.pre-plugins.json");
+        let old = json!({ "id": "project", "version": 3, "tracks": [] });
+        super::write_editor_project_file(&path, &old).unwrap();
+        super::write_editor_project_file(&path, &old).unwrap();
+        assert!(!backup.exists());
+        let upgraded = json!({ "id": "project", "version": 4, "masterLimiter": { "enabled": true } });
+        super::write_editor_project_file(&path, &upgraded).unwrap();
+        let stored: serde_json::Value = serde_json::from_slice(&std::fs::read(&backup).unwrap()).unwrap();
+        assert_eq!(stored, old);
+        let new_root = tempfile::tempdir().unwrap();
+        let new_path = new_root.path().join("project.json");
+        super::write_editor_project_file(&new_path, &upgraded).unwrap();
+        super::write_editor_project_file(&new_path, &upgraded).unwrap();
+        assert!(!new_root.path().join("project.pre-plugins.json").exists());
+    }
+
+    #[test]
+    fn editor_upgrade_backup_failure_keeps_original_project_until_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let backup = root.path().join("project.pre-plugins.json");
+        let old = b"{\"id\":\"project\",\"version\":3}";
+        std::fs::write(&path, old).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        let next = json!({ "id": "project", "version": 4 });
+        let error = super::write_editor_project_file(&path, &next).unwrap_err();
+        assert!(error.to_string().contains("Could not preserve the original editor project"));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::remove_dir(&backup).unwrap();
+        super::write_editor_project_file(&path, &next).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), old);
+    }
+
+    #[test]
+    fn editor_upgrade_backup_serializes_concurrent_first_saves() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let old = b"{\"id\":\"project\",\"version\":3}";
+        std::fs::write(&path, old).unwrap();
+        std::thread::scope(|scope| {
+            for revision in 1..=4 {
+                let path = &path;
+                scope.spawn(move || super::write_editor_project_file(path, &json!({
+                    "id": "project", "version": 4, "revision": revision
+                })).unwrap());
+            }
+        });
+        assert_eq!(std::fs::read(root.path().join("project.pre-plugins.json")).unwrap(), old);
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 4);
+        assert!(saved["revision"].as_u64().is_some_and(|revision| (1..=4).contains(&revision)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn json_save_retries_unable_to_remove_replaced_without_touching_the_old_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let old = br#"{"revision":1}"#;
+        std::fs::write(&path, old).unwrap();
+        let mut attempts = 0;
+        super::write_json_file_with_replace(&path, &json!({ "revision": 2 }), |temp, dest| {
+            super::retry_file_replacement(|| {
+                attempts += 1;
+                assert_eq!(std::fs::read(dest).unwrap(), old);
+                let pending: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(temp).unwrap()).unwrap();
+                assert_eq!(pending, json!({ "revision": 2 }));
+                if attempts < 3 {
+                    Err(std::io::Error::from_raw_os_error(1175))
+                } else {
+                    std::fs::rename(temp, dest)
+                }
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, json!({ "revision": 2 }));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn persistent_replacement_failure_is_bounded_and_keeps_the_previous_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        let old = br#"{"revision":1}"#;
+        std::fs::write(&path, old).unwrap();
+        let mut attempts = 0;
+        let error = super::write_json_file_with_replace(&path, &json!({ "revision": 2 }), |_, _| {
+            super::retry_file_replacement(|| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(1175))
+            })?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 6);
+        assert!(matches!(error,
+            crate::error::AppError::Io(error) if error.raw_os_error() == Some(1175)));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn partial_replacements_are_not_retried_and_keep_a_complete_recovery_file() {
+        for code in [1176, 1177] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("project.json");
+            std::fs::write(&path, br#"{"revision":1}"#).unwrap();
+            let mut recovery = PathBuf::new();
+            let mut attempts = 0;
+            let error = super::write_json_file_with_replace(
+                &path,
+                &json!({ "revision": 2 }),
+                |temp, dest| {
+                    recovery = temp.to_path_buf();
+                    super::retry_file_replacement(|| {
+                        attempts += 1;
+                        if code == 1176 {
+                            std::fs::remove_file(dest)?;
+                        } else {
+                            std::fs::rename(dest, root.path().join("original.json"))?;
+                        }
+                        Err(std::io::Error::from_raw_os_error(code))
+                    })?;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(!path.exists());
+            assert!(error.to_string().contains(&recovery.display().to_string()));
+            let pending: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(recovery).unwrap()).unwrap();
+            assert_eq!(pending, json!({ "revision": 2 }));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_transient_file_errors_fail_without_retrying() {
+        for code in [2, 87, 112] {
+            let mut attempts = 0;
+            let error = super::retry_file_replacement(|| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(code))
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn json_save_succeeds_after_a_windows_reader_releases_its_handle() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("project.json");
+        write_json_file(&path, &json!({ "revision": 1 })).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(reader);
+        });
+        let result = write_json_file(&path, &json!({ "revision": 2 }));
+        release.join().unwrap();
+        result.unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, json!({ "revision": 2 }));
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[test]

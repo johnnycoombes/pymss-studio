@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 /**
  * Litegraph-based node editor for comfy-mss workflows.
  *
@@ -6,7 +8,7 @@
  * directly as native comfy-mss JSON; serialize() output is handed to the parent
  * via v-model:definition, and pymss.graph.load_comfy_file consumes it verbatim.
  */
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
 import { AddOutline, ArrowRedoOutline, ArrowUndoOutline, ExpandOutline, SearchOutline } from '@vicons/ionicons5'
@@ -40,9 +42,117 @@ import type { NodeSpec } from '@/litegraph/nodeSpecs'
 import { translateNodeCategory, translateNodeTitle, type NodeTranslator } from '@/litegraph/nodeLocalization'
 import { isGraphWorkflowDefinition } from '@/workflows/formats'
 import { applyGraphDefaultWidgets, type GraphDefaults } from '@/workflows/graphDefaults'
+import { registerPluginNodeSpecs } from '@/litegraph/registerNodes'
+import { pluginRevision } from '@/features/plugin-marketplace/composable'
 
-// All node specs the palette offers (pymss nodes + ComfyUI builtin audio/string nodes).
-const ALL_SPECS: Record<string, NodeSpec> = { ...NODE_SPECS, ...BUILTIN_SPECS }
+const studioLog = createLogger('ui.components.workflow.WorkflowNodeEditorLite')
+
+// All node specs the palette offers (pymss + ComfyUI builtin + plugin-contributed).
+const ALL_SPECS = reactive<Record<string, NodeSpec>>({ ...NODE_SPECS, ...BUILTIN_SPECS })
+let disposed = false
+let pluginNodeLoadId = 0
+
+type PluginNodeDecl = {
+  type?: string
+  title?: string
+  category?: string
+  description?: string
+  registered?: boolean
+  pluginId?: string
+  inputs?: { name?: string; type?: string; widget?: string }[]
+  outputs?: { name?: string; type?: string }[]
+  widgets?: { name?: string; type?: string; default?: unknown; min?: number; max?: number; step?: number; options?: string[] }[]
+}
+
+/** Plugin node types the worker reports as not registered (plugin broken or
+ *  its runtime missing). Nodes of these types on canvas are flagged. */
+const unregisteredPluginNodes = ref<Map<string, string>>(new Map())
+const knownPluginNodeTypes = new Set<string>()
+const originalPluginNodeStyles = new WeakMap<LGraphNode, { color?: string; bgcolor?: string }>()
+
+/** Fetch plugin node declarations and merge them into the spec pool. */
+async function loadPluginNodeSpecs() {
+  if (disposed || typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
+  const request = ++pluginNodeLoadId
+  try {
+    const response = await invoke<{ nodes?: PluginNodeDecl[] }>('list_nodes')
+    if (disposed || request !== pluginNodeLoadId) return
+    const declarations = Array.isArray(response?.nodes) ? response.nodes : []
+    const PORT_VALUES = ['AUDIO', 'STRING', 'COMBO', 'BOOLEAN', 'PYMSS_MSS_PARAMS', 'PYMSS_VR_PARAMS'] as const
+    type PortName = typeof PORT_VALUES[number]
+    const toPort = (value: unknown): PortName => ((PORT_VALUES as readonly string[]).includes(String(value)) ? String(value) : 'AUDIO') as PortName
+    const specs: NodeSpec[] = declarations.map(decl => ({
+      type: String(decl.type || ''),
+      title: String(decl.title || decl.type || ''),
+      category: String(decl.category || 'pymss/plugins'),
+      inputs: (decl.inputs || []).map(port => ({
+        name: String(port.name || ''),
+        type: toPort(port.type),
+        widget: port.widget ? { name: String(port.widget) } : undefined,
+      })),
+      outputs: (decl.outputs || []).map(port => ({
+        name: String(port.name || ''),
+        type: toPort(port.type),
+      })),
+      widgets: (decl.widgets || []).map(widget => ({
+        name: String(widget.name || ''),
+        type: (['toggle', 'combo', 'number'].includes(String(widget.type)) ? String(widget.type) : 'text') as 'text',
+        default: widget.default as string | number | boolean,
+        options: widget.options,
+      })),
+    })).filter(spec => spec.type && !NODE_SPECS[spec.type] && !BUILTIN_SPECS[spec.type])
+    registerPluginNodeSpecs(specs)
+    const types = new Set(specs.map(spec => spec.type))
+    const removed = Object.keys(ALL_SPECS).filter(type => !NODE_SPECS[type] && !BUILTIN_SPECS[type]
+      && !types.has(type))
+    for (const type of removed) delete ALL_SPECS[type]
+    for (const spec of specs) {
+      ALL_SPECS[spec.type] = spec
+      knownPluginNodeTypes.add(spec.type)
+    }
+    const broken = new Map<string, string>()
+    for (const type of knownPluginNodeTypes) {
+      if (!types.has(type)) broken.set(type, type)
+    }
+    for (const decl of declarations) {
+      if (decl.type && decl.registered === false) broken.set(decl.type, decl.pluginId || decl.type)
+    }
+    unregisteredPluginNodes.value = broken
+    flagUnregisteredNodes()
+  } catch (error) {
+    if (disposed || request !== pluginNodeLoadId) return
+    console.warn('[workflow] plugin nodes unavailable', error)
+  }
+}
+
+/** Mark on-canvas nodes whose plugin executor is missing: red-tinted so the
+ *  user sees WHY the workflow would fail before running it. */
+function flagUnregisteredNodes() {
+  const graph = graphRef.value
+  if (!graph) return
+  for (const node of graph.nodes || []) updatePluginNodeStatus(node)
+  canvasRef.value?.setDirty(true, true)
+}
+
+function updatePluginNodeStatus(node: LGraphNode) {
+  const type = String(node.type)
+  const missing = unregisteredPluginNodes.value.get(type)
+    || (!NODE_SPECS[type] && !BUILTIN_SPECS[type] && node.has_errors ? type : undefined)
+  if (missing) {
+    if (!originalPluginNodeStyles.has(node)) originalPluginNodeStyles.set(node, { color: node.color, bgcolor: node.bgcolor })
+    node.color = '#5a2d2d'
+    node.bgcolor = '#3b1f1f'
+    ;(node as any).pymssMissingPlugin = missing
+  } else {
+    const original = originalPluginNodeStyles.get(node)
+    if (original) {
+      node.color = original.color
+      node.bgcolor = original.bgcolor
+      delete (node as any).pymssMissingPlugin
+      originalPluginNodeStyles.delete(node)
+    }
+  }
+}
 
 const props = withDefaults(defineProps<{
   readonly?: boolean
@@ -280,6 +390,7 @@ const paletteCategories = computed(() => {
   locale.value
   const groups: Record<string, { type: string; title: string }[]> = {}
   for (const spec of Object.values(ALL_SPECS)) {
+    if (spec.hidden) continue
     const cat = translateNodeCategory(spec.category || 'pymss', nodeTranslator)
     ;(groups[cat] ||= []).push({
       type: spec.type,
@@ -416,7 +527,7 @@ function initializeGraph() {
       throw new Error(t('workflows.graphEditorFormatRequired'))
     }
   } catch (error) {
-    console.error('[workflow-node-editor] failed to restore graph', error)
+    studioLog.error('[workflow-node-editor] failed to restore graph', error)
     reportLoadError(error)
     return
   }
@@ -451,7 +562,7 @@ watch(definition, () => {
     emit('initialized')
     ;(canvasRef.value as any)?.setDirty(true, true)
   } catch (error) {
-    console.error('[workflow-node-editor] failed to hydrate late graph definition', error)
+    studioLog.error('[workflow-node-editor] failed to hydrate late graph definition', error)
     reportLoadError(error)
   }
 })
@@ -459,6 +570,15 @@ watch(definition, () => {
 // --- lifecycle -------------------------------------------------------------
 let disposeCanvasDpi: (() => void) | null = null
 let executionResizeObserver: ResizeObserver | null = null
+function disableEmptyCanvasDoubleClick(event: PointerEvent) {
+  const canvas = canvasRef.value
+  const graph = graphRef.value
+  if (!canvas || !graph || event.button !== 0) return
+  const [x, y] = canvas.graph_mouse
+  if (!graph.getNodeOnPos(x, y, canvas.visible_nodes) && !graph.getGroupOnPos(x, y)) {
+    canvas.pointer.onDoubleClick = undefined
+  }
+}
 function fitExecutionCanvas() {
   const canvas = canvasRef.value
   const element = canvasEl.value
@@ -475,8 +595,10 @@ function fitExecutionCanvas() {
   canvas.setDirty(true, true)
 }
 
-onMounted(() => {
+onMounted(async () => {
   registerPymssNodes(nodeTranslator)
+  await loadPluginNodeSpecs()
+  if (disposed) return
   applyTheme()
   if (!canvasEl.value) return
   const graph = new LGraph()
@@ -488,9 +610,9 @@ onMounted(() => {
   canvasRef.value = canvas
   // Transient host display only; node styles, selection and serialized JSON stay native.
   canvas.onDrawForeground = drawRunningNodes
-  // Native double-click and connection searches retain LiteGraph's port filters.
   // Track link/property edits so separate node stems follow the chosen model.
   graph.onNodeAdded = (node: any) => {
+    updatePluginNodeStatus(node)
     if (ready.value && !configuringGraph) {
       applyGraphDefaultWidgets([node], {
         device: props.defaultDevice,
@@ -501,6 +623,8 @@ onMounted(() => {
     if (ready.value) scheduleSnap()
   }
   if (canvasRef.value) canvasRef.value.read_only = Boolean(props.readonly)
+  // Run after LiteGraph's capture listener has selected this gesture's actions.
+  canvasEl.value.addEventListener('pointerdown', disableEmptyCanvasDoubleClick, true)
   document.addEventListener('keyup', restoreReadonlyAfterKeyup, true)
   canvasEl.value.addEventListener('keydown', onCanvasKey)
   window.addEventListener('keydown', onEditorKey)
@@ -513,11 +637,14 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
+  pluginNodeLoadId++
   if (pendingSnap) cancelAnimationFrame(pendingSnap)
   pendingSnap = 0
   disposeCanvasDpi?.()
   disposeCanvasDpi = null
   executionResizeObserver?.disconnect()
+  canvasEl.value?.removeEventListener('pointerdown', disableEmptyCanvasDoubleClick, true)
   canvasEl.value?.removeEventListener('keydown', onCanvasKey)
   window.removeEventListener('keydown', onEditorKey)
   document.removeEventListener('keyup', restoreReadonlyAfterKeyup, true)
@@ -527,6 +654,8 @@ onBeforeUnmount(() => {
   graphRef.value = null
   canvasRef.value = null
 })
+
+watch(pluginRevision, () => { void loadPluginNodeSpecs() })
 
 function seedStarterGraph() {
   const graph = graphRef.value
@@ -685,6 +814,9 @@ function configureGraphNode(node: LGraphNode) {
     <slot v-else name="execution-progress" />
     <div class="canvas-wrap">
       <canvas ref="canvasEl" class="lg-canvas" tabindex="0" :aria-label="t('workflows.nodeEditor')" />
+      <div v-if="!ready && !loadError" class="canvas-loading" role="status">
+        <n-spin size="small" /><span>{{ t('workflows.advancedEditor.loadingNodes') }}</span>
+      </div>
       <div v-if="loadError" class="canvas-error" role="alert">
         <n-result status="error" :title="t('workflows.advancedEditor.loadFailed')" :description="loadError">
           <template #footer><n-button secondary @click="onClose">{{ t('workflows.returnToWorkflows') }}</n-button></template>
@@ -695,6 +827,7 @@ function configureGraphNode(node: LGraphNode) {
 </template>
 
 <style scoped>
+.canvas-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--on-surface-muted); }
 .litegraph-editor { display: flex; flex-direction: column; height: 100%; min-height: 0; gap: 10px; color: var(--on-surface); }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; padding: 10px 16px; border: 1px solid var(--outline); border-radius: 16px; background: var(--surface-1); }
 .toolbar__title { display: flex; align-items: center; flex: 1 1 200px; min-width: 0; }

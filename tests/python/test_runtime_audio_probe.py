@@ -4,8 +4,10 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 if __package__:
@@ -14,9 +16,32 @@ else:
     import _bootstrap as _worker_test_bootstrap
 
 import worker_bootstrap
+import runtime_audio_probe
 
 
 class RuntimeAudioProbeTests(unittest.TestCase):
+    def test_core_api_checks_reject_a_breaking_graph_interface_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "resources").mkdir()
+            (root / "resources/model_catalog.json").write_text('{"models": []}', encoding="utf-8")
+            modules = {
+                "pymss": SimpleNamespace(__file__=str(root / "__init__.py"), MSSeparator=type("Separator", (), {"process_folder": lambda *_args: None}), get_separation_logger=lambda: None),
+                "pymss.config": SimpleNamespace(load_config=lambda: None, to_plain=lambda: None),
+                "pymss.model_registry": SimpleNamespace(**{name: lambda: None for name in ("get_model_entry", "list_models", "model_root", "model_path_for", "config_path_for", "auxiliary_paths_for")}),
+                "pymss.graph": SimpleNamespace(**{name: lambda: None for name in ("compile_workflow_to_dag", "load_comfy_file", "run_dag", "SeparatorCache", "DAGNode", "DAGLink", "get_node_type", "register_node")}),
+            }
+            with mock.patch.object(runtime_audio_probe.importlib, "import_module", side_effect=modules.__getitem__):
+                runtime_audio_probe.verify_core_api()
+                del modules["pymss.graph"].run_dag
+                with self.assertRaisesRegex(RuntimeError, "pymss.graph.run_dag"):
+                    runtime_audio_probe.verify_core_api()
+
+    def test_core_update_verification_requests_the_desktop_api_contract_check(self) -> None:
+        with mock.patch.object(worker_bootstrap.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            worker_bootstrap._verify_runtime_audio(Path(sys.executable), Path("staging"), core_api=True)
+        self.assertIn("--check-core", run.call_args.args[0])
+
     def test_audio_decode_and_resampling_keep_both_channels(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(_worker_test_bootstrap.WORKER_DIR / "runtime_audio_probe.py")],

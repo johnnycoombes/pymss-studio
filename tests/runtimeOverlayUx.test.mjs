@@ -6,9 +6,10 @@ const appSource = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8
 const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
 const manifest = JSON.parse(readFileSync(new URL('../python/runtime-manifest.json', import.meta.url), 'utf8'))
 
-test('an older runtime manifest is synchronized before model metadata is loaded', () => {
-  assert.match(appSource, /async function synchronizeRuntimeManifest\(\)/)
-  assert.match(appSource, /app\.updateRuntimeCore\(backend, 'auto', locale\.value/)
+test('an older runtime only prompts for confirmation and model preloading waits for dependency synchronization', () => {
+  assert.doesNotMatch(appSource, /app\.updateRuntimeCore\(/)
+  assert.doesNotMatch(appSource, /synchronizeRuntimeManifest|runtimeAutoSyncActive/)
+  assert.match(appSource, /runtimeCorePromptVisible\.value = true/)
   assert.match(mainSource, /!runtimeCoreSyncAvailable\(activeRuntime, runtime\.manifestVersion\)/)
 })
 

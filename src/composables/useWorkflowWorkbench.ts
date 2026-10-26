@@ -97,9 +97,7 @@ export function useWorkflowWorkbench(options: {
             await connected.attach(key)
             if (!disposed && options.workflowKey.value === key) {
               remoteReady = true
-              if (detectWorkflowFormat(options.definition()) === 'simple') {
-                await connected.remember(key, cloneWorkflow(store.session(key)))
-              }
+              await connected.remember(key, cloneWorkflow(store.session(key)))
             }
           } catch (error) { if (!disposed) message.error(String(error)) }
         }, { immediate: true }))

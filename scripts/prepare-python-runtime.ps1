@@ -54,7 +54,9 @@ function Get-ManifestBackendExtras {
     )
     $backendProperty = $runtimeManifest.backends.PSObject.Properties[$Backend]
     if (!$backendProperty) { return @() }
-    return @($backendProperty.Value.extras | ForEach-Object { [string]$_ })
+    return @($backendProperty.Value.extras |
+        Where-Object { ![string]::IsNullOrWhiteSpace([string]$_) } |
+        ForEach-Object { [string]$_ })
 }
 
 function Resolve-ManifestBackend {
@@ -278,7 +280,7 @@ if ($InitialBackend) {
             $env:PATH = ($rocmToolDirs + $previousPath) -join ";"
         }
         Invoke-NativeChecked -FilePath $envPython -Arguments @('-c', "import importlib.util, pymss, pymss.graph, torch, librosa, av, yaml, tqdm; print('pymss', getattr(pymss, '__version__', 'unknown'), pymss.__file__); print('torch', torch.__version__, 'cuda', torch.version.cuda, 'cuda_available', torch.cuda.is_available()); print('librosa', librosa.__version__); print('av', av.__version__); print('mlx', importlib.util.find_spec('mlx') is not None)")
-        Invoke-NativeChecked -FilePath $envPython -Arguments @((Join-Path $root "python\runtime_audio_probe.py"))
+        Invoke-NativeChecked -FilePath $envPython -Arguments @((Join-Path $root "python\runtime_audio_probe.py"), '--check-core')
 
         # Step 5: Read manifest version and write state files
         $manifestVersion = $runtimeManifest.manifestVersion
@@ -443,7 +445,7 @@ Assert-BootstrapRuntime -PythonPath $runtimePython
 $previousDontWriteBytecode = $env:PYTHONDONTWRITEBYTECODE
 $env:PYTHONDONTWRITEBYTECODE = "1"
 Invoke-NativeChecked -FilePath $runtimePython -Arguments @('-c', "import importlib.util, pymss, pymss.graph, torch, librosa, av, yaml, tqdm; print('pymss', getattr(pymss, '__version__', 'unknown'), pymss.__file__); print('torch', torch.__version__, 'cuda', torch.version.cuda, 'cuda_available', torch.cuda.is_available()); print('librosa', librosa.__version__); print('av', av.__version__); print('mlx', importlib.util.find_spec('mlx') is not None)")
-Invoke-NativeChecked -FilePath $runtimePython -Arguments @((Join-Path $root "python\runtime_audio_probe.py"))
+Invoke-NativeChecked -FilePath $runtimePython -Arguments @((Join-Path $root "python\runtime_audio_probe.py"), '--check-core')
 if ($null -eq $previousDontWriteBytecode) {
     Remove-Item Env:\PYTHONDONTWRITEBYTECODE -ErrorAction SilentlyContinue
 } else {

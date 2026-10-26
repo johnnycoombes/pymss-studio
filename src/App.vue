@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { darkTheme } from 'naive-ui'
@@ -7,6 +9,8 @@ import SideNav from '@/components/SideNav.vue'
 import { isMainTaskOwner } from '@/utils/taskOwner'
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import StartupOnboarding from '@/components/StartupOnboarding.vue'
+import BeginnerGuide from '@/components/BeginnerGuide.vue'
+import { useBeginnerGuideStore } from '@/stores/beginnerGuide'
 import ViewportRecoveryOverlay from '@/components/ViewportRecoveryOverlay.vue'
 import { useSettingsStore } from '@/stores/settings'
 import { useAppStore } from '@/stores/app'
@@ -19,10 +23,13 @@ import { useWorkflowStore } from '@/stores/workflow'
 import { useToastStore } from '@/stores/toast'
 import { useWorkbenchStore } from '@/stores/workbench'
 import type { WorkflowRuntimeBindings } from '@/workflows/workbench'
-import { activeRuntimeEnvironment, isKnownRuntimeBackend, runtimeBackendLabel, runtimeCoreSyncAvailable, runtimeCoreUpdateAvailable as hasRuntimeCoreUpdate } from '@/utils/runtime'
+import { activeRuntimeEnvironment, runtimeBackendLabel, runtimeCoreSyncAvailable, runtimeCoreUpdateAvailable as hasRuntimeCoreUpdate } from '@/utils/runtime'
 import { connectWorkerEvents } from '@/utils/events'
 
+const studioLog = createLogger('ui.App')
+
 const settings = useSettingsStore()
+const beginnerGuide = useBeginnerGuideStore()
 const app = useAppStore()
 watch([() => settings.initialized, () => app.envInfo], ([initialized, env]) => {
   if (initialized && env?.torchAvailable) settings.reconcileRuntimeDevice(env)
@@ -31,7 +38,7 @@ const updates = useUpdateStore()
 const workflow = useWorkflowStore()
 const route = useRoute()
 const router = useRouter()
-const { t, locale } = useI18n()
+const { t } = useI18n()
 const bootReady = ref(false)
 const backgroundWarmupsStarted = ref(false)
 const deferredPromptShown = ref(false)
@@ -43,8 +50,6 @@ const manualUpdateModalVisible = ref(false)
 const manualUpdateError = ref('')
 const runtimeCorePromptVisible = ref(false)
 const runtimeCorePromptShown = ref(false)
-const runtimeAutoSyncActive = ref(false)
-const runtimeAutoSyncAttempted = ref(false)
 const workflowEventUnlisteners: UnlistenFn[] = []
 let unmounted = false
 
@@ -59,6 +64,9 @@ const resolvedTheme = computed(() => {
   return getResolvedThemeTokens(settings.themeMode, settings.themeAccent)
 })
 const showStartupOnboarding = computed(() => bootReady.value && !isStandaloneRoute.value && settings.shouldShowStartupOnboarding)
+const beginnerGuideEnabled = computed(() => bootReady.value && settings.initialized && isMainTaskOwner()
+  && !isStandaloneRoute.value && !showStartupOnboarding.value && !deferredUpdateModalVisible.value
+  && !manualUpdateModalVisible.value && !runtimeCorePromptVisible.value && !updates.isInstallOverlayVisible)
 const deferredUpdatePrompt = computed(() => updates.updateIsPrerelease
   ? t('settings.updatePrereleaseDeferredPrompt', { version: updates.latestVersion })
   : t('settings.updateDeferredPrompt', { version: updates.latestVersion }))
@@ -66,17 +74,18 @@ const manualUpdatePrompt = computed(() => updates.updateMessage || t('settings.u
 const activeRuntime = computed(() => activeRuntimeEnvironment(app.runtimeInfo))
 const runtimeVersionUpdateAvailable = computed(() => hasRuntimeCoreUpdate(
   activeRuntime.value,
-  app.runtimeCoreVersions?.packages?.pymss?.latestVersion,
-  app.runtimeCoreVersions?.packages?.['pymss-core']?.latestVersion,
+  app.runtimeCoreVersions,
   app.runtimeInfo?.manifestVersion,
 ))
 const runtimeManifestSyncRequired = computed(() => runtimeCoreSyncAvailable(
   activeRuntime.value,
   app.runtimeInfo?.manifestVersion,
 ))
-const runtimeCoreUpdateAvailable = computed(() => runtimeVersionUpdateAvailable.value || runtimeManifestSyncRequired.value)
+const runtimeCoreUpdateAvailable = computed(() => app.runtimeCoreUpdateSupported && (runtimeVersionUpdateAvailable.value || runtimeManifestSyncRequired.value))
+const runtimeCorePromptBlocked = computed(() => app.runtimeInfoLoading || app.runtimeCoreVersionsLoading
+  || ['preparing', 'prepared', 'updating'].includes(app.runtimeCoreUpdateStatus))
 const runtimeCorePromptContent = computed(() => t(
-  runtimeManifestSyncRequired.value && !runtimeVersionUpdateAvailable.value
+  runtimeManifestSyncRequired.value
     ? 'settings.runtimeCoreStartupSyncPrompt'
     : 'settings.runtimeCoreStartupPrompt',
   {
@@ -153,7 +162,7 @@ function startBackgroundWarmups() {
 
 async function reconnectWorkerEvents() {
   await connectWorkerEvents(app).catch((error) => {
-    console.warn('Failed to reconnect worker events', error)
+    studioLog.warn('Failed to reconnect worker events', error)
   })
 }
 
@@ -176,6 +185,7 @@ function showManualUpdatePrompt() {
 
 async function openManualUpdate() {
   const url = updates.manualInstallUrl || 'https://github.com/pymss-project/pymss-studio/releases/latest'
+  manualUpdateError.value = ''
   try {
     await open(url)
     manualUpdateModalVisible.value = false
@@ -185,37 +195,14 @@ async function openManualUpdate() {
 }
 
 function showRuntimeCorePrompt() {
-  if (runtimeAutoSyncActive.value || runtimeCorePromptShown.value || !bootReady.value || isStandaloneRoute.value || !runtimeCoreUpdateAvailable.value) return
-  if (runtimeManifestSyncRequired.value && !runtimeAutoSyncAttempted.value) return
+  if (!app.runtimeCoreUpdateSupported || runtimeCorePromptBlocked.value || !runtimeCoreUpdateAvailable.value || isStandaloneRoute.value) {
+    runtimeCorePromptVisible.value = false
+    return
+  }
+  if (runtimeCorePromptShown.value || !bootReady.value || showStartupOnboarding.value || beginnerGuide.visible
+    || !settings.beginnerGuideInvitationSeen) return
   runtimeCorePromptShown.value = true
   runtimeCorePromptVisible.value = true
-}
-
-async function synchronizeRuntimeManifest() {
-  if (
-    runtimeAutoSyncAttempted.value
-    || runtimeAutoSyncActive.value
-    || !bootReady.value
-    || showStartupOnboarding.value
-    || isStandaloneRoute.value
-    || !runtimeManifestSyncRequired.value
-  ) return
-  const runtime = activeRuntime.value
-  const backend = String(runtime?.backend || '')
-  if (!runtime?.pythonPath || !isKnownRuntimeBackend(backend)) return
-
-  runtimeAutoSyncAttempted.value = true
-  runtimeAutoSyncActive.value = true
-  runtimeCorePromptVisible.value = false
-  try {
-    await app.updateRuntimeCore(backend, 'auto', locale.value, {
-      pythonPath: runtime.pythonPath,
-    })
-  } catch {
-    runtimeAutoSyncActive.value = false
-    runtimeCorePromptShown.value = false
-    showRuntimeCorePrompt()
-  }
 }
 
 function openRuntimeSettings() {
@@ -225,6 +212,10 @@ function openRuntimeSettings() {
 
 async function installDeferredUpdate() {
   if (deferredUpdateInstalling.value) return
+  if (updates.installationBlockedReason) {
+    deferredUpdateError.value = updates.installationBlockedReason
+    return
+  }
   deferredUpdateInstalling.value = true
   deferredUpdateError.value = ''
   deferredUpdateModalVisible.value = false
@@ -232,6 +223,7 @@ async function installDeferredUpdate() {
     await updates.downloadAndInstall()
   } catch (error) {
     deferredUpdateError.value = error instanceof Error ? error.message : String(error)
+    if (!updates.isInstallOverlayVisible) deferredUpdateModalVisible.value = true
   } finally {
     deferredUpdateInstalling.value = false
   }
@@ -258,7 +250,7 @@ async function listenForMainWorkflowEvent<T>(event: string, handler: EventCallba
 
 function handleWorkflowEditorClosed(kind: 'advanced' | 'simple', label?: string) {
   void workflow.handleEditorClosed(kind, label).catch((error) => {
-    console.warn('Failed to refresh workflows after editor closed', error)
+    studioLog.warn('Failed to refresh workflows after editor closed', error)
   })
 }
 
@@ -271,7 +263,7 @@ onMounted(async () => {
       workflow.applyEditorSnapshot(event.payload)
     })
     if (isMainTaskOwner() && !isStandaloneRoute.value) {
-      try { await workflow.refreshEditorWindows() } catch (error) { console.warn('Failed to refresh workflow editors', error) }
+      try { await workflow.refreshEditorWindows() } catch (error) { studioLog.warn('Failed to refresh workflow editors', error) }
     }
     await listenForMainWorkflowEvent<{ label?: string }>('pymss://workflow-node-editor-closed', event => {
       handleWorkflowEditorClosed('advanced', event.payload?.label)
@@ -325,26 +317,9 @@ watch([bootReady, () => updates.requiresManualInstall, () => updates.latestVersi
   showManualUpdatePrompt()
 }, { immediate: true })
 
-watch([bootReady, isStandaloneRoute, runtimeCoreUpdateAvailable], () => {
-  if (isStandaloneRoute.value) {
-    runtimeCorePromptVisible.value = false
-    return
-  }
+watch([bootReady, showStartupOnboarding, isStandaloneRoute, runtimeCoreUpdateAvailable, runtimeCorePromptBlocked, () => beginnerGuide.visible], () => {
   showRuntimeCorePrompt()
 }, { immediate: true })
-
-watch([bootReady, showStartupOnboarding, isStandaloneRoute, runtimeManifestSyncRequired], () => {
-  void synchronizeRuntimeManifest()
-}, { immediate: true })
-
-watch(() => app.runtimeCoreUpdateStatus, (status) => {
-  if (!runtimeAutoSyncActive.value || status === 'updating' || status === 'idle') return
-  runtimeAutoSyncActive.value = false
-  if (status !== 'success') {
-    runtimeCorePromptShown.value = false
-    showRuntimeCorePrompt()
-  }
-})
 
 const themeOverrides = computed(() => {
   void isDark.value
@@ -357,7 +332,7 @@ const themeOverrides = computed(() => {
     <n-notification-provider>
       <n-message-provider>
         <n-dialog-provider>
-        <div class="app-shell" :class="{ 'app-shell--editor': isStandaloneRoute, 'app-shell--workflow-node-editor': isStandaloneRoute && isWorkflowEditorRoute, 'app-shell--native-titlebar': isMacOS, 'no-animations': !settings.animationsEnabled }">
+        <div class="app-shell" :inert="beginnerGuide.demoActive || undefined" :class="{ 'app-shell--editor': isStandaloneRoute, 'app-shell--workflow-node-editor': isStandaloneRoute && isWorkflowEditorRoute, 'app-shell--native-titlebar': isMacOS, 'no-animations': !settings.animationsEnabled }">
           <div class="app-backdrop" />
           <TitleBar v-if="!isWorkflowEditorRoute || isMainTaskOwner()" />
           <div v-if="app.workerEventConnectionStatus === 'error'" class="worker-event-alert">
@@ -376,7 +351,7 @@ const themeOverrides = computed(() => {
               </div>
             </n-alert>
           </div>
-          <div class="app-body">
+          <div class="app-body" :inert="showStartupOnboarding || beginnerGuide.demoActive || undefined">
             <SideNav v-if="!isStandaloneRoute" />
             <main class="app-content">
               <router-view v-slot="{ Component, route }">
@@ -399,6 +374,7 @@ const themeOverrides = computed(() => {
             </div>
           </transition>
           <StartupOnboarding v-if="showStartupOnboarding" />
+          <BeginnerGuide v-if="isMainTaskOwner() && !isStandaloneRoute" :enabled="beginnerGuideEnabled" />
           <ViewportRecoveryOverlay :enabled="bootReady && !isStandaloneRoute" />
         </div>
         <n-modal v-model:show="deferredUpdateModalVisible" preset="dialog" type="warning" :mask-closable="false" :closable="false">
@@ -406,14 +382,17 @@ const themeOverrides = computed(() => {
             {{ t('settings.updateDeferred') }}
           </template>
           <div>{{ deferredUpdatePrompt }}</div>
-          <n-alert v-if="deferredUpdateError" type="error" :bordered="false" style="margin-top: 12px">
+          <n-alert v-if="updates.installationBlockedReason" type="info" :bordered="false" style="margin-top: 12px">
+            {{ updates.installationBlockedReason }}
+          </n-alert>
+          <n-alert v-if="deferredUpdateError && deferredUpdateError !== updates.installationBlockedReason" type="error" :bordered="false" style="margin-top: 12px">
             {{ deferredUpdateError }}
           </n-alert>
           <template #action>
             <n-button secondary :disabled="deferredUpdateInstalling" @click="keepDeferredUpdateForNextLaunch">
               {{ t('settings.updateRemindLater') }}
             </n-button>
-            <n-button type="primary" :loading="deferredUpdateInstalling" @click="installDeferredUpdate">
+            <n-button type="primary" :loading="deferredUpdateInstalling" :disabled="Boolean(updates.installationBlockedReason)" @click="installDeferredUpdate">
               {{ t('settings.installUpdate') }}
             </n-button>
           </template>
@@ -449,15 +428,6 @@ const themeOverrides = computed(() => {
             </n-button>
           </template>
         </n-modal>
-        <n-modal :show="runtimeAutoSyncActive" preset="card" :mask-closable="false" :closable="false" class="runtime-auto-sync-modal">
-          <div class="runtime-auto-sync-panel">
-            <n-spin size="small" />
-            <div>
-              <strong>{{ t('settings.runtimeAutoSyncTitle') }}</strong>
-              <span>{{ app.runtimeCoreUpdateMessage || t('settings.runtimeAutoSyncPreparing') }}</span>
-            </div>
-          </div>
-        </n-modal>
         <n-modal
           :show="updates.isInstallOverlayVisible"
           preset="card"
@@ -469,12 +439,12 @@ const themeOverrides = computed(() => {
           <div class="update-install-panel">
             <div class="update-install-panel__head">
               <strong>
-                {{ updates.status === 'failed' ? t('settings.updateInstallFailed') : updates.status === 'installing' ? t('settings.updateInstalling') : t('settings.updateDownloading') }}
+                {{ updates.status === 'restart-required' ? t('settings.updateRestartRequiredTitle') : updates.status === 'failed' ? t('settings.updateInstallFailed') : updates.status === 'installing' ? t('settings.updateInstalling') : t('settings.updateDownloading') }}
               </strong>
-              <span>{{ updates.status === 'failed' ? t('settings.updateInstallFailedHint') : t('settings.updateInstallOverlayHint') }}</span>
+              <span>{{ updates.status === 'restart-required' ? t('settings.updateRestartRequiredHint') : updates.status === 'failed' ? t('settings.updateInstallFailedHint') : t('settings.updateInstallOverlayHint') }}</span>
             </div>
             <n-progress
-              v-if="updates.status !== 'failed'"
+              v-if="updates.status !== 'failed' && updates.status !== 'restart-required'"
               type="line"
               :percentage="updates.downloadProgressPercent"
               :processing="updates.status === 'downloading'"
@@ -490,15 +460,18 @@ const themeOverrides = computed(() => {
             <p v-else-if="updates.status === 'installing'" class="update-install-panel__meta">
               {{ t('settings.updateInstallRestarting') }}
             </p>
-            <n-alert v-if="updates.status === 'failed' && updates.error" type="error" :bordered="false">
+            <n-alert v-if="(updates.status === 'failed' || updates.status === 'restart-required') && updates.error" type="error" :bordered="false">
               {{ updates.error }}
+            </n-alert>
+            <n-alert v-if="updates.status === 'failed' && manualUpdateError" type="error" :bordered="false">
+              {{ manualUpdateError }}
             </n-alert>
             <section v-if="updates.downloadLogs.length" class="update-install-panel__logs" aria-live="polite">
               <div class="update-install-panel__logs-head">
                 <strong>{{ t('settings.updateDownloadLogs') }}</strong>
                 <span>{{ t('settings.updateDownloadLogHint') }}</span>
               </div>
-              <div class="update-install-panel__log-list">
+              <div class="update-install-panel__log-list console-scrollbar">
                 <div v-for="(entry, index) in updates.downloadLogs" :key="`${entry.at}-${index}`" class="update-install-panel__log-line">
                   <time>{{ entry.at }}</time>
                   <span>{{ entry.message }}</span>
@@ -507,6 +480,11 @@ const themeOverrides = computed(() => {
             </section>
             <div v-if="updates.status === 'failed'" class="update-install-panel__actions">
               <n-button secondary @click="updates.dismissInstallError()">{{ t('common.close') }}</n-button>
+              <n-button type="primary" @click="openManualUpdate">{{ t('settings.updateOpenGitHub') }}</n-button>
+            </div>
+            <div v-else-if="updates.status === 'restart-required'" class="update-install-panel__actions">
+              <n-button secondary @click="updates.closeForUpdate()">{{ t('settings.updateCloseApplication') }}</n-button>
+              <n-button type="primary" @click="updates.retryUpdateExit()">{{ t('settings.updateRetryExit') }}</n-button>
             </div>
           </div>
         </n-modal>
@@ -589,34 +567,6 @@ const themeOverrides = computed(() => {
   width: clamp(320px, 44vw, 520px);
   max-width: calc(100vw - 24px);
   box-sizing: border-box;
-}
-
-:global(.runtime-auto-sync-modal) {
-  width: min(460px, calc(100vw - 24px));
-}
-
-.runtime-auto-sync-panel {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.runtime-auto-sync-panel > div {
-  min-width: 0;
-  display: grid;
-  gap: 5px;
-}
-
-.runtime-auto-sync-panel strong {
-  color: var(--on-surface);
-  font-size: 15px;
-}
-
-.runtime-auto-sync-panel span {
-  color: var(--on-surface-muted);
-  font-size: 12px;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
 }
 
 .update-install-panel {

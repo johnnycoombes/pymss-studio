@@ -1,8 +1,14 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
+import type { InputInst } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
-import type { EditorClip, EditorSession, EditorSource, EditorTrackEffects } from '@/types/editor'
+import { PencilOutline } from '@vicons/ionicons5'
+import { useEditorPlaybackStore } from '@/stores/editorPlayback'
+import type { EditorClip, EditorMasterLimiter as MasterLimiterSettings, EditorSession, EditorSource } from '@/types/editor'
 import { formatTime } from '@/utils/editorTime'
+import EditorMasterLimiter from '@/components/editor/EditorMasterLimiter.vue'
+import EditorParameterSlider from '@/components/editor/EditorParameterSlider.vue'
+import EditorPluginPanel from '@/components/editor/EditorPluginPanel.vue'
 
 const props = defineProps<{
   session: EditorSession
@@ -15,16 +21,25 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
+  selectTrack: [trackId: string | null]
+  togglePlayback: []
+  setMasterVolume: [value: number]
+  setMasterPan: [value: number]
+  setMasterLimiter: [patch: Partial<MasterLimiterSettings>]
+  beginMasterLimiter: []
+  commitMasterLimiter: []
+  beginMasterVolume: []
+  commitMasterVolume: []
+  beginMasterPan: []
+  commitMasterPan: []
   renameTrack: [trackId: string, name: string, commit?: boolean]
+  toggleTrackFlag: [trackId: string, flag: 'muted' | 'solo']
   setTrackVolume: [trackId: string, value: number]
   setTrackPan: [trackId: string, value: number]
-  setTrackEffects: [trackId: string, patch: Partial<EditorTrackEffects>]
   beginTrackVolume: []
   commitTrackVolume: []
   beginTrackPan: []
   commitTrackPan: []
-  beginTrackEffects: []
-  commitTrackEffects: []
   setClipFades: [payload: {
     trackId: string
     clipId: string
@@ -42,26 +57,126 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const playback = useEditorPlaybackStore()
 
 const selectedTrack = computed(() => props.session.tracks.find((track) => track.id === props.selectedTrackId) || null)
+const channelOptions = computed(() => [
+  { label: t('editor.plugins.masterOutput'), value: 'master' },
+  ...props.session.tracks.map(track => ({ label: track.name, value: `track:${track.id}` })),
+])
+const channelValue = computed(() => selectedTrack.value ? `track:${selectedTrack.value.id}` : 'master')
+const channelVolume = computed(() => selectedTrack.value ? selectedTrack.value.volume : props.session.masterVolume)
+const channelPan = computed(() => selectedTrack.value ? selectedTrack.value.pan : props.session.masterPan)
+const channelVolumeLabel = computed(() => t(selectedTrack.value ? 'editor.trackVolume' : 'editor.masterVolume'))
+const channelLevels = computed<[number, number]>(() => {
+  const levels = selectedTrack.value ? playback.trackLevels[selectedTrack.value.id] : playback.masterLevel
+  return [normalizeLevel(levels?.[0]), normalizeLevel(levels?.[1])]
+})
+const channelPeak = computed(() => Math.max(...channelLevels.value))
 const selectedClip = computed(() => (
   selectedTrack.value?.clips?.find((clip) => clip.id === props.selectedClipId) || null
 ))
 const renameDraft = ref('')
-const effectPreset = ref('custom')
+const editingTrackId = ref<string | null>(null)
+const renameInput = ref<InputInst | null>(null)
+const nameButton = ref<HTMLButtonElement | null>(null)
+
+function selectChannel(value: string) {
+  if (value === 'master') { emit('selectTrack', null); return }
+  const track = props.session.tracks.find(track => `track:${track.id}` === value)
+  if (track) emit('selectTrack', track.id)
+}
+function updateChannelVolume(value: number) {
+  if (selectedTrack.value) emit('setTrackVolume', selectedTrack.value.id, value)
+  else emit('setMasterVolume', value)
+}
+function updateChannelPan(value: number) {
+  if (selectedTrack.value) emit('setTrackPan', selectedTrack.value.id, value)
+  else emit('setMasterPan', value)
+}
+function beginChannelVolume() {
+  if (selectedTrack.value) emit('beginTrackVolume')
+  else emit('beginMasterVolume')
+}
+function commitChannelVolume() {
+  if (selectedTrack.value) emit('commitTrackVolume')
+  else emit('commitMasterVolume')
+}
+function beginChannelPan() {
+  if (selectedTrack.value) emit('beginTrackPan')
+  else emit('beginMasterPan')
+}
+function commitChannelPan() {
+  if (selectedTrack.value) emit('commitTrackPan')
+  else emit('commitMasterPan')
+}
+function toggleTrackFlag(flag: 'muted' | 'solo') {
+  if (selectedTrack.value) emit('toggleTrackFlag', selectedTrack.value.id, flag)
+}
+function normalizeLevel(value: number | undefined) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0
+}
+function levelDb(value: number) {
+  return value > 0 ? 20 * Math.log10(value) : -Infinity
+}
+const meterTicks = [
+  { db: 0, position: 1 },
+  { db: -3, position: 0.88 },
+  { db: -6, position: 0.76 },
+  { db: -9, position: 0.64 },
+  { db: -12, position: 0.52 },
+  { db: -15, position: 0.4 },
+  { db: -24, position: 0.24 },
+  { db: -30, position: 0.12 },
+  { db: -60, position: 0 },
+]
+function meterValue(value: number) { return Math.max(-60, levelDb(value)) }
+function meterDbScale(db: number) {
+  if (db >= 0) return 1
+  for (let index = 1; index < meterTicks.length; index++) {
+    const lower = meterTicks[index]
+    const upper = meterTicks[index - 1]
+    if (db >= lower.db) return lower.position + (db - lower.db) / (upper.db - lower.db) * (upper.position - lower.position)
+  }
+  return 0
+}
+function meterScale(value: number) { return meterDbScale(meterValue(value)) }
+function formatLevel(value: number) { return value > 0 ? levelDb(value).toFixed(1) : '−∞' }
 
 watch(
   selectedTrack,
   (track) => {
+    editingTrackId.value = null
     renameDraft.value = track?.name || ''
-    effectPreset.value = 'custom'
   },
   { immediate: true },
 )
 
+async function beginRename() {
+  const track = selectedTrack.value
+  if (!track) return
+  renameDraft.value = track.name
+  editingTrackId.value = track.id
+  await nextTick()
+  if (editingTrackId.value !== track.id) return
+  renameInput.value?.focus()
+  renameInput.value?.select()
+}
+
 function commitRename() {
-  if (!selectedTrack.value) return
-  emit('renameTrack', selectedTrack.value.id, renameDraft.value, true)
+  const track = props.session.tracks.find(track => track.id === editingTrackId.value)
+  const name = renameDraft.value.trim()
+  editingTrackId.value = null
+  if (track && name && name !== track.name) emit('renameTrack', track.id, name, true)
+}
+
+function onRenameKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.keyCode === 229) return
+  if (event.key !== 'Enter' && event.key !== 'Escape') return
+  event.preventDefault()
+  if (event.key === 'Enter') commitRename()
+  else editingTrackId.value = null
+  void nextTick(() => nameButton.value?.focus({ preventScroll: true }))
 }
 
 function shortPath(path: string) {
@@ -83,6 +198,19 @@ function formatTrackVolume(value: number) {
   return `${percent} · ${normalized}`
 }
 
+function formatVolumeDb(value: number) {
+  const volume = Math.max(0, Number(value || 0))
+  if (volume <= 0.0001) return '−∞ dB'
+  const db = 20 * Math.log10(volume)
+  return `${db > 0.05 ? '+' : ''}${db.toFixed(1)} dB`
+}
+
+function formatPanShort(value: number) {
+  const pan = Number(value || 0)
+  if (Math.abs(pan) < 0.025) return 'C'
+  return `${pan < 0 ? 'L' : 'R'}${Math.round(Math.abs(pan) * 100)}`
+}
+
 function formatTrackPan(value: number) {
   const pan = Number(value || 0)
   if (Math.abs(pan) < 0.025) return t('editor.panCenter')
@@ -100,21 +228,6 @@ const fadeMax = computed(() => selectedClip.value?.duration || props.selectedSou
 const usesTrackFadeLabel = computed(() => (selectedTrack.value?.clips?.length || 0) === 1)
 const fadeInValue = computed(() => selectedClip.value?.fadeIn || 0)
 const fadeOutValue = computed(() => selectedClip.value?.fadeOut || 0)
-const trackEffects = computed<EditorTrackEffects>(() => selectedTrack.value?.effects || {
-  reverb: 0,
-  delay: 0,
-  delayTime: 0.24,
-  clarity: 0,
-  compressor: 0,
-})
-const effectPresetOptions = computed(() => [
-  { label: t('editor.effectPresetCustom'), value: 'custom' },
-  { label: t('editor.effectPresetOriginal'), value: 'original' },
-  { label: t('editor.effectPresetVocal'), value: 'vocal' },
-  { label: t('editor.effectPresetBackground'), value: 'background' },
-  { label: t('editor.effectPresetRecording'), value: 'recording' },
-  { label: t('editor.effectPresetSpace'), value: 'space' },
-])
 const clipOffsetMax = computed(() => Math.max(0, Number(props.selectedSource?.duration || 0) - Number(selectedClip.value?.duration || 0)))
 const clipDurationMax = computed(() => Math.max(0.01, Number(props.selectedSource?.duration || 0) - Number(selectedClip.value?.offset || 0)))
 
@@ -136,203 +249,87 @@ function updateFades(patch: { fadeIn?: number; fadeOut?: number }) {
   })
 }
 
-function updateTrackEffects(patch: Partial<EditorTrackEffects>) {
-  if (!selectedTrack.value) return
-  effectPreset.value = 'custom'
-  emit('setTrackEffects', selectedTrack.value.id, patch)
-}
-
-function applyEffectPreset(value: string) {
-  if (!selectedTrack.value) return
-  const presets: Record<string, EditorTrackEffects> = {
-    original: { reverb: 0, delay: 0, delayTime: 0.24, clarity: 0, compressor: 0 },
-    vocal: { reverb: 0.12, delay: 0.02, delayTime: 0.18, clarity: 0.45, compressor: 0.5 },
-    background: { reverb: 0.06, delay: 0.08, delayTime: 0.32, clarity: 0.08, compressor: 0.16 },
-    recording: { reverb: 0.04, delay: 0, delayTime: 0.24, clarity: 0.62, compressor: 0.62 },
-    space: { reverb: 0.34, delay: 0.16, delayTime: 0.3, clarity: 0.1, compressor: 0.12 },
-  }
-  const preset = presets[value]
-  if (!preset) {
-    effectPreset.value = 'custom'
-    return
-  }
-  effectPreset.value = value
-  emit('beginTrackEffects')
-  emit('setTrackEffects', selectedTrack.value.id, preset)
-  emit('commitTrackEffects')
-}
 </script>
 
 <template>
   <aside class="editor-inspector" :class="{ 'editor-inspector--compact': compact }">
     <div class="editor-inspector__titlebar">
-      <div class="editor-inspector__eyebrow">{{ selectedTrack ? t('editor.trackParams') : t('editor.inspectorTitle') }}</div>
-      <div class="editor-inspector__title">
-        <strong>{{ selectedTrack ? selectedTrack.name : t('editor.projectInfo') }}</strong>
-        <span>{{ selectedTrack ? (sourceMeta || t('editor.laneNoAudio')) : t('editor.clipParamsIdle') }}</span>
+      <div class="editor-inspector__eyebrow" :title="selectedTrack ? t('editor.trackParams') : t('editor.plugins.masterOutput')">{{ t('editor.channelInspector') }}</div>
+      <div class="editor-inspector__channel-select">
+        <n-input v-if="selectedTrack && editingTrackId === selectedTrack.id" ref="renameInput" v-model:value="renameDraft" class="editor-inspector__name-input" size="small" :input-props="{ 'aria-label': t('editor.inspectorFieldName') }" @blur="commitRename()" @keydown.stop="onRenameKeydown" />
+        <n-select v-else class="editor-inspector__channel-picker" size="small" :value="channelValue" :options="channelOptions" :aria-label="t('editor.selectChannel')" @update:value="selectChannel" />
+        <button v-if="selectedTrack && editingTrackId !== selectedTrack.id" ref="nameButton" type="button" class="editor-inspector__name" :title="t('editor.renameTrack', { name: selectedTrack.name })" :aria-label="t('editor.renameTrack', { name: selectedTrack.name })" @click="beginRename" @keydown.stop><n-icon :component="PencilOutline" :size="14" /></button>
+        <n-button class="editor-inspector__master-button" size="tiny" secondary :type="selectedTrack ? 'default' : 'primary'" :disabled="!selectedTrack" @keydown.space.stop @click="selectChannel('master')">{{ t('editor.plugins.masterOutput') }}</n-button>
       </div>
+      <span class="editor-inspector__channel-context" :title="selectedTrack ? sourceMeta : session.name">{{ selectedTrack ? (sourceMeta || t('editor.laneNoAudio')) : session.name }}</span>
     </div>
 
     <div class="editor-inspector__scroll">
-      <section v-if="selectedTrack" class="inspector-group inspector-group--primary">
-        <div class="inspector-group__header">
-          <strong>{{ t('editor.inspectorSectionCommon') }}</strong>
-          <span>{{ t('editor.inspectorTrackContext') }}</span>
-        </div>
-
-        <div class="inspector-group__body inspector-group__body--dense">
-          <label class="panel-field panel-field--compact">
-            <span class="panel-field__label">{{ t('editor.inspectorFieldName') }}</span>
-            <n-input
-              v-model:value="renameDraft"
-              size="small"
-              @blur="commitRename"
-              @keydown.enter.prevent="commitRename"
+      <section class="inspector-strip" :aria-label="selectedTrack ? selectedTrack.name : t('editor.plugins.masterOutput')">
+        <div class="inspector-strip__controls">
+          <div class="inspector-strip__pan" :title="`${t('editor.balance')} · ${formatTrackPan(channelPan)}`">
+            <div class="inspector-strip__caption"><span>{{ t('editor.balance') }}</span><strong>{{ formatPanShort(channelPan) }}</strong></div>
+            <EditorParameterSlider
+              :key="channelValue"
+              :value="channelPan"
+              :reset-value="0"
+              :label="t('editor.balance')"
+              :aria-label="t('editor.balance')"
+              :reset-label="t('editor.sliderDefaultCenter')"
+              :min="-1"
+              :max="1"
+              :step="0.01"
+              :tooltip="false"
+              @update:value="updateChannelPan"
+              @dragstart="beginChannelPan"
+              @dragend="commitChannelPan"
             />
-          </label>
+          </div>
 
-          <div class="dual-fields dual-fields--stacked">
-            <label class="panel-field panel-field--compact">
-              <div class="panel-field__split panel-field__split--compact">
-                <span class="panel-field__label">{{ t('editor.trackVolume') }}</span>
-                <strong>{{ formatTrackVolume(selectedTrack.volume) }}</strong>
-              </div>
-              <n-slider
-                :value="selectedTrack.volume"
-                :min="0"
-                :max="2"
-                :step="0.01"
-                :tooltip="false"
-                @update:value="(value: number) => selectedTrack && emit('setTrackVolume', selectedTrack.id, value)"
-                @dragstart="emit('beginTrackVolume')"
-                @dragend="emit('commitTrackVolume')"
-              />
-            </label>
+          <div v-if="selectedTrack" class="inspector-strip__flags">
+            <button type="button" class="inspector-strip__flag inspector-strip__flag--mute" :class="{ 'inspector-strip__flag--active': selectedTrack.muted }" :aria-pressed="selectedTrack.muted" :title="t(selectedTrack.muted ? 'editor.unmuteTrack' : 'editor.muteTrack')" :aria-label="t(selectedTrack.muted ? 'editor.unmuteTrack' : 'editor.muteTrack')" @keydown.space.stop @click="toggleTrackFlag('muted')">M</button>
+            <button type="button" class="inspector-strip__flag inspector-strip__flag--solo" :class="{ 'inspector-strip__flag--active': selectedTrack.solo }" :aria-pressed="selectedTrack.solo" :title="t(selectedTrack.solo ? 'editor.unsoloTrack' : 'editor.soloTrack')" :aria-label="t(selectedTrack.solo ? 'editor.unsoloTrack' : 'editor.soloTrack')" @keydown.space.stop @click="toggleTrackFlag('solo')">S</button>
+          </div>
 
-            <label class="panel-field panel-field--compact">
-              <div class="panel-field__split panel-field__split--compact">
-                <span class="panel-field__label">{{ t('editor.balance') }}</span>
-                <strong>{{ formatTrackPan(selectedTrack.pan) }}</strong>
+          <div class="inspector-strip__fader-area" :title="t('editor.channelLevelStereo', { left: formatLevel(channelLevels[0]), right: formatLevel(channelLevels[1]) })">
+            <div class="inspector-strip__fader">
+            <EditorParameterSlider
+              :key="channelValue"
+              vertical
+              :value="channelVolume"
+              :reset-value="1"
+              :label="channelVolumeLabel"
+              :aria-label="channelVolumeLabel"
+              :reset-label="t('editor.sliderDefaultVolume')"
+              :min="0"
+              :max="2"
+              :step="0.01"
+              :tooltip="false"
+              @update:value="updateChannelVolume"
+              @dragstart="beginChannelVolume"
+              @dragend="commitChannelVolume"
+            />
+            </div>
+            <div class="inspector-strip__meter">
+              <div v-for="(value, index) in channelLevels" :key="index" class="inspector-strip__meter-bar" role="meter" :aria-label="`${t('editor.channelLevel')} · ${t(index === 0 ? 'editor.panLeft' : 'editor.panRight')}`" :aria-valuemin="-60" :aria-valuemax="0" :aria-valuenow="meterValue(value)" :aria-valuetext="`${formatLevel(value)} dBFS`">
+                <span :class="{ 'inspector-strip__meter-fill--full': value >= 1 }" :style="{ clipPath: `inset(${(1 - meterScale(value)) * 100}% 0 0)` }" />
               </div>
-              <n-slider
-                :value="selectedTrack.pan"
-                :min="-1"
-                :max="1"
-                :step="0.01"
-                :tooltip="false"
-                @update:value="(value: number) => selectedTrack && emit('setTrackPan', selectedTrack.id, value)"
-                @dragstart="emit('beginTrackPan')"
-                @dragend="emit('commitTrackPan')"
-              />
-            </label>
+              <div class="inspector-strip__meter-scale" aria-hidden="true">
+                <span v-for="tick in meterTicks" :key="tick.db" :class="{ 'inspector-strip__meter-tick--major': tick.db >= -12 }" :style="{ top: `${(1 - tick.position) * 100}%` }">{{ tick.db === 0 ? '0' : `−${Math.abs(tick.db)}` }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="inspector-strip__readout" :title="`${channelVolumeLabel} · ${formatTrackVolume(channelVolume)}`">
+            <strong>{{ formatVolumeDb(channelVolume) }}</strong>
+            <small>{{ formatLevel(channelPeak) }} dBFS</small>
           </div>
         </div>
-      </section>
 
-      <details v-if="selectedTrack" class="inspector-group inspector-group--effects">
-        <summary class="inspector-group__header">
-          <strong>{{ t('editor.inspectorSectionEffects') }}</strong>
-          <span>{{ t('editor.inspectorEffectsContext') }}</span>
-        </summary>
-
-        <div class="inspector-group__body inspector-group__body--dense">
-          <label class="panel-field panel-field--compact">
-            <span class="panel-field__label">{{ t('editor.effectPreset') }}</span>
-            <n-select
-              :value="effectPreset"
-              :options="effectPresetOptions"
-              size="small"
-              @update:value="applyEffectPreset"
-            />
-          </label>
-
-          <p class="effect-hint">{{ t('editor.effectPresetHint') }}</p>
-
-          <label class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectClarity') }}</span>
-              <strong>{{ Math.round(trackEffects.clarity * 100) }}%</strong>
-            </div>
-            <n-slider
-              :value="trackEffects.clarity"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ clarity: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </label>
-
-          <label class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectCompressor') }}</span>
-              <strong>{{ Math.round(trackEffects.compressor * 100) }}%</strong>
-            </div>
-            <n-slider
-              :value="trackEffects.compressor"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ compressor: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </label>
-
-          <label class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectReverb') }}</span>
-              <strong>{{ Math.round(trackEffects.reverb * 100) }}%</strong>
-            </div>
-            <n-slider
-              :value="trackEffects.reverb"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ reverb: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </label>
-
-          <label class="panel-field panel-field--compact">
-            <div class="panel-field__split panel-field__split--compact">
-              <span class="panel-field__label">{{ t('editor.effectDelay') }}</span>
-              <strong>{{ Math.round(trackEffects.delay * 100) }}%</strong>
-            </div>
-            <n-slider
-              :value="trackEffects.delay"
-              :min="0"
-              :max="1"
-              :step="0.01"
-              :tooltip="false"
-              @update:value="(value: number) => updateTrackEffects({ delay: value })"
-              @dragstart="emit('beginTrackEffects')"
-              @dragend="emit('commitTrackEffects')"
-            />
-          </label>
-
-          <label class="panel-field panel-field--compact">
-            <span class="panel-field__label">{{ t('editor.effectDelayTime') }}</span>
-            <n-input-number
-              :value="trackEffects.delayTime"
-              :min="0.05"
-              :max="1.2"
-              :step="0.01"
-              size="small"
-              :format="(value: number | null) => `${Number(value || 0).toFixed(2)} s`"
-              :parse="(value: string) => Number.parseFloat(value)"
-              @focus="emit('beginTrackEffects')"
-              @blur="emit('commitTrackEffects')"
-              @update:value="(value: number | null) => updateTrackEffects({ delayTime: numberOrZero(value) })"
-            />
-          </label>
+        <div class="inspector-strip__inserts">
+          <EditorPluginPanel :session="session" :selected-track-id="selectedTrackId" @select-target="(id) => emit('selectTrack', id)" @toggle-playback="emit('togglePlayback')" />
         </div>
-      </details>
+      </section>
 
       <section v-if="selectedTrack && selectedClip" class="inspector-group inspector-group--clip">
         <div class="inspector-group__header">
@@ -465,12 +462,20 @@ function applyEffectPreset(value: string) {
           </div>
         </div>
       </section>
+      <EditorMasterLimiter
+        v-if="!selectedTrack"
+        :value="session.masterLimiter"
+        @update="emit('setMasterLimiter', $event)"
+        @begin="emit('beginMasterLimiter')"
+        @commit="emit('commitMasterLimiter')"
+      />
     </div>
   </aside>
 </template>
 
 <style scoped>
 .editor-inspector {
+  container: channel-inspector / inline-size;
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -495,27 +500,37 @@ function applyEffectPreset(value: string) {
   letter-spacing: 0.08em;
 }
 
-.editor-inspector__title {
-  display: grid;
-  gap: 2px;
-}
-
-.editor-inspector__title strong,
-.editor-inspector__title span {
+.editor-inspector__channel-select { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.editor-inspector__channel-picker, .editor-inspector__name-input { min-width: 0; flex: 1; }
+.editor-inspector__master-button { flex-shrink: 0; }
+.editor-inspector__channel-context {
+  color: var(--on-surface-muted);
+  font-size: 10px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.editor-inspector__title strong {
-  font-size: 14px;
-  line-height: 1.15;
+.editor-inspector__name {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 
-.editor-inspector__title span {
-  color: var(--on-surface-muted);
-  font-size: 10px;
-}
+.editor-inspector__name:hover { background: var(--primary-softer); }
+.editor-inspector__name:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.editor-inspector__name-input :deep(input) { font-size: 14px; font-weight: 600; }
 
 .editor-inspector__scroll {
   min-height: 0;
@@ -545,10 +560,68 @@ function applyEffectPreset(value: string) {
   border-color: color-mix(in srgb, var(--outline) 78%, transparent);
 }
 
-.inspector-group--effects {
-  border-color: color-mix(in srgb, var(--primary-border) 50%, var(--outline));
-  background: color-mix(in srgb, var(--primary-soft) 10%, var(--surface-1));
+/* Channel strip: fader column on the left, insert slots on the right. */
+.inspector-strip {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  height: clamp(216px, 36dvh, 380px);
+  min-height: 0;
+  border: 1px solid color-mix(in srgb, var(--outline) 78%, transparent);
+  border-radius: 8px;
+  background: var(--surface-1);
+  overflow: hidden;
 }
+.editor-inspector--compact .inspector-strip { grid-template-columns: 66px minmax(0, 1fr); }
+.inspector-strip__controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  padding: 8px 7px;
+  border-right: 1px solid color-mix(in srgb, var(--outline) 70%, transparent);
+  background: color-mix(in srgb, var(--surface-2) 40%, var(--surface-1));
+}
+.inspector-strip__caption { display: flex; justify-content: space-between; align-items: baseline; gap: 2px; font-size: 9px; color: var(--on-surface-muted); }
+.inspector-strip__caption > span { min-width: 0; overflow-wrap: anywhere; }
+.inspector-strip__caption > strong { color: var(--on-surface); font-size: 10px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.inspector-strip__pan :deep(.editor-parameter-slider) { gap: 0; }
+.inspector-strip__pan :deep(.editor-parameter-slider__reset) { display: none; }
+.inspector-strip__flags { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.inspector-strip__flag {
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--outline);
+  border-radius: 4px;
+  background: var(--surface-1);
+  color: var(--on-surface-muted);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.inspector-strip__flag:hover { color: var(--on-surface); border-color: var(--outline-strong); }
+.inspector-strip__flag:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.inspector-strip__flag--mute.inspector-strip__flag--active { border-color: transparent; background: var(--warning); color: #1b1b1b; }
+.inspector-strip__flag--solo.inspector-strip__flag--active { border-color: transparent; background: var(--primary); color: #fff; }
+.inspector-strip__fader-area { position: relative; display: flex; justify-content: center; gap: 5px; flex: 1; min-height: 150px; padding-bottom: 23px; }
+.inspector-strip__fader { display: flex; flex-direction: column; }
+.inspector-strip__fader :deep(.editor-parameter-slider) { flex-direction: column; flex: 1; min-height: 0; gap: 0; }
+.inspector-strip__fader :deep(.editor-parameter-slider__control) { display: flex; justify-content: center; flex: 1; min-height: 0; }
+.inspector-strip__fader :deep(.n-slider) { height: 100%; }
+.inspector-strip__fader :deep(.editor-parameter-slider__reset) { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); min-height: 18px; max-width: 100%; padding: 0 3px; font-size: 9px; white-space: normal; }
+.inspector-strip__meter { display: grid; grid-template-columns: 5px 5px 16px; gap: 2px; }
+.inspector-strip__meter-bar { position: relative; overflow: hidden; background: var(--surface-2); border: 1px solid var(--outline); border-radius: 2px; }
+.inspector-strip__meter-bar > span { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(255, 106, 106, 0.95), rgba(255, 170, 102, 0.92) 24%, rgba(92, 214, 132, 0.9) 60%); }
+.inspector-strip__meter-bar > .inspector-strip__meter-fill--full { background: var(--error, var(--warning)); }
+.inspector-strip__meter-scale { position: relative; color: var(--on-surface-muted); font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums; }
+.inspector-strip__meter-scale > span { position: absolute; left: 0; white-space: nowrap; transform: translateY(-50%); }
+.inspector-strip__meter-scale > span::before { content: ''; position: absolute; top: 50%; left: -3px; width: 2px; height: 1px; background: var(--outline-strong); }
+.inspector-strip__meter-scale > .inspector-strip__meter-tick--major { color: var(--on-surface); font-size: 9px; font-weight: 600; }
+.inspector-strip__readout { display: grid; justify-items: center; gap: 1px; padding: 4px 0 1px; border-top: 1px solid color-mix(in srgb, var(--outline) 60%, transparent); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.inspector-strip__readout > strong { font-size: 11px; font-weight: 600; }
+.inspector-strip__readout > small { color: var(--on-surface-muted); font-size: 8px; }
+.inspector-strip__inserts { min-width: 0; min-height: 0; overflow: auto; }
 
 .inspector-group--clip {
   background: color-mix(in srgb, var(--surface-2) 20%, var(--surface-1));
@@ -657,16 +730,6 @@ details.inspector-group[open] > summary.inspector-group__header::after {
   letter-spacing: 0;
 }
 
-.effect-hint {
-  margin: -2px 0 1px;
-  padding: 6px 7px;
-  border-left: 2px solid color-mix(in srgb, var(--primary) 64%, transparent);
-  border-radius: 0 6px 6px 0;
-  color: var(--on-surface-muted);
-  font-size: 10px;
-  line-height: 1.45;
-  background: color-mix(in srgb, var(--surface-2) 54%, transparent);
-}
 
 .panel-field__split {
   display: flex;
@@ -794,27 +857,42 @@ details.inspector-group[open] > summary.inspector-group__header::after {
   --n-box-shadow-focus: 0 0 0 2px color-mix(in srgb, var(--primary-soft) 34%, transparent) !important;
 }
 
-.inspector-group--effects :deep(.n-base-selection),
-.inspector-group--effects :deep(.n-input),
-.inspector-group--effects :deep(.n-input-number .n-input) {
-  --n-color: var(--surface-1) !important;
-  --n-border: 1px solid color-mix(in srgb, var(--outline) 62%, transparent) !important;
-}
 
 .editor-inspector :deep(.n-slider-rail),
 .editor-inspector :deep(.n-slider-rail__fill) {
   border-radius: 999px;
 }
 
-@media (max-width: 1480px) {
-  .stats-grid {
-    grid-template-columns: 1fr;
-  }
+@container channel-inspector (max-width: 250px) {
+  .editor-inspector__titlebar { padding-inline: 8px; }
+  .editor-inspector__channel-select { flex-wrap: wrap; }
+  .editor-inspector__channel-picker, .editor-inspector__name-input { flex-basis: calc(100% - 30px); }
+  .editor-inspector__master-button { margin-left: auto; }
+  .editor-inspector__scroll { padding-inline: 8px; }
+  .inspector-strip { grid-template-columns: 66px minmax(0, 1fr); }
+  .inspector-group { padding-inline: 8px; }
 }
-
-@media (max-width: 1360px) {
-  .inspector-group {
-    padding-inline: 8px;
-  }
+@container channel-inspector (min-width: 300px) {
+  .inspector-strip { grid-template-columns: 84px minmax(0, 1fr); }
+  .inspector-strip__controls { padding-inline: 8px; }
+  .inspector-strip__caption { font-size: 10px; }
+  .inspector-strip__readout > strong { font-size: 12px; }
+}
+@media (max-height: 760px) {
+  .inspector-strip__controls { gap: 6px; padding-block: 6px; }
+  .inspector-strip__fader-area { min-height: 104px; }
+}
+@media (max-height: 640px) {
+  .editor-inspector__titlebar { gap: 2px; padding-block: 7px; }
+  .editor-inspector__scroll { gap: 6px; padding-block: 6px; }
+  .inspector-strip { height: clamp(204px, 35dvh, 224px); }
+  .inspector-strip__controls { gap: 4px; }
+  .inspector-strip__fader-area { min-height: 76px; }
+  .inspector-strip__flag { height: 18px; }
+  .inspector-strip__readout { padding-top: 2px; }
+}
+@media (max-height: 520px) {
+  .inspector-strip { height: 200px; }
+  .inspector-strip__fader-area { min-height: 68px; }
 }
 </style>

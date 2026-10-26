@@ -1,0 +1,78 @@
+name: 故障反馈 / Bug report
+description: 报告安装、更新、音频处理或界面中的异常。 / Report problems with installation, updates, audio processing or the interface.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        使用咨询请前往 [使用问答](https://github.com/pymss-project/pymss-studio/discussions/categories/%E4%BD%BF%E7%94%A8%E9%97%AE%E7%AD%94-q-a)，新功能建议请前往 [功能建议](https://github.com/pymss-project/pymss-studio/discussions/categories/%E5%8A%9F%E8%83%BD%E5%BB%BA%E8%AE%AE-ideas)。不清楚的信息可以注明“不确定”。
+
+        For usage questions, visit Q&A; for feature requests, visit Ideas using the links above. It is fine to mark details as unknown.
+  - type: dropdown
+    id: area
+    attributes:
+      label: 出现问题的环节（选填） / Affected area (optional)
+      description: 选择最接近的功能，不确定时可以留空。 / Choose the closest area, or leave this blank if unsure.
+      options:
+        - 安装、启动或引导 / Installation or startup
+        - 应用、内核或环境更新 / App, core or runtime updates
+        - 环境或组件安装与切换 / Runtimes or optional components
+        - 模型下载或导入 / Model download or import
+        - 分离、批量任务或融合 / Separation, batch tasks or ensemble
+        - 简易或高级工作流 / Simple or advanced workflows
+        - 结果、编辑器、工程或混音导出 / Results, editor, projects or mix export
+        - 音频工具（转换、ASR、MIDI 等） / Audio tools
+        - 界面、设置或其他 / Interface, settings or other
+    validations:
+      required: false
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题现象 / What happened
+      description: 描述预期结果与实际情况；若有报错，请保留原文。 / Describe what you expected and what happened. Include the exact error message if available.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤 / Steps to reproduce
+      description: |
+        描述触发问题的操作和发生频率；偶发问题可说明最近一次出现前的操作。若更新后出现，请补充此前正常的版本，并说明更新了应用、内核还是运行环境。
+
+        Describe the steps and frequency. For intermittent issues, explain what you did before it happened. For regressions, include the last working version and whether you updated the app, core packages or runtime.
+    validations:
+      required: true
+  - type: textarea
+    id: version-and-os
+    attributes:
+      label: 软件版本与系统 / App version and OS
+      description: |
+        应用版本可在“设置 → 关于”查看。请提供系统版本和安装方式（安装版、便携版、DMG、AppImage 或源码），也可填写安装包文件名。无法打开应用或不清楚的项目可以说明“不确定”。
+
+        Find the app version in Settings → About. Include your OS version and installation method or package filename. Unknown details are fine, including when the app cannot start.
+    validations:
+      required: true
+  - type: textarea
+    id: runtime
+    attributes:
+      label: 相关环境与任务信息（选填） / Environment and task details (optional)
+      description: |
+        只需填写与问题相关的内容；诊断报告中已有的信息无需重复填写。
+        - 分离或环境问题：芯片/显卡、实际选择的设备、模型和关键参数；pymss 与 pymss-core 版本可在“设置 → 运行环境”查看。
+        - 工作流、编辑器或音频工具问题：流程/节点或工具名称、输入格式/时长/声道，以及输出格式与采样率。
+        - 速度或内存问题：batch size、分块、重叠、TTA、任务并发数，以及实际耗时或内存情况。
+
+        Include only relevant details: hardware/device, core versions (Settings → Runtime Environment), model/settings, workflow node or tool, input properties and output settings. For performance issues, include batch/chunk/overlap/TTA/concurrency settings and measured time or memory. A diagnostic report can replace details already included there.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志、截图或复现附件（选填） / Logs or attachments (optional)
+      description: |
+        可粘贴相关报错片段、附截图或工作流导出文件。应用能够打开时，也可在设置中启用“开发者模式”，再到“诊断 → 生成诊断报告”获取 latest-diagnostic-report.md；启动失败或旧版本无此入口时，提供已有日志即可。分享前检查并移除个人路径、账号凭据、Cookie、代理密码和其他不宜公开的信息。
+
+        Add relevant log excerpts, screenshots or an exported workflow. If the app opens, enable Developer Mode in Settings and use Diagnostics → Create diagnostic report to obtain latest-diagnostic-report.md. Existing logs are sufficient if startup fails or this option is unavailable. Review attachments and remove personal paths, credentials, cookies, proxy passwords and other private information before sharing.
+    validations:
+      required: false

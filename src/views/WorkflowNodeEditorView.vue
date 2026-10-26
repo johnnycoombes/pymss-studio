@@ -1,14 +1,17 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { useMessage, type InputInst } from 'naive-ui'
-import { SettingsOutline } from '@vicons/ionicons5'
+import { FolderOpenOutline } from '@vicons/ionicons5'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { invoke } from '@tauri-apps/api/core'
 import { storeToRefs } from 'pinia'
 import WorkflowRunPanel from '@/components/workflow/WorkflowRunPanel.vue'
 import WorkflowExecutionProgress from '@/components/workflow/WorkflowExecutionProgress.vue'
+import WorkflowNodeBindings from '@/components/workflow/WorkflowNodeBindings.vue'
 import { WorkflowEditorInUseError } from '@/utils/workflowEditorState'
 import { useWorkflowWorkbench } from '@/composables/useWorkflowWorkbench'
 import { cloneWorkflow } from '@/workflows/workbench'
@@ -26,6 +29,8 @@ import {
   isWorkflowSeparationNodeType,
 } from '@/workflows/formats'
 import { storeGraphDefaults } from '@/workflows/graphDefaults'
+
+const studioLog = createLogger('ui.views.WorkflowNodeEditorView')
 
 const { t, locale } = useI18n()
 const route = useRoute()
@@ -63,7 +68,7 @@ const showRevisionConflict = ref(false)
 const pendingDefinition = ref<Record<string, unknown> | null>(null)
 const formatError = ref('')
 const canvasError = ref('')
-const showInfo = ref(false)
+const showOutputSettings = ref(false)
 
 const hasTauriWindow = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 const currentWindow = hasTauriWindow ? getCurrentWindow() : null
@@ -427,7 +432,7 @@ async function refreshMaximized() {
   try {
     isMaximized.value = await invoke<boolean>('is_current_window_maximized')
   } catch (error) {
-    console.warn('[workflow-node-editor] is_current_window_maximized failed', error)
+    studioLog.warn('[workflow-node-editor] is_current_window_maximized failed', error)
     try {
       isMaximized.value = await currentWindow.isMaximized()
     } catch {
@@ -443,8 +448,8 @@ function startWindowDrag(event?: MouseEvent) {
   }
   if (!currentWindow) return
   invoke('start_drag_current_window').catch((error) => {
-    console.warn('[workflow-node-editor] start_drag_current_window failed', error)
-    currentWindow.startDragging().catch(innerError => console.warn('[workflow-node-editor] currentWindow.startDragging failed', innerError))
+    studioLog.warn('[workflow-node-editor] start_drag_current_window failed', error)
+    currentWindow.startDragging().catch(innerError => studioLog.warn('[workflow-node-editor] currentWindow.startDragging failed', innerError))
   })
 }
 
@@ -453,8 +458,8 @@ async function minimizeWindow() {
   try {
     await invoke('minimize_current_window')
   } catch (error) {
-    console.warn('[workflow-node-editor] minimize_current_window failed', error)
-    currentWindow.minimize().catch(innerError => console.warn('[workflow-node-editor] currentWindow.minimize failed', innerError))
+    studioLog.warn('[workflow-node-editor] minimize_current_window failed', error)
+    currentWindow.minimize().catch(innerError => studioLog.warn('[workflow-node-editor] currentWindow.minimize failed', innerError))
   }
 }
 
@@ -463,8 +468,8 @@ async function toggleMaximizeWindow() {
   try {
     isMaximized.value = await invoke<boolean>('toggle_maximize_current_window')
   } catch (error) {
-    console.warn('[workflow-node-editor] toggle_maximize_current_window failed', error)
-    currentWindow.toggleMaximize().then(refreshMaximized).catch(innerError => console.warn('[workflow-node-editor] currentWindow.toggleMaximize failed', innerError))
+    studioLog.warn('[workflow-node-editor] toggle_maximize_current_window failed', error)
+    currentWindow.toggleMaximize().then(refreshMaximized).catch(innerError => studioLog.warn('[workflow-node-editor] currentWindow.toggleMaximize failed', innerError))
   }
 }
 
@@ -582,7 +587,7 @@ onBeforeUnmount(() => {
         </div>
       </template>
       <template #settings-controls>
-        <n-button size="small" quaternary circle :title="t('workflows.editMeta')" :aria-label="t('workflows.editMeta')" @click="showInfo = true"><template #icon><n-icon :component="SettingsOutline" /></template></n-button>
+        <n-button size="small" quaternary @click="showOutputSettings = true"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('separate.output') }}</n-button>
       </template>
       <template #execution-progress><WorkflowExecutionProgress :job="workbench.focusedJob.value" :task="workbench.focusedTask.value" /></template>
       <template #run-controls>
@@ -593,10 +598,9 @@ onBeforeUnmount(() => {
         </WorkflowRunPanel>
       </template>
     </WorkflowNodeEditor>
-    <n-modal v-model:show="showInfo" preset="card" :title="t('workflows.editMeta')" class="advanced-workflow-info-modal" style="width: min(480px, calc(100vw - 32px))">
-      <label class="workflow-info-field"><span>{{ t('workflows.note') }}</span><n-input v-model:value="description" type="textarea" :autosize="{ minRows: 3, maxRows: 6 }" :placeholder="t('workflows.descriptionPlaceholder')" /></label>
-      <p class="workflow-info-hint">{{ t('workflows.advancedEditor.nodeSettingsHint') }}</p>
-      <template #footer><div class="workflow-node-editor-page__prompt-actions"><n-button secondary @click="showInfo = false">{{ t('common.close') }}</n-button></div></template>
+    <n-modal v-model:show="showOutputSettings" preset="card" :title="t('separate.output')" class="advanced-output-settings-modal" style="width: min(480px, calc(100vw - 32px))">
+      <WorkflowNodeBindings :workflow-key="workflowKey" :definition="definition" mode="outputs" :aggregate-output="true" />
+      <template #footer><div class="workflow-node-editor-page__prompt-actions"><n-button size="small" secondary @click="showOutputSettings = false">{{ t('common.close') }}</n-button></div></template>
     </n-modal>
     <n-modal v-model:show="showClosePrompt" preset="card" :title="t('workflows.simpleUnsavedTitle')" style="width: min(440px, calc(100vw - 32px))">
       <p>{{ t('workflows.simpleUnsavedHint') }}</p>
@@ -725,8 +729,6 @@ onBeforeUnmount(() => {
 
 .workflow-node-editor-title { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .workflow-save-status { flex-shrink: 0; color: var(--on-surface-muted); font-size: 11px; white-space: nowrap; }
-.workflow-info-field { display: grid; gap: 8px; font-size: 12px; color: var(--on-surface-muted); }
-.workflow-info-hint { margin: 16px 0 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.6; }
 
 .workflow-name-trigger {
   min-width: 0;

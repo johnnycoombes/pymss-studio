@@ -1,0 +1,1009 @@
+Pymss Studio VST Lab
+====================
+
+Experimental branch: codex/vst3-host-lab
+Original requirement audit and remaining acceptance work: VST-REQUIREMENTS-AUDIT.txt.
+Current implementation target: Windows/macOS/Linux VST2/VST3 effects and macOS
+AUv2/AUv3 effects. AAX audio hosting is deferred at the user's request; existing
+module inspection remains diagnostic only. Native hosting is now enabled by
+default and connected to all release entries, with experimental status retained
+until real-plugin, native-platform and signed-package acceptance is complete.
+Initial validated host target: Windows x64 VST3 audio effects.
+VST3 implementation now also includes macOS and Linux; native validation is pending there.
+Additional code adapters: Windows/macOS/Linux VST2 effects, including shell children,
+and macOS AUv2/AUv3 effects through Apple's C compatibility bridge.
+These adapters have unit/compile validation only; real plugin validation is pending.
+Native editors: VST2/VST3 on Windows; VST2/VST3/AUv2 Cocoa and AUv3 views on macOS;
+VST2/VST3 X11 or XWayland views on Linux. Generic parameter controls remain available.
+
+Run from this worktree:
+  pnpm install --frozen-lockfile
+  pnpm vst:dev
+
+Build a debug executable without publishing/installing:
+  pnpm vst:build
+
+Build with the ordinary application identity and native host:
+  pnpm plugins:build --debug --no-bundle
+This build shares the ordinary app's identity/data/update behavior. Its
+config adds macOS plugin-loading entitlements; signing/notarization and native
+platform compatibility still require validation. Lab identity remains separate.
+
+Cargo uses CARGO_TARGET_DIR when supplied. On this machine the experimental
+Tauri target is E:\pymss-vst-lab-target and the native-only target is
+E:\pymss-vst-lab-native-target; D: has insufficient room for a new Rust build.
+For Git Bash, for example:
+  CARGO_TARGET_DIR=E:/pymss-vst-lab-target pnpm vst:build
+
+The launcher isolates the application identity, singleton, WebView storage,
+settings, projects, outputs and runtime environment under data-vst-lab.
+The application does not use the production updater. Do not copy real project
+files into the lab unless they are disposable copies.
+
+Usage
+-----
+Open an audio project and select a track in the editor. The inspector has one
+Audio plugins button opening the draggable, modeless manager. Choose a plugin
+folder on the left to identify its effects, select an effect and add it to the
+named track/master destination on the right. Sources initially contain no folder;
+only explicitly selected sources are remembered. Empty lists never scan system
+defaults. On macOS, system Audio Units are a separate explicit source choice.
+The initial position leaves transport visible, and resizing recenters the panel.
+Closing it retains the selected target and catalog; native windows stay open.
+The library groups results by vendor, declared effect type or plugin format.
+Scanning runs on the blocking worker with one isolated helper per package. The
+manager shows the active package, elapsed time and completion count, with Skip
+and blacklist and Stop controls available while the scan is busy. A package that
+exceeds ten seconds is terminated, excluded and followed by the next package.
+Exclusions persist in plugin-blacklist.json and survive ordinary/forced rescans.
+Remove an entry in the manager to invalidate its failure cache and retry during
+the next scan. VST2 shell children/VST3 classes share their package exclusion;
+the explicit system AU source is a whole metadata enumeration, not a per-unit test.
+VST3 uses SDK metadata; VST2 categories stay coarse; unknown categories are not
+guessed from names. AU currently uses vendor/format and actual component identity.
+Track and master chains support adding, ordering, bypassing, removing and opening
+the plugin's native window. Native edits are observed and automatically captured
+into immutable content-addressed files; manual save and window close await the
+latest state. Failed captures remain visible and can be retried. Export renders the same native graph before
+the existing output encoding and publishing stage.
+Export sessions select offline processing during control-thread preparation.
+Plugins may choose different offline quality, latency or tail behavior. The host
+notifies VST3/VST2 effects and AUs supporting the optional OfflineRender property;
+it does not force a plugin to change its quality. Ordinary AUs without that
+property keep their current effect path. Dedicated auol/batch-offline workflows
+are outside the current adapter.
+VST3 latency/tail queries and latency-change reactivation run on the control
+thread while DSP is suspended. The worker reads an atomic timing cache; render
+startup recovery is bounded per insert, including serial effect chains.
+
+First-round boundaries
+----------------------
+Use mono/stereo local audio. Built-in track effects can precede the plugin chain
+in the native graph. Recording saves dry microphone takes, with native plugins
+processing accompaniment and recorded clips. Live input plugin monitoring,
+hardware latency compensation, instruments/MIDI, sidechains, float64-only plugins and architecture bridging
+are not supported. Maximum plugin tail is 30 seconds; exports report truncation.
+Stable processing-latency changes are renegotiated with the same plugin instance,
+preserving playback position, loop state and editor windows. Repeatedly unstable
+latency stops playback after a bounded recovery attempt.
+IMessage/IAttributeList hosting, hidden/bypass parameter delivery and preset value
+refresh are implemented; additional plugins still need compatibility checks.
+Plugin crashes interrupt the audio process. The plugin panel can explicitly
+reload the most recently saved state; uncaptured edits may be lost.
+
+Native reproducible checks (no application or Python ML runtime needed)
+---------------------------------------------------------------------
+  cargo test --manifest-path native/Cargo.toml -p pymss-audio-host --lib
+  cargo build --manifest-path native/Cargo.toml -p pymss-audio-host
+  cargo build --manifest-path native/vendor/soundcraft-vst3-host/tests/fixture/Cargo.toml
+
+Run tests/manual/vst_host_smoke.py --help for local fixture checks.
+Run tests/manual/vst_real_plugin_smoke.py --help for user-supplied VST2/VST3/AU
+checks, explicit shell child selection and optional native-window validation.
+Run tests/manual/vst_host_fault_smoke.py --help for delay, chain-order and
+crash/hang recovery checks. They use task-specific audio and artifact directories.
+Run tests/manual/vst_processing_restrictions_smoke.py --help for VST3 mode
+admission and preview preservation checks through the native/application helper.
+Run tests/manual/aax_module_smoke.py --help for AAX module/ABI inspection checks.
+AAX diagnostics never enable AAX in the audio plugin library or processing graph.
+
+Upstream provenance: native/vendor/UPSTREAM.txt.
+Future work: native plugin compatibility validation, live input monitoring and
+recording latency calibration. AAX audio runtime development is deferred.
+
+Validation record (Windows x64, 2026-10-23 UTC)
+-----------------------------------------
+Frontend suite: 1045 passed, 3 skipped; frontend production build passed.
+Python audio worker: 22 passed. Native audio unit tests: 22 passed.
+Tauri process/state bridge: 8 focused tests passed.
+Vendored VST3 host: unit/integration suites and all standalone module-exit
+and main-thread programs passed.
+Fixture integration: 9 cases passed, including real 48 kHz device playback
+with silent output. Fault integration: 5 cases passed, including real delay
+compensation, nonlinear insert order, process crashes and hang recovery.
+TDR Nova 2.2.3 and BYOD 1.3.0: six native checks each passed; parameter
+changes affect audio, native windows open/reopen, and two fresh state restores
+produce identical rendered audio in these tests (RMS difference 0).
+UI interactions were checked at 1280x820 and 980x680 using actual Vue UI
+with a controlled transport. The complete debug Tauri application was built.
+
+Artifacts on this machine: E:/pymss-vst-lab-artifacts (reports, generated WAVs,
+plugin archives and UI screenshots). Third-party plugins were extracted only
+inside this artifact directory; no system plugin installation was performed.
+A lab-only Python venv was prepared below data-vst-lab/runtime-envs/cuda,
+using a lab-local .pth reference to existing system dependencies, and installing
+pymss 2.1.8 / pymss-core 0.1.11 only
+inside the venv. The system Python packages were not upgraded. Normal runtime
+activation and complete UI/encoding validation are recorded in the Tauri
+smoke report. This environment is local test data and is not part of source.
+
+Final complete Tauri smoke: 12/12 passed, normal application exit 0, no
+browser console errors. The runtime was activated through the existing
+activate_runtime command and validated by its real probe (ready=true).
+Real page metadata/waveforms, play/pause/save and both final encodings passed:
+WAV PCM24 at 48 kHz (48184 frames); FLAC PCM16 at 44.1 kHz (44269 frames).
+The output peak is half the source peak with the master at 50%, confirming
+that the neutral final encoding did not apply master gain a second time.
+Final report:
+E:/pymss-vst-lab-artifacts/tauri-smoke/20261023T160336.729089Z-12868/report.json
+
+Second iteration (2026-10-23 UTC)
+-------------------------------
+Native editor state is observed by session identity and monotonic revision.
+Parameter edits are debounced before capture/save; open editors also have a
+15-second fallback for non-parameter changes. Snapshot failure keeps a healthy
+host alive, dirty and retryable. A disconnected host requires explicit recovery
+from saved state rather than silently replacing the live controller.
+Undo/redo can restore only the selected plugin slots without replacing other
+live plugin states or the project's timeline/mixer edits.
+
+The SDK host now provides typed message attributes with COM ownership, UTF-16
+byte-capacity handling and owned binary payloads. Hidden/bypass parameters and
+preset refresh notifications reach the processor. Parameter queues accommodate
+all 4096 parameters allowed by the host's existing metadata limit.
+
+Latency recovery keeps the same plugin/controller instance and discards old
+audio epochs. A later user pause/seek/play takes precedence over the recovery.
+Stable first-process changes can also negotiate before offline output; a
+subsequent unstable change fails and removes the partial WAV. Render tasks are
+registered before scheduling so early cancellation cannot miss them. IPC request
+limits match the native 64 MiB input bound and validation errors preserve a
+healthy session.
+
+A state-capture pause is now owned by the request lifetime. Timeout, flush
+failure, or a full control queue cannot leave a late capture barrier holding
+the audio worker indefinitely.
+
+Second-iteration verification:
+- Complete frontend suite: 1056 passed, 3 skipped, 0 failures; build passed.
+- Native audio: 27 unit tests passed, including capture timeout/late-barrier
+  release and pause/seek/play recovery ordering.
+- SDK host: 18 unit tests + 11 integration tests and standalone main-thread /
+  module-exit checks passed.
+- Tauri bridge: 17 focused tests passed; normal/default Cargo check passed.
+- Dynamic/revision/state fixture suite: 11/11 passed on the final native binary.
+- TDR Nova 2.2.3 and BYOD 1.3.0: six real-plugin checks each passed again.
+- Actual Vue plugin UI, error/retry/reload confirmation, and both supported
+  window sizes passed the UI smoke.
+- Real Tauri automatic persistence: 6/6 passed on the final application build;
+  editor changes while paused were written to disk, restored after reopening,
+  and verified through rendered amplitude. Application exit 0, no console errors.
+- Complete real Tauri Nova/WAV/FLAC flow: 12/12 passed in this iteration.
+
+Latest reports:
+E:/pymss-vst-lab-artifacts/persistence-v2-final/20261023T164031.735699Z-12048/report.json
+E:/pymss-vst-lab-artifacts/dynamic-v2-final/20261023T164051.905342Z-14400/report.json
+E:/pymss-vst-lab-artifacts/tauri-smoke-v2-final/20261023T163808.297038Z-11328/report.json
+
+Third iteration (2026-10-23 UTC)
+------------------------------
+A bypassed VST3 whose binary, class, saved state, or initialization is unavailable
+can be left in its original slot while the rest of the project plays/exports.
+The host reports skipped slot identities and reasons; it never substitutes a
+new default state or replaces the project's original opaque state reference.
+An enabled unavailable plugin still blocks processing. Changing bypass state
+rebuilds the graph, so re-enabling a previously skipped slot cannot silently
+leave dry audio in its place. Previously open windows are restored only for
+instances that actually loaded.
+
+The inspector can relocate an existing slot to a scanned installation of the
+same plugin class. Its slot identity, state and other metadata are preserved;
+a different class cannot inherit that blob. Recovery edits capture the surviving
+native graph without first trying to apply a project that has already failed,
+retaining current GUI edits of healthy plugins.
+
+The plugin library now presents scan failures and explicit retry. The new
+plugin_host_scan_report command returns plugins, failures, scanned and cached;
+the original array command remains available. Successful and failed probes are
+fingerprint-cached, and a forced scan retries them. Missing custom paths report
+an error; absent platform-default paths are quietly skipped. Only the child
+process's project copy loses an unreadable bypassed state; persisted data keeps
+its original reference for later recovery.
+
+Continuous playback validation used 15 seconds, 6 tracks and 4 PCM sources.
+Two 720000-frame renders (neutral, and true track/master plugin delay) had zero
+maximum sample error. Silent device playback crossed the 4/8/12-second decoding
+boundaries and passed pause, nearby/distant seek, rapid seek, mixer updates and
+loop checks. Maximum observed wall-clock drift was 0.017 seconds; this run saw
+zero underruns, without treating that single measurement as a general guarantee.
+Report:
+E:/pymss-vst-lab-artifacts/streaming-v3/20261023T164742.773611Z-25996/report.json
+
+If a project update fails local state/FFmpeg validation before reaching the
+native process, the previously loaded healthy session remains available for
+recovery capture and a corrected update. New-project load failure and transport
+failure retain their previous cleanup rules. This prevents an attempted enable
+of a missing-state plugin from trapping subsequent bypass/remove/relocate edits.
+
+Third-iteration verification:
+- Native audio unit tests: 30 passed.
+- Tauri bridge/scan/state tests: 27 passed; default and experimental Cargo checks passed.
+- Complete frontend suite: 1063 passed, 3 skipped, 0 failures.
+- Dynamic-latency/state suite: 11/11 passed; fault/PDC suite: 5/5 passed.
+- Continuous multitrack playback and exact offline samples: 6/6 passed.
+
+- The complete experimental application build passed.
+- Actual Vue recovery/scanner UI: 10 scenarios passed at both supported sizes.
+- Real Tauri missing-plugin recovery: 12/12 passed, normal exit 0 and CDP released.
+  Enabled missing plugins remained strict; bypass kept the missing slot's original
+  state plus the healthy slot's current 0.8 gain. Same-class relocation restored
+  the missing slot's 0.3 gain and metadata; the final chain rendered at 0.24 gain.
+  A failed enable of an unreadable state kept the healthy session identity and
+  allowed subsequent bypass/remove. Playback, snapshots and normal close passed.
+Final recovery report:
+E:/pymss-vst-lab-artifacts/recovery-v3-final/20261023T165611.410854Z-12664/report.json
+UI report:
+E:/pymss-vst-lab-artifacts/ui-recovery/report.json
+
+Fourth iteration: cross-platform implementation (2026-10-24 local time)
+-------------------------------------------------------------------
+The vst-lab capability gate now enables Windows, macOS and Linux. Supported
+format remains VST3. VST2, AU and AAX are not implemented by this iteration.
+The frontend and Python separation worker were not changed in this iteration.
+
+Linux native editors use runtime-loaded X11 and XEmbed; Wayland sessions require
+XWayland and DISPLAY. Audio processing/offline rendering do not require DISPLAY.
+The SDK IRunLoop is available through both factory/instance host contexts and
+editor frames, with bounded descriptor/timer registrations, nonblocking polling,
+coalesced timers, bounded callback batches and reentrant unregister/cleanup.
+Registrations are cleared on failed initialization/attachment and destruction.
+The X connection and previous process error handler are restored on UI shutdown.
+
+macOS audio helpers initialize an accessory NSApplication, process native events
+and timers alongside JSON requests, and drain autoreleased objects each host
+tick. Plugin windows stay visible when focus returns to the desktop process.
+Windows uses the same event-pump entry point with bounded message batches.
+
+Unix helpers have dedicated process groups. Shared process leases serialize
+termination and reaping, preventing late cancellation from signalling a recycled
+PID. Active scanner, playback and render helpers are registered for app shutdown.
+Cancelled scans do not replace the previous cache with cancellation failures.
+Platform scan defaults now share one implementation and include macOS network
+and Linux lib64 locations.
+
+Code validation performed on Windows:
+- Native audio/protocol unit tests: 32 passed.
+- Vendored SDK unit tests: 21 passed (including platform-independent run-loop tests).
+- Tauri bridge unit tests: 33 passed with default features and 33 with vst-lab;
+  both backend Cargo checks passed. Terminal shutdown rejects later registrations.
+- Windows native workspace Cargo check passed.
+- Native audio host cross-check passed for aarch64-apple-darwin and x86_64-apple-darwin.
+- Linux SDK crate, including test sources, cross-check passed.
+- The actual isolated helper/lease/request bridge source typechecked for Linux
+  x86_64 and macOS ARM64/x86_64; this is not a full cross-platform Tauri build.
+- Full Linux audio-host cross-check is blocked by the absent ALSA/pkg-config cross
+  sysroot on this Windows machine; no substitute library metadata was used.
+
+No application UI, real plugin, device playback or export functional validation
+was performed in this iteration. macOS and Linux have not been tested natively.
+The manual-only VST Lab native validation workflow builds/checks and runs the
+focused SDK/audio/bridge suites on Windows, macOS and Linux when dispatched.
+It has not been dispatched, and no release or production CI workflow was changed.
+Local bridge logs and isolated cross-check metadata are under
+E:/pymss-vst-lab-artifacts/bridge-v4-*.
+
+Interface references:
+https://github.com/steinbergmedia/vst3_pluginterfaces/blob/master/gui/iplugview.h
+https://steinbergmedia.github.io/vst3_dev_portal/pages/Technical+Documentation/Locations+Format/Plugin+Locations.html
+https://developer.apple.com/documentation/appkit/nsapplication
+
+Fifth iteration: VST2 and AUv2 effect integration (2026-10-24 local time)
+--------------------------------------------------------------------
+The native graph now uses a shared effect adapter for VST3, VST2 and AUv2;
+track/master inserts can mix formats with the same existing PDC, crash recovery,
+snapshot barriers and offline render path. Capabilities advertise VST2 on all
+three desktop platforms, and AUv2 only on macOS. Unsupported enabled formats
+still fail; bypassed foreign/missing slots retain their original opaque state.
+
+VST2 supports native-architecture VST 2.4 float32 mono/stereo effects. It discovers
+Windows DLLs, macOS .vst bundles and Linux .so files. Shell containers, instruments,
+MIDI, additional buses, old Carbon views and architecture bridging are excluded.
+Windows/macOS can open native windows; macOS sends Cockos' Cocoa negotiation
+before passing an NSView. Linux VST2 uses generic parameter controls. Host callbacks
+use per-instance atomics and per-thread process levels; audio processing does not
+acquire a host mutex. Shutdown retires off-thread instances to their creating UI
+thread before closing windows and unloading their libraries.
+
+VST2 state uses a versioned envelope bound to effect ID, binary version and
+parameter count. Chunk state and parameter-only state are supported, with exact
+length/representation validation and a 32 MiB limit. A different binary version
+is deliberately rejected rather than implicitly migrating its saved state.
+
+AUv2 enumerates registered synchronous components in a separate scan helper;
+the system catalog is reprobed each scan. AU slots store their component identity
+as both pluginId and path, independent of the installed component bundle location.
+Only global writable parameters and a single main input/output bus are hosted.
+Native Cocoa views, AUv3/asynchronous components, instruments and additional buses
+are excluded. ClassInfo is stored as a bounded binary property-list dictionary;
+restored state is preserved across initialization without resending old defaults.
+Latency/tail notifications only publish an atomic dirty flag. Property queries
+run during stopped-worker renegotiation, and latency accumulation saturates so
+invalid reported values cannot wrap into a seemingly valid delay. Tail limits
+remain visible to exports. Input callbacks support repeated/overlapping buffers
+without constructing conflicting Rust slice references.
+
+The inspector now offers generic parameter controls with search, pagination,
+finite/range validation, toggles and choices. Requests use the session queue;
+project, session and slot identities prevent stale replies from applying to a
+replacement instance. Native plain-value caches are updated only after enqueue
+success. Scanning, state references and same-class relocation handle all formats;
+AU registry entries do not offer file relocation. Existing projects without
+plugins continue using their original playback/export route.
+
+Validation (code checks only):
+- Complete frontend suite: 1071 passed, 3 skipped; production frontend build passed.
+- Native audio/discovery/protocol suite: 37 passed.
+- VST2 adapter fake-ABI suite: 14 passed.
+- AU portable ID/controller/timing suite: 10 passed.
+- Vendored VST3 SDK suite: 21 passed.
+- Application bridge suite: 37 passed in default and vst-lab builds.
+- Full audio host, including test sources, cross-check passed for both macOS architectures.
+- VST2/AU/VST3 adapter test sources cross-check passed for Linux x86_64.
+- Full Linux audio-host compilation still requires the ALSA/pkg-config environment
+  described in the fourth iteration; the manual CI installs those dependencies.
+
+No real VST2/AU plugin, desktop UI, device playback, installed environment or final
+encoded export was exercised in this iteration. Windows VST3 runtime results above
+describe earlier commits, not runtime validation of these new adapters. No release
+or deployment was performed. Logs: E:/pymss-vst-lab-artifacts/multiformat-v5-*.
+AAX remains unimplemented pending a verified host integration contract.
+
+Additional references:
+https://github.com/RustAudio/vst-rs
+https://www.reaper.fm/sdk/vst/vst_ext.php
+https://github.com/apple/AudioUnitSDK/blob/main/src/AudioUnitSDK/AUBase.cpp
+https://developer.apple.com/documentation/audiotoolbox/audio-unit-v2-c-api
+
+Sixth iteration: native editors and complete platform checks (2026-10-24 local time)
+-------------------------------------------------------------------------------
+The original format/platform goal is tracked as follows (implementation, not a
+claim of native runtime compatibility):
+  Windows: VST2/VST3 effect DSP, state, generic controls and native editor windows.
+  macOS:   VST2/VST3/AUv2 effect DSP, state, generic controls and native Cocoa views.
+  Linux:   VST2/VST3 effect DSP, state, generic controls and X11/XWayland windows.
+  AAX:     recognized and reported unsupported; no host loader is implemented.
+
+Linux VST2 uses the modern JUCE/DPF contract: the numeric parent XID is passed in
+effEditOpen's pointer argument, with value zero. The shared host completes the
+parent window creation with XSync before a plugin on a different Display can
+attach. Resize requests are coalesced; plugins may provide their first rectangle
+after attachment, and old rectangles cannot overwrite newer SizeWindow requests.
+Native Wayland and older shared-Display/_XEventProc extensions remain outside scope.
+
+AU native editors resolve the component's AUCocoaUIBase factory and retain its
+bundle, factory and NSView until the view has detached. AUEventListener callbacks
+coalesce plain parameter values into bounded atomic mailboxes on the UI run loop.
+Generic-to-native-to-original-value changes remain observable. Closing or rapidly
+reopening a view captures pending final values before unregistering its listener.
+Units with no compatible Cocoa view can still use the generic parameter panel.
+
+AU view creation/closure runs behind the processing snapshot barrier. A user-closed
+window is detached behind the same barrier and its final edits reach the current
+session in the same idle tick. Session teardown joins the audio worker before
+closing native views, then destroys the processors. Off-thread retirement is drained
+by the UI loop. If AUListenerDispose fails, disabled callback storage and its unit
+remain alive until helper exit, preventing a callback into a disposed component;
+the affected view cannot be reopened until the helper is reloaded.
+
+The lab-only macOS entitlement permits third-party plugin libraries in future
+signed lab builds while retaining Hardened Runtime. The production config was
+not modified. The entitlement plist and effective Tauri lab overlay were parsed
+and checked by the Rust build. No signing, notarization or packaging was performed.
+
+AAX public documentation was rechecked: the Avid AAX SDK page describes developing
+plugins for Pro Tools/VENUE/Media Composer and directs downloads through an account
+and license agreement. It does not establish a third-party host loading contract.
+No account, SDK agreement, vendor correspondence or unverified host ABI was used.
+An .aaxplugin package (including a selected internal library) is rejected before
+binary probing/fingerprinting, preventing its libraries from being mistaken for
+VST2. Bypassed AAX slots continue preserving their original opaque project state.
+
+The earlier full Linux compilation blocker is now resolved using a real isolated
+Linux ALSA SDK. Debian bookworm libasound2-dev/libasound2 1.2.8 provide the actual
+headers, ELF64 library and .pc file; MSYS2 pkgconf 3.0.10 runs natively on Windows.
+Downloaded packages and repository metadata were checked with SHA-256, and all
+files remain under E:/pymss-vst-lab-artifacts/cross-sdk (about 9.82 MB downloaded).
+No global environment, installed runtime or project configuration was changed.
+Reproduce the complete Linux audio-host metadata/type check with:
+  python E:/pymss-vst-lab-artifacts/cross-sdk/check-linux.py
+The script preserves Debian's pkg-config prefix and validates the real ELF target.
+prepare.py, manifest.json and linux-audio-host-check.json/log record provenance.
+This check does not link or execute a Linux program.
+
+Validation (automated code checks):
+- Native audio/protocol/discovery: 41 unit tests passed.
+- VST2: 19 unit tests passed; AU portable event/controller tests: 14 passed.
+- VST3 SDK: 21 unit tests passed.
+- Tauri bridge: 38 passed in both default and experimental configurations.
+- Complete native audio host, including tests, passed cross-checks for Linux x86_64,
+  macOS ARM64 and macOS x86_64. macOS-specific Cocoa/event ABI tests were compiled,
+  not executed on this Windows machine.
+- Windows backend and effective experimental configuration Cargo checks passed.
+No real plugin/editor, native environment, playback or export was exercised.
+Logs: E:/pymss-vst-lab-artifacts/native-ui-v6-*.
+
+References:
+https://github.com/juce-framework/JUCE/blob/master/modules/juce_audio_processors/format_types/juce_VSTPluginFormat.cpp
+https://github.com/DISTRHO/DPF/blob/main/distrho/src/DistrhoPluginVST2.cpp
+https://developer.avid.com/aax/
+https://developer.avid.com/audio/
+https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.cs.disable-library-validation
+
+Seventh iteration: original requirement audit (2026-10-24 local time)
+------------------------------------------------------------------
+The complete requirement matrix, unmet requirements and current acceptance
+evidence are in VST-REQUIREMENTS-AUDIT.txt. The four-format/three-platform formal
+support target is not fully satisfied: AAX hosting is absent, and native platform,
+third-party VST2/AU and signed release validation remains outstanding.
+
+This audit found and fixed four flow gaps despite the previous unit suite passing:
+- Removing the last plugin invalidated the native pause request, locking transport.
+- Export preparation mixed a frozen mix with newer per-slot states. The whole
+  original project now freezes after capture, preserving one coherent revision.
+- Plugin stdout could corrupt JSONL. Helpers now retain a private non-inheritable
+  protocol output handle and redirect plugin-visible OS/CRT stdout to a null sink.
+  stderr remains unchanged; ordinary application launch is unaffected.
+- VST2/VST3 exports used cached tail lengths after parameter/preset changes. Stopped
+  control preparation refreshes latency+tail before and after startup probes,
+  retaining same-instance PDC and the existing tail cap without realtime polling.
+
+Regression evidence includes old-code failures, actual native helper plus the
+local fixture's C/Rust/Win32 stdout noise, and a tail-only edit/infinite-tail render.
+The manual platform CI now includes both native helper regression integration tests.
+Final checks: frontend 1078 passed/3 skipped and build passed; native 96 unit tests;
+audio helper 41 unit+2 integration; VST3 21 unit+11 integration+5 standalone lifecycle
+programs; bridge default/experimental 38 each. Linux and both macOS native host
+cross-checks passed. The current Windows lab executable also linked successfully
+through pnpm vst:build; no desktop UI or real third-party plugin was launched.
+Exact commands/exit codes/source hashes:
+E:/pymss-vst-lab-artifacts/requirements-v7-final-20261024T022413Z/source.json
+
+Eighth iteration: AUv3 and VST2 shell integration (2026-10-24 UTC)
+----------------------------------------------------------------
+VST2 scanning enumerates up to 4096 unique shell children without instantiating
+each child. Descriptors retain the binary path, child vst2:8HEX identity and
+isShellChild. Their isInstrument is null until actual loading validates effect
+category and bus layout. The selected ID is instance/thread scoped before the
+plugin entry point, through state/parameter/editor calls, processing and close.
+The state envelope remains bound to the actual child's ID, version and parameters.
+
+AU discovery now includes AUv3 and components requiring asynchronous creation.
+Legacy au: identities remain unchanged; extensions use au3: so v2/v3 components
+sharing four-char codes cannot reuse one another's state. AudioComponentInstantiate
+and kAudioUnitProperty_RequestViewController use Apple's documented compatibility
+bridge. Each asynchronous operation waits at most ten seconds while pumping the
+main event loop. Late controllers release on the UI thread before retiring units.
+Load/update/export preparation allows 20..120 seconds according to AU slot count,
+including bypassed slots that still initialize for state/controller access.
+Components missing the supported C parameter/state/DSP bridge report failures.
+Native 64-bit parameter addresses are not cast into 32-bit parameter IDs.
+
+The library labels AUv2/AUv3, VST2 Shell and VST3 variants explicitly. Scans expose
+auVersion/isShellChild and nullable instrument classification; cache version 2
+invalidates older unsupported-shell results. Single AU IDs can be inspected with
+--plugin-scan au:... or --plugin-scan au3:... on macOS.
+
+The portable manual harness uses the descriptor's actual format and supports:
+  python tests/manual/vst_real_plugin_smoke.py --host HOST --plugin BINARY_OR_AU_ID \
+    --plugin-id EXACT_ID --ffmpeg FFMPEG --output-dir ARTIFACTS
+Append --editor for native windows and --param-id ID (optionally --param-value N)
+for parameter/audio checks. Without these options those checks are reported as
+skipped. Restored-render comparison checks both channels and matching lengths;
+--restore-tolerance may be chosen for effects with nondeterministic output.
+Four portable harness tests require no plugin or audio device:
+  python -m unittest discover -s tests/manual -p test_vst_real_plugin_smoke.py
+
+Validation for this iteration is automated only: frontend 1085 passed/3 skipped
+and production build passed; native 113 unit tests (audio 44, VST2 27, AU 21,
+VST3 21), audio helper stdout/tail integration regressions, and bridge default/
+experimental 42 tests each passed. Full native host including tests cross-checked
+for Linux x86_64 and macOS ARM64/x86_64. Logs: E:/pymss-vst-lab-artifacts/native-v8-*.
+These checks do not execute a macOS/Linux program or any real VST2/AUv3 plugin.
+AAX hosting and native compatibility/release acceptance remain outstanding.
+
+Ninth iteration: live bypass and queued control identity (2026-10-24 UTC)
+-----------------------------------------------------------------------
+Healthy, already-loaded effects now switch host bypass without rebuilding the
+session or reopening native editors. The compensated dry path stays warm while
+the effect runs. Bypass suspends wet processing; re-enabling resets DSP history
+on the same processor and uses aligned dry samples during its latency refill.
+Parameters and native controller ownership remain intact. Tail/cap metadata is
+recomputed on the processing worker. A failed or recovering graph still takes
+the reload path, and enabling a missing bypassed effect still fails explicitly.
+
+Generic parameter reads/writes bind their target when called, before waiting in
+the serialized queue. Undo, relocation and session/slot replacement invalidate
+stale operations; routine capture of the same controller's opaque state remains
+valid. Bypass/remove/reorder actions resolve stable slot IDs after capture, so
+a changed chain cannot redirect the action to another effect.
+
+Regression evidence: the old helper changed session identity on bypass; fifteen
+new frontend regressions failed against the prior implementation. The current
+frontend suite passes 1102 tests with 3 skipped. Native audio passes 46 unit tests
+and four helper integration regressions. A headless local-fixture subprocess
+checks both channels across active/bypass/active transitions, three-sample latency,
+partial blocks and the restored wet gain. It opens no editor or audio device.
+Full native host/tests cross-checks pass for Linux x86_64 and macOS ARM64/x86_64.
+Logs: E:/pymss-vst-lab-artifacts/native-v9-* and parameter-target-v8/.
+Real plugin reset behavior and live transitions still need native acceptance;
+AAX and the built-in-effects/recording boundaries remain unchanged.
+
+Tenth iteration: built-in effects with native plugins (2026-10-24 UTC)
+--------------------------------------------------------------------
+Plugin projects can now use the existing reverb, delay, clarity and compressor
+controls. The native track path is clip gain/fades/pan and summing, then clarity,
+compressor, parallel dry/reverb/delay, plugin inserts and PDC. Track/master plugins
+and output gain keep their existing order. Live preview and plugin export use
+this same native graph; final Python encoding receives one neutral rendered track.
+
+The streaming DSP uses the worker's deterministic coefficients: one-pole highpass,
+memoryless compressor, six reverb taps and five delay echoes. It does not attempt
+bit parity with Web Audio's convolver/dynamics nodes; without-plugin processing
+is unchanged. Effects run once per summed track, rather than independently per
+clip. Highpass settling adds a relative -120 dB decay budget before serial plugin
+tails; the existing 30-second total cap and truncation report remain in effect.
+
+Configuration/ring allocation happens before the audio worker receives a mix
+update. Unchanged settings retain their filter and echo history; changed settings
+reset that track's built-in processor while keeping plugin instances/windows.
+Active effect histories have a 128 MiB aggregate limit. A single acknowledged mix
+update bounds ordinary replacement peaks to roughly 256 MiB. Failed updates do
+not replace the session specification. DSP processing performs no I/O/allocation.
+Older hosts without builtinEffects=true keep the existing explicit effect gate.
+
+Validation: frontend 1107 passed/3 skipped; native audio 59 unit tests and five
+helper integration regressions passed; Tauri default/experimental bridge tests
+42 each passed. Linux x86_64 and macOS ARM64/x86_64 full native-host/test cross-
+checks passed. The helper/FFmpeg/local-fixture export checks nonlinear ordering,
+stereo reference samples, track+master gain, IIR/tap tail length and same-session
+effect updates. It opens no editor or audio output device. This regression needs
+FFmpeg on PATH or PYMSS_TEST_FFMPEG; it reports when that optional decoder is absent.
+Logs: E:/pymss-vst-lab-artifacts/native-v10-* and builtin-effects-v9/.
+AAX, plugin-project recording and native platform/real-plugin acceptance remain
+outstanding. No release, remote CI or real third-party plugin was run this round.
+
+Eleventh iteration: recording with native accompaniment (2026-10-24 UTC)
+----------------------------------------------------------------------
+Plugin projects can now use the existing microphone recording/file lifecycle.
+This captures dry mono PCM16; plugins process backing audio and the recorded
+clip after capture. Live microphone routing through plugins and input/output
+hardware latency calibration are outside this implementation.
+
+Native playback gains a transient monitor operation for recording targets. It
+skips their decode/prefetch and silences their dry, effect and insert output,
+without editing persisted mute/solo flags or plugin state. Same-project graph
+rebuilds retain existing target IDs. Offline export clears this audition mask
+and restores it afterward, including failed/cancelled renders. Recording starts
+playback in a new epoch after the mask is acknowledged, discarding old queued audio.
+
+Capture stays in preparation while plugins load. Recorded samples own the
+recording clock; companion status updates meters and recording can continue
+after the backing timeline ends. Loop is temporarily disabled and restored.
+Late pause/status responses do not overwrite the final take position. Cancelling,
+same-ID project replacement and late microphone callbacks cannot attach data to
+a different lifecycle. Write failure or an 8 MiB PCM backlog stops input and
+cleans up the partial take after pending writes settle.
+
+Hosts must declare recording=true for plugin-project capture. Older hosts retain
+normal plugin play/seek without receiving the new monitor operation. Existing
+without-plugin recording remains available through its previous path.
+
+Validation: frontend 1132 passed/3 skipped, including nine capture lifecycle and
+70 focused playback checks. Native audio: 66 unit and seven helper integration
+tests passed; actual FFmpeg/local-fixture output is byte-identical with and
+without a preview mask. Tauri default/experimental bridge tests: 42 each.
+Linux x86_64 and both macOS native-host/test cross-checks passed. No actual
+microphone capture, output stream, editor window or real third-party plugin was opened.
+Logs: E:/pymss-vst-lab-artifacts/native-v11-* and native-recording-v10/.
+Physical capture timing, device permissions and latency remain native acceptance
+work. AAX hosting, signing/release acceptance and real plugin compatibility are
+still outstanding.
+
+Twelfth iteration: offline render context (2026-10-24 UTC)
+-------------------------------------------------------
+The load protocol now honors offline=true, and updates without the flag retain
+the session's mode. VST3 setupProcessing and all process/parameter-flush blocks
+agree on kOffline or kRealtime. VST2 processing/parameter flush callbacks report
+Offline or Realtime; editor/state/control callbacks remain User with nested and
+thread-local restoration. AUs receive the optional OfflineRender property while
+uninitialized, including AUv3 units exposed through the C compatibility bridge.
+Actual property/setup failures propagate; failed rollback prevents further use.
+Missing/read-only AU properties retain the ordinary effect implementation.
+
+Application export already owns a separate helper. A direct render request on
+a realtime helper now pauses and snapshots preview, then creates a temporary
+offline session on that helper's control/UI thread at the same sample rate.
+Its worker renders and returns ownership to the UI thread for disposal. The
+original preview mode, instance/controller, parameters, loop and monitor mask
+remain intact. Export errors and shutdown also release the temporary session.
+Offline sessions cannot open a playback stream. A mode-changing update keeps
+position/loop but does not try to resume audio when its target mode is offline.
+
+Validation: audio 67 unit + nine helper integration tests, VST2 30, portable AU
+30, VST3 21 unit + 11 integration tests and four isolated mode scenarios passed.
+FFmpeg plus local fixtures verify mode-specific gain, 11-frame PDC and combined
+track/master tails. Parameter/state retention, zero-frame flushes, invalid flags,
+mode inheritance, rejected setup and failed rollback are covered. Tauri vst-lab
+bridge: 42 tests passed. Linux x86_64 and both macOS full-host/test cross-checks
+passed. The normal pnpm vst:build entry passed typecheck/frontend production
+build and Windows debug linking. No frontend source changed; its full unit suite
+was not repeated. Logs: E:/pymss-vst-lab-artifacts/native-v12-*.
+The newly linked Tauri executable also passed ten headless --audio-host entry
+checks with the local fixture; the desktop UI, audio stream and Python runtime
+were not started. Report: native-v12-app-helper/report.json in that artifact root.
+
+These are headless/fixture and compile checks, not real-plugin, editor, device
+or macOS/Linux runtime acceptance. Separate offline instances can use different
+DSP settings and consume additional memory; actual quality is plugin-defined.
+The pre-existing VST3 latency/tail refresh path still needs an audit of SDK
+UI-thread affinity; this iteration keeps new mode setup/negotiation on the UI
+thread but does not claim to have completed that separate timing work.
+AAX hosting, signing/release acceptance, live input effects and physical capture
+latency calibration remain outstanding.
+
+Thirteenth iteration: control-thread VST3 timing (2026-10-24 UTC)
+----------------------------------------------------------------
+VST3 timing refresh no longer calls getLatencySamples/getTailSamples from the
+audio/render worker. A controller-independent timing reader validates its creating
+thread and shares the existing lifetime link. UI teardown cuts off its processor
+reference before termination/unloading. The worker consumes one atomic latency/
+tail pair and leaves restart notifications pending until a stopped UI refresh.
+
+A latency notification stops processing and deactivates/reactivates the component
+on the control thread before reading its new timing. Lifecycle flags are shared
+with the unique worker owner so processing restarts correctly. Transition failure
+blocks subsequent processing, flush, mode change and preparation until reload.
+Notifications raised by getters are retained; the host allows one further UI
+refresh within the same suspension, then fails if the plugin remains unstable.
+
+Live recovery holds the existing capture barrier while refreshing timing. Offline
+preparation/probes request the same refresh through a stopped-worker ticket and
+apply the result before PDC/output. The UI checks the ticket's deadline and cancel
+state before entering the SDK. A late queued ticket cannot query a resumed graph;
+an already running query must finish before the worker can proceed. A hung SDK
+call still requires the existing isolated-helper termination path.
+
+Rendering defers synchronous editor-close/capture idle work until completion,
+avoiding an AU close barrier waiting on the worker that awaits its UI timing reply.
+Preview sessions remain independently serviced when a temporary exporter is used.
+Startup probes now allow one timing adjustment per unique slot instead of one for
+the entire graph. Repeated changes in the same slot still fail before output.
+
+Regression evidence: the unchanged d7aa2f3 executable successfully loads a strict
+local fixture, then aborts on its worker-thread getLatencySamples during export.
+The new helper passes those strict getter/setActive thread checks. A two-insert
+startup regression also failed before the per-slot fix and now passes, including
+a notification from inside a getter; an unstable fixture still fails without WAV.
+
+Validation: audio 73 unit + 12 helper integration tests; VST3 21 unit + 11 fixture
+integration tests, four processing-mode and six timing-reader isolated scenarios;
+Tauri vst-lab bridge 42 tests passed. FFmpeg/fixture output checks both channels
+and sample alignment for track/master latency that only changes after activation.
+Expired/cancelled/in-flight tickets, AU close deferral, missing controller, released
+handles, native stop/reactivate failure and repeated export rejection are covered.
+Linux x86_64 and macOS ARM64/x86_64 full-host/test compile checks passed. No frontend
+source changed; its previous full unit suite was not repeated. Artifacts/logs:
+E:/pymss-vst-lab-artifacts/native-v13-*.
+The normal pnpm vst:build entry passed frontend typecheck/production build and
+Windows debug linking. The resulting executable passed ten headless --audio-host
+checks with strict timing, deferred activation latency and getter notifications.
+Its implementation/config/test source fingerprint remained unchanged during
+validation/build; executable/source hashes are in native-v13-build-artifact.json.
+
+No real third-party plugin, editor window, microphone or output stream was opened.
+macOS/Linux programs were not executed. These timing fixes resolve the code issue
+recorded in iteration twelve; AAX hosting, native compatibility and signed release
+acceptance remain outstanding.
+
+Fourteenth iteration: floating plugin manager (2026-10-24 UTC)
+------------------------------------------------------------
+Plugin library forms and generic controls moved out of the narrow inspector.
+The sidebar retains chain context, bypass and native-editor shortcuts. Manage
+plugins opens a wide, draggable, modeless panel with chain and library columns;
+long paths wrap, and error details/recovery stay in that panel. The existing
+theme and built-in component set are retained. The outdated instruction to
+disable built-in effects was removed from the plugin introduction.
+
+The manager uses the existing Vue owner and plugin/store APIs. It does not create
+another Tauri window or another graph/controller. Closing it preserves catalog,
+directories, selection and native editor lifetime. Project replacement closes
+the manager and rejects late scan/editor replies. Missing targets fall back to
+master, and an action awaiting state capture cannot recreate a removed track.
+
+Dropdowns and confirmation popups live under the floating card's keyboard
+boundary. Escape dismisses the active child before the manager. Confirmation
+buttons cannot trigger background playback/delete shortcuts. Resize clears only
+drag offsets, preserving controls and drafts. Numeric parameter inputs receive
+their accessible label on the input itself.
+
+Validation: frontend 1140 passed, three skipped; the focused panel suite passes
+15 tests. Its previous SFC passes the original seven and fails all eight new
+state/lifecycle regressions in an isolated comparison. Thirteen controlled-
+transport browser scenarios cover compact layout, dragging, resize, background
+loop control, close/reopen, generic parameter writes, chain actions, persistence,
+scan errors and recovery. Extra light/dark captures check 1280x820 and 980x680.
+The initial empty sidebar measures about 171 CSS pixels in that browser check.
+No real plugin, device or user project is manipulated by these UI checks.
+
+Windows lab build uses the normal pnpm vst:build entry. Native DSP/SDK code was
+not changed or retested in this UI iteration. Logs, screenshots and build hashes:
+E:/pymss-vst-lab-artifacts/plugin-manager-v14-* and native-v14-*.
+Fifteenth iteration: plugin manager layout and controls (2026-10-24 UTC)
+-----------------------------------------------------------------------
+Search locations now collapse to a single row, with manual paths and the existing
+native folder picker available on expansion. The library is a searchable list
+with visible selection and one add action. Generic parameters and chain controls
+stay in the left column; reorder, relocation and removal use labelled icon buttons.
+Empty, no-match and scan-failure states provide focused guidance. Scan failures
+retain full diagnostics under an expandable detail control.
+
+Existing descriptor labels still distinguish AU versions, shell classes and
+same-name installations. These details remain visible and accessible in the list;
+relocation preserves its strict format/identity filter. A filter cannot leave a
+hidden or unsupported candidate selected. Scan progress is separate from other
+busy operations. Keyboard boundaries, project lifetime guards and native window
+ownership remain with the existing panel/store paths.
+
+Validation: frontend 1144 passed, three skipped; focused panel tests include
+search, folder cancellation/deduplication, variant metadata and relocation.
+Fifteen controlled-transport browser scenarios passed without page errors. Five
+additional light/dark layouts cover 1440x900, 1280x820 and 980x680. Browser tests
+use synthetic projects and mock Tauri responses; they do not access user data or
+exercise real plugins/devices. Native DSP/SDK code remains unchanged.
+Artifacts: E:/pymss-vst-lab-artifacts/plugin-manager-v15-* and native-v15-*.
+
+Sixteenth iteration: explicit plugin sources and guided setup (2026-10-24 UTC)
+----------------------------------------------------------------------------
+The inspector now exposes one Audio plugins function button. The floating manager
+follows a left-to-right workflow: choose a source, identify effects, then add to
+the named track/master destination. Selecting a folder identifies its effects;
+cancelling does nothing. Search/add controls appear after identification, and a
+successful chain edit names its destination. Existing projects and effect state
+are preserved when library sources change.
+
+New source preferences restore only choices made through this workflow. Legacy
+experimental search paths are neither imported nor deleted. Both desktop scan
+commands now treat an empty source list as empty, without system/environment
+fallback or probing. macOS Audio Unit discovery is an explicit system-source
+action, using the existing au:system protocol; normal folder scans no longer
+append it. Native CLI defaults and saved AU project loading remain unchanged.
+Source revisions invalidate late scan replies and errors. Relative/invalid paths
+retain validation, and AU registry sources remain limited to macOS lab builds.
+
+The manager assigns its own content/footer classes to the existing Naive UI
+component. This fixes the previous selector mismatch and nested outer scrolling.
+Only long source lists, plugin results and effect chains need local scrolling;
+the workflow bar and add action remain visible at the desktop minimum size.
+
+Validation: frontend full suite 1148 passed, three skipped; 28 focused panel and
+locale checks passed after final UI changes. Windows plugin-host tests: 45 passed.
+Seventeen controlled-transport browser scenarios and five light/dark layout cases
+passed. Empty roots, old cached candidates, explicit AU gating, picker cancellation,
+source invalidation, saved chain preservation and footer visibility are covered.
+Browser/native unit checks use synthetic data, not user projects or real plugins.
+macOS/Linux runtime and real third-party plugin/device acceptance remain deferred.
+Artifacts: E:/pymss-vst-lab-artifacts/plugin-manager-v16-* and native-v16-*.
+
+Seventeenth iteration: ordinary host builds and categorized library (2026-10-24 UTC)
+-------------------------------------------------------------------------------
+The native-plugins feature owns host functionality; vst-lab includes it but keeps
+application identity, storage, singleton and updater isolation separate. Frontend
+startup uses the explicit labBuild capability to preserve ordinary update behavior.
+The opt-in plugins:build entry adds the plugin-loading macOS entitlement overlay.
+Default release workflows remain unchanged pending production acceptance.
+
+VST3 categories/subcategories and raw VST2 categories now survive the scan protocol.
+AU component identity is exposed without name-based category inference. The library
+supports vendor/type/format groups, category search and stable plugin identities.
+Cache version 3 refreshes old descriptors. Unknown and shell-child metadata remain
+unclassified; VST2 RoomFx remains a combined reverb/delay type.
+
+Validation: frontend 1157 passed, three skipped; final focused 51 passed; native
+workspace lib 159 passed. Tauri default/native-plugins/vst-lab tests: 46/47/47.
+Both Windows debug builds and ten headless helper checks per executable passed.
+Linux x64 and macOS ARM64/x64 native host/test metadata checks passed offline.
+Eighteen browser scenarios and five light/dark layouts passed. No new real-plugin,
+device, macOS/Linux runtime or signed-release acceptance is claimed. AAX has public
+SDK interfaces to investigate but still has no runtime adapter in this project.
+Logs/hashes: E:/pymss-vst-lab-artifacts/native-v17-* and plugin-manager-v17-*.
+
+Eighteenth iteration: AAX module inspection and VST3 restrictions (2026-10-24 UTC)
+--------------------------------------------------------------------------------
+native/aax-probe resolves Windows x64/macOS packages, inspects seven ACF exports
+and calls the public SDK-version ABI in a disposable --aax-probe helper. The
+Tauri command shares bounded scanner process ownership and cancellation. Module
+stdout is isolated; result/version strings preserve native precision. The
+report always has audioProcessingAvailable=false. Ordinary scan/load and the
+format capability list still exclude AAX audio processing. ACF services/factory,
+generic algorithm contexts, PCM/packet routing, state and UI remain missing.
+Public Avid SDK ABI sources and RAVET's limited self-owned Gain harness were
+reviewed without copying SDK implementations; see native/aax-probe/ABI-SOURCES.txt.
+
+VST3 OnlyARA and OnlyOfflineProcess are refused before normal-insert construction,
+including when caller metadata is stale. OnlyRT refuses fast offline processing
+before mutating a prepared instance. NoOfflineProcess remains allowed for normal
+downmix: it concerns direct offline processing. SDK abort guards and headless
+helper checks cover refusal, preserved preview/state/monitor and bypass recovery.
+
+Validation: native library tests AAX/audio/VST2/AU/VST3 = 6/76/31/30/23; AAX ABI
+integration 2 and audio-host integration 12 passed. SDK fixture integration 11,
+nine isolated processing modes and lifecycle programs passed. Tauri bridge
+default/native-plugins/vst-lab = 47/48/48. Windows native, ordinary-identity and
+Lab application helpers passed nine AAX and five VST3 checks each. Both Windows
+debug builds passed with unchanged implementation source fingerprints. Linux x64 and
+macOS ARM64/x64 audio-host and probe test sources passed six offline metadata
+checks; this does not establish platform runtime compatibility. Three Python
+files passed Ruff/syntax checks. CI now includes these isolated regressions.
+No new real plugins, audio devices, desktop windows or signed releases were run.
+Artifacts and final build fingerprints: E:/pymss-vst-lab-artifacts/native-v18-*.
+
+Nineteenth iteration: non-AAX effect hosts, release and close lifecycle (2026-10-24 UTC)
+------------------------------------------------------------------------------------
+AAX development is deferred. The active target is VST2/VST3 on three desktop
+platforms and macOS AUv2/AUv3. Native hosting is enabled by default; explicit
+minimal builds can pass -- --no-default-features through the Tauri build runner.
+All six release build entries use the native-plugin configuration. macOS default
+and final re-signing preserve plugin-loading and unrelated entitlements. Staged
+executables are checked through the early --plugin-host-capabilities query and
+isolated helper shutdown; this does not certify real-plugin compatibility.
+
+AU effects negotiate independent 1/2-channel inputs/outputs, map each direction
+and retain that exact layout across offline transitions/rollback. Explicit load
+can retry a transient initialization failure; metadata probes still coalesce it.
+
+Window close now persists state then awaits plugin graph release. Persistence
+failure offers retry, keep open or explicit discard; recording/export/update
+guards cannot be bypassed by that recovery. Discard blocks new autosave drains,
+does not write stale project data and checks project/generation/native identity.
+Successful status/snapshot responses track identities changed by latency recovery.
+Recovery controls isolate editor shortcuts and handle Escape explicitly. macOS
+menu Quit/Cmd+Q requests normal guarded window closes, with the main window last;
+Dock Quit/logout native termination remains outside this menu fix.
+
+Validation: frontend 1169 passed/3 skipped, close/persistence focus 60 passed;
+native audio/VST2/AU/VST3 library tests 76/31/35/23 passed, Tauri bridge 50 and quit
+requests 5 passed. Release focus 12 passed; related release regressions 24 passed
+and one platform skip. AU macOS ARM64/x64 plus full native-host Linux x64 and
+macOS ARM64/x64 test-source metadata checks passed offline. macOS Tauri full-app
+compilation/runtime and actual signed releases were not performed. No real plugins,
+audio devices or desktop windows were started. Artifacts: native-v19-* on E:.
+Windows ordinary/Lab/minimal debug builds all passed with unchanged source hashes.
+The ordinary exe passed the real staged-package verifier; Lab identity and disabled
+minimal capability responses were checked without creating desktop data. Each native
+application exe also passed five processing-restriction/state-preservation scenarios.
+
+Twentieth iteration: interruptible package scans (2026-10-24 UTC)
+----------------------------------------------------------------
+Independent scan IDs and package attempts own progress, skip and cancellation.
+Fifty-millisecond polling observes controls under the existing ten-second deadline;
+skip wins over a simultaneous successful reply. Cancellation can be followed by a
+new scan and does not poison the app-wide shutdown lease or affect playback/render.
+Manual skip has one persistence owner; restoring an exclusion cannot be undone by
+a late worker add. Cache commit also respects restore invalidations. UI polling and
+controls reject obsolete project/source/scan replies and clean up timers.
+
+Validation: Windows native bridge/control/storage 68 passed; frontend 1180 passed,
+three skipped, focused UI/locales 41 passed. Three actual Vue browser scenarios with
+mock IPC passed at two sizes, without page errors. Ordinary/Lab Windows debug builds
+and packaged capabilities/helper entry checks passed. No installed plugins, remote
+license servers, user windows, macOS/Linux desktop execution or signing were used.
+Unix descendant-held-pipe regression is included in the native validation workflow.
+Reports: E:/pymss-vst-lab-artifacts/native-v20-* and scan-control-ui/.
+
+Twenty-first iteration: plugin workbench and native dialog waits
+----------------------------------------------------------------
+The target selector moves into the header. The narrower grouped library keeps
+sources/blacklist/failures in source management; the main chain uses compact rows.
+Generic parameters are collapsed by default in a separate bounded dock. Numeric
+formatting preserves actual submitted precision, units and steps.
+
+A real installed ValhallaRoom 2.0.5 Windows VST3 opens an Authorization MessageBox
+and blocks its helper UI thread pending a user-selected license. The live bridge
+now retains one outstanding RPC while an owned visible standard Windows dialog is
+present. It strictly drains that reply ID before sending another operation, retains
+native identity/close semantics, and restores a bounded deadline after dismissal.
+Ordinary hangs, EOF and invalid IDs remain fatal. Scanners/temporary exporters keep
+their existing limits. Custom/non-Windows/external-process dialogs are not covered.
+
+The UI shows a recoverable warning and resumes observation, parameter reads and
+saving after dismissal. Pending waits do not become red notifications or unavailable
+sessions. Playback/pause observation also survives the wait. Unsaved state is retained.
+
+Validation: frontend 1192 passed/3 skipped; bridge 74 passed/one opt-in ignored.
+The ignored real-plugin observation was run explicitly and passed: the owned helper
+survived its real authorization window beyond 20 seconds, then was reaped. No license
+prompt was dismissed or activated; real post-authorization DSP/window recovery remains
+unverified. Actual Vue/browser tests with mock IPC passed 21 scenarios, including eight
+light/dark dialog recovery cases, no page errors and no red waiting notifications.
+Artifacts: native-v21-*, modal-backend-plugin-host.log, workbench-dialog-v7/ on E:.
+The user's existing application/project data and main branch remain untouched.
+Final Windows ordinary/Lab debug builds passed typecheck, frontend production build,
+linking, capabilities and helper shutdown. Source fingerprints match the final input;
+no desktop data directories were created by the headless verification.
+
+Twenty-second iteration: channel inspector and inline inserts (2026-10-25)
+----------------------------------------------------------------
+The right inspector now selects a track or the existing master output, with a visible
+master shortcut. Volume, pan, stereo meters and insert chains follow the same target;
+library target selection updates the global selection. Existing master state/setters,
+undo and saving are reused without changing the project format. Track-only clip,
+source and built-in effect controls remain scoped to tracks. Channel tokens cannot
+collide with real track identifiers such as master or IDs containing colons.
+
+Inserts are visible directly in the inspector: open/close native UI, enable/bypass,
+reorder, remove and open advanced parameters. The existing floating library retains
+source selection, scanning and blacklist management. No audio-engine replacement or
+bottom mixer was introduced. The Rust native plugin helper remains the DSP path.
+
+Validation: frontend 1200 passed/3 skipped; six channel browser scenarios plus 21
+workbench and 18 full regression scenarios passed with mocked IPC and no page errors.
+Light/dark themes and 1400x900/980x680 layouts were inspected. Reports and final Lab
+build fingerprints: native-v22-*, channel-inspector-v4/, channel-workbench-v2/ and
+channel-regression-v2/ under E:/pymss-vst-lab-artifacts. These checks do not certify
+real DSP/hardware or macOS/Linux. Existing user windows/projects remain untouched.
+
+Twenty-third iteration: channel strip and built-in effects removal (2026-10-25)
+-----------------------------------------------------------------------------
+The inspector is now a channel strip: pan, M/S, vertical fader with stereo meter
+and dB readout on the left, insert slots on the right. When a track is selected,
+a compact master row shows the summed master level and switches to the master.
+
+The built-in reverb/delay/clarity/compressor track effects are removed from all
+layers, superseding the tenth iteration: Web Audio preview nodes, the browser
+offline effect render (editorRender/editorEffects and the Tauri commands
+append_editor_export_render_chunk/cleanup_editor_export_render), the Python
+worker effect DSP/tail, the native graph effect processor and its 128 MiB history
+budget, and the builtinEffects capability. Older projects drop track effects on
+load; the native protocol and Python worker silently ignore a legacy effects field.
+Old .export-render temporary directories are no longer cleaned automatically.
+
+Validation: frontend 1190 passed/3 skipped, production build passed; native audio
+host 65 unit + 13 integration tests; Tauri vst-lab 335 passed/3 ignored; Python
+694 passed (WorkbenchNativeTests excluded: the local pymss lacks pymss.graph,
+unrelated to this change). Channel strip UI checked with mocked IPC in light/dark
+at 1400x900 and 980x680. Manual Playwright smoke scripts touched by the removal
+were edited but not rerun.
+
+Responsive editor layout follow-up (2026-10-25)
+---------------------------------------------
+Panel visibility and fitted widths now follow the editor container, with a
+ResizeObserver and a window-resize fallback. Automatic fitting does not overwrite
+saved widths or collapsed choices. Both panels shrink to their minimums before
+hiding the lower-priority panel; expanding a hidden launcher takes priority and
+wide windows restore requested panels. Manual drag reversals remain possible when
+the opposite panel reclaims space. A new optional panelPriority preference records
+explicit user choices. Unset inspector widths adapt to wider containers.
+
+The toolbar uses compact/two-row arrangements in narrower containers. Channel
+strips adjust to their own width and available height; hidden panels cannot retain
+keyboard interaction. Plugin managers expand on wide screens, fit short windows,
+and retain bounded lists and parameter controls. No audio or project format changes.
+
+Validation: frontend 1212 passed/3 skipped; 40 actual Vue/mock IPC responsive cases
+passed across light/dark, Chinese/English and 800x600 through 3840x2160 viewports.
+These include preferred-width restoration, manual resizing, constrained reverse
+dragging, hidden-panel focus and explicit collapsed state. Plugin workbench 21,
+inline-toolbar geometry 64, and the full slider reset/keyboard/undo/save smoke passed.
+Reports: responsive-ui-v4/, responsive-workbench/, responsive-toolbar/ and
+responsive-sliders/ under E:/pymss-vst-lab-artifacts. Native DSP, physical display
+scaling and other operating systems were not tested by these browser scenarios.

@@ -13,8 +13,12 @@
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:all": "pnpm test:frontend && pnpm test:python && pnpm test:rust",
     "preview": "vite preview",
-    "tauri": "tauri",
-    "tauri:preview": "tauri dev --config src-tauri/tauri.preview.conf.json"
+    "tauri": "node scripts/tauri.mjs",
+    "tauri:preview": "node scripts/tauri.mjs dev --config src-tauri/tauri.preview.conf.json",
+    "vst:dev": "node scripts/vst-lab.mjs dev",
+    "vst:build": "node scripts/vst-lab.mjs build",
+    "plugins:build": "node scripts/tauri.mjs build --config src-tauri/tauri.plugins.conf.json --features native-plugins",
+    "test:native-audio": "cargo test --manifest-path native/Cargo.toml -p pymss-audio-host --lib"
   },
   "dependencies": {
     "@comfyorg/litegraph": "0.17.2",

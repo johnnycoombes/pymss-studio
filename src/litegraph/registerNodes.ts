@@ -402,10 +402,47 @@ export function refreshNodeModelOptions(node: any, values: string[]) {
   widget.options.values = values
 }
 
+const PLUGIN_NODE_SPECS: Record<string, NodeSpec> = {}
+let pluginSpecsLoaded = false
+
+/** Reconcile the current runtime's plugin declarations without replacing built-ins. */
+export function registerPluginNodeSpecs(specs: NodeSpec[]) {
+  const next = new Map(specs.filter(spec => spec?.type && !NODE_SPECS[spec.type] && !BUILTIN_SPECS[spec.type])
+    .map(spec => [spec.type, spec]))
+  const remove = (type: string) => {
+    delete PLUGIN_NODE_SPECS[type]
+    if (registered) LiteGraph.unregisterNodeType(type)
+    for (let index = registeredNodeClasses.length - 1; index >= 0; index--) {
+      if (registeredNodeClasses[index]?.spec.type === type) registeredNodeClasses.splice(index, 1)
+    }
+  }
+  for (const type of Object.keys(PLUGIN_NODE_SPECS)) {
+    if (!next.has(type)) remove(type)
+  }
+  for (const spec of next.values()) {
+    const existing = PLUGIN_NODE_SPECS[spec.type]
+    if (existing && JSON.stringify(existing) === JSON.stringify(spec)) continue
+    if (existing) remove(spec.type)
+    PLUGIN_NODE_SPECS[spec.type] = spec
+    if (registered) {
+      const cls = makeNodeClass(spec) as any
+      LiteGraph.registerNodeType(spec.type, cls)
+      cls.category = translateNodeCategory(spec.category)
+      registeredNodeClasses.push({ cls, spec })
+    }
+  }
+  pluginSpecsLoaded = true
+}
+
+export function pluginNodeSpecsLoaded() {
+  return pluginSpecsLoaded
+}
+
 function specForNode(node: AnyNode): NodeSpec | undefined {
   const type = String(node?.type || '')
   return NODE_SPECS[type]
     || BUILTIN_SPECS[type]
+    || PLUGIN_NODE_SPECS[type]
     || NODE_SPECS[type.replace(/^pymss_/, '')]
 }
 
@@ -509,6 +546,7 @@ function makeNodeClass(spec: NodeSpec): any {
   const klass = class extends LGraphNode {
     static title = translateNodeTitle(spec)
     static category = translateNodeCategory(spec.category)
+    static skip_list = Boolean(spec.hidden)
     stems: string[] = spec.dynamicStems ? DEFAULT_STEMS : []
 
     constructor(title?: string) {
@@ -543,6 +581,14 @@ function makeNodeClass(spec: NodeSpec): any {
       localizeNodeWithSpec(this, spec)
       if (isWorkflowSeparationNodeType(spec.type)) {
         this.setSize([Math.max(this.size[0], SEPARATE_NODE_MIN_WIDTH), this.size[1]])
+      } else {
+        // Widen short-spec nodes so the title is not truncated by the 140px
+        // default: estimate ~7px per CJK char and ~6.3px per latin char.
+        const title = String(this.title || spec.title || '')
+        let estimate = 0
+        for (const ch of title) estimate += ch.charCodeAt(0) > 0x2e80 ? 7.2 : 6.3
+        const minTitleWidth = Math.ceil(estimate) + 34 // padding + title dot
+        if (this.size[0] < minTitleWidth) this.setSize([minTitleWidth, this.size[1]])
       }
     }
 
@@ -607,6 +653,7 @@ export function allNodeTypes(): string[] {
     if (isWorkflowSeparationNodeType(spec.type)) types.add(`pymss_${spec.type}`)
   }
   for (const spec of Object.values(BUILTIN_SPECS)) types.add(spec.type)
+  for (const spec of Object.values(PLUGIN_NODE_SPECS)) types.add(spec.type)
   return [...types]
 }
 
@@ -618,6 +665,9 @@ export function registerPymssNodes(translator?: NodeTranslator) {
   const register = (spec: NodeSpec, type = spec.type) => {
     const cls = makeNodeClass(spec) as any
     LiteGraph.registerNodeType(type, cls)
+    // Native search enumerates the registry without checking skip_list.
+    // Keep legacy types addressable by name for imports, outside that catalog.
+    if (spec.hidden) Object.defineProperty(LiteGraph.registered_node_types, type, { enumerable: false })
     // registerNodeType 用 type 名派生 category(无 '/' 时置空串,覆盖类的
     // static category),导致右键 Add Node 菜单按类别分组为空。补回 spec.category。
     cls.category = translateNodeCategory(spec.category)
@@ -632,6 +682,9 @@ export function registerPymssNodes(translator?: NodeTranslator) {
     }
   }
   for (const spec of Object.values(BUILTIN_SPECS)) {
+    register(spec)
+  }
+  for (const spec of Object.values(PLUGIN_NODE_SPECS)) {
     register(spec)
   }
 }

@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { isTutorialFrame } from '@/features/onboarding/demoContext'
+import { computed, nextTick, onScopeDispose, ref, watch } from 'vue'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { FolderOpenOutline, MusicalNotesOutline, OptionsOutline } from '@vicons/ionicons5'
 import { useEditorStore } from '@/stores/editor'
+import { currentPluginSession, observePluginTransport } from '@/utils/pluginHost'
 import { useTaskStore } from '@/stores/task'
 import { useSettingsStore } from '@/stores/settings'
 import EditorAssetPanel from '@/components/editor/EditorAssetPanel.vue'
@@ -95,11 +97,14 @@ const {
   session,
   clearAssetPointerDrag,
 })
-const { isDraggingExternal } = useEditorProjectBridge({
+const { isDraggingExternal, isDraggingExternalOnMixer, isImportingExternal } = useEditorProjectBridge({
   routeProjectId,
   hasTauriApis,
   editor,
   assetPanelEl,
+  mixerRef,
+  canDropToMixer: () => !recordingBusy.value,
+  zoomFactor: computed(() => settings.scaleFactor),
   message,
   t,
 })
@@ -241,7 +246,23 @@ async function togglePlayback() {
   if (!ok && playbackError.value) message.error(playbackError.value)
 }
 
+let nativeShortcutDisposed = false
+let nativeShortcutQueue = Promise.resolve()
+const stopNativeShortcuts = observePluginTransport(request => {
+  nativeShortcutQueue = nativeShortcutQueue.then(async () => {
+    const current = currentPluginSession()
+    if (nativeShortcutDisposed || editor.session !== request.project || current !== request.session
+      || current.sessionId !== request.sessionId || current.transportOwner !== request.owner) return
+    await togglePlayback()
+  }).catch(cause => { if (!nativeShortcutDisposed) message.error(String(cause)) })
+})
+onScopeDispose(() => { nativeShortcutDisposed = true; stopNativeShortcuts() })
+
 async function handleRecordingToggle() {
+  if (recordingState.value === 'idle' && isImportingExternal.value) {
+    message.warning(t('editor.recordingImportPending'))
+    return
+  }
   const wasRecording = isRecording.value
   const ok = await toggleRecording()
   if (!ok && recordingError.value) {
@@ -376,9 +397,26 @@ function handleClipTiming(payload: {
 }
 
 async function save() {
-  await editor.saveProject()
-  message.success(t('editor.saved'))
+  try {
+    await editor.saveProject()
+    message.success(t('editor.saved'))
+  } catch (cause) { if (!editor.pluginStateError) message.error(editor.lastError || String(cause)) }
 }
+
+watch(() => editor.pluginStateError, error => {
+  const host = currentPluginSession()
+  if (error && !(host?.project === editor.session && host.interactionRequired)) message.error(error, { duration: 10000 })
+})
+
+onBeforeRouteLeave(async () => {
+  try {
+    if (editor.session) await editor.releasePluginSession(editor.session)
+    return true
+  } catch (cause) {
+    if (!editor.pluginStateError) message.error(editor.lastError || String(cause))
+    return false
+  }
+})
 
 useEditorShortcuts({
   togglePlay: togglePlayback,
@@ -421,7 +459,7 @@ watch(
       :style="shellStyle"
       @contextmenu.prevent
     >
-      <EditorTransportBar
+      <EditorTransportBar data-guide="demo-editor-transport"
         :session-name="sessionName"
         :track-count="session?.tracks.length || 0"
         :current-time="playbackCurrentTime"
@@ -441,6 +479,7 @@ watch(
         :missing-asset-preview="missingAssetPreview"
         :relinking-missing-assets="relinkingMissingAssets"
         :recording-state="recordingState"
+        :recording-start-disabled="isImportingExternal || isTutorialFrame()"
         :recording-devices="recordingDevices"
         :recording-device-id="recordingDeviceId"
         :recording-input-level="recordingInputLevel"
@@ -503,7 +542,7 @@ watch(
             </button>
           </div>
 
-          <div ref="assetPanelEl" class="editor-shell__asset-panel">
+          <div ref="assetPanelEl" class="editor-shell__asset-panel" :inert="!assetPanelVisible" :aria-hidden="!assetPanelVisible">
             <EditorAssetPanel
               :sources="librarySources"
               :tree="editor.assetTree"
@@ -526,7 +565,7 @@ watch(
         </div>
 
         <div class="editor-shell__center">
-          <EditorMixer
+          <EditorMixer data-guide="demo-editor-mixer"
             ref="mixerRef"
             :tracks="session.tracks"
             :source-map="editor.sourceMap"
@@ -537,6 +576,8 @@ watch(
             :pixels-per-second="editor.pixelsPerSecond"
             :track-levels="trackLevels"
             :editing-disabled="recordingBusy"
+            :external-dragging="isDraggingExternalOnMixer"
+            :external-importing="isImportingExternal"
             :recording-preview="recordingPreview"
             @scroll-ready="handleMixerScrollReady"
             @select-track="editor.selectTrack"
@@ -584,7 +625,7 @@ watch(
             <n-icon :component="OptionsOutline" />
             <em>{{ t('editor.inspectorTitle') }}</em>
           </button>
-          <div class="editor-shell__inspector-panel">
+          <div class="editor-shell__inspector-panel" :inert="!inspectorPanelVisible" :aria-hidden="!inspectorPanelVisible">
             <EditorInspectorPanel
               :session="session"
               :selected-track-id="editor.selectedTrackId"
@@ -593,16 +634,25 @@ watch(
               :duration="displayedTimelineDuration"
               :last-export-path="editor.lastExport?.path || null"
               :compact="inspectorPanelWidth <= 248"
+              @select-track="editor.selectTrack"
+              @toggle-playback="togglePlayback"
+              @set-master-volume="setMasterVolume"
+              @set-master-pan="setMasterPan"
+              @set-master-limiter="editor.setMasterLimiter"
+              @begin-master-limiter="editor.beginInteraction"
+              @commit-master-limiter="editor.commitInteraction"
+              @begin-master-volume="editor.beginInteraction"
+              @commit-master-volume="editor.commitInteraction"
+              @begin-master-pan="editor.beginInteraction"
+              @commit-master-pan="editor.commitInteraction"
               @rename-track="editor.renameTrack"
+              @toggle-track-flag="(trackId, flag) => editor.toggleTrackFlag(trackId, flag)"
               @set-track-volume="setTrackVolume"
               @set-track-pan="setTrackPan"
-              @set-track-effects="editor.setTrackEffects"
               @begin-track-volume="editor.beginInteraction"
               @commit-track-volume="editor.commitInteraction"
               @begin-track-pan="editor.beginInteraction"
               @commit-track-pan="editor.commitInteraction"
-              @begin-track-effects="editor.beginInteraction"
-              @commit-track-effects="editor.commitInteraction"
               @set-clip-fades="setClipFades"
               @set-clip-timing="handleClipTiming"
               @begin-clip-timing="editor.beginInteraction"
@@ -630,6 +680,7 @@ watch(
       :exporting="editor.exporting"
       :export-cancelling="editor.exportCancelling"
       :export-progress="exportProgressPercentage"
+      :export-progress-indeterminate="!editor.exportProgress || (editor.exportProgress.phase === 'preparing' && editor.exportProgress.completed === 0)"
       :export-progress-text="exportProgressText"
       :format="exportFormatDraft"
       :wav-bit-depth="exportWavBitDepthDraft"
@@ -668,6 +719,9 @@ watch(
   --inspector-width: 268px;
   position: relative;
   height: calc(100vh - 40px);
+  height: calc(100dvh - 40px);
+  container-type: inline-size;
+  container-name: editor-shell;
   display: grid;
   grid-template-columns:
     calc(var(--asset-rail-width) + var(--asset-panel-width))
@@ -711,6 +765,11 @@ watch(
 
 .editor-shell__assets--collapsed {
   border-right-color: color-mix(in srgb, var(--outline) 46%, transparent);
+}
+
+.editor-shell__assets--collapsed .editor-shell__asset-panel {
+  visibility: hidden;
+  pointer-events: none;
 }
 
 .editor-shell__asset-rail {

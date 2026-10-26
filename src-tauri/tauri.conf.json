@@ -36,8 +36,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "deb", "rpm"],
+    "targets": [
+      "app",
+      "dmg",
+      "deb",
+      "rpm"
+    ],
     "resources": [
+      "resources/plugin-sdk/*",
       "../python/*.py",
       "../python/*.json",
       "../python/*.txt",
@@ -55,7 +61,8 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "minimumSystemVersion": "14.0.0"
+      "minimumSystemVersion": "14.0.0",
+      "entitlements": "entitlements.plugins.plist"
     },
     "publisher": "TheSmallHanCat"
   },

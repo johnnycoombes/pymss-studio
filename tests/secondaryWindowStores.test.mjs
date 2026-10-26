@@ -21,6 +21,7 @@ const { useModelStore } = await vite.ssrLoadModule('/src/stores/model.ts')
 const { useSettingsStore } = await vite.ssrLoadModule('/src/stores/settings.ts')
 const { useUpdateStore } = await vite.ssrLoadModule('/src/stores/update.ts')
 const { useAppStore } = await vite.ssrLoadModule('/src/stores/app.ts')
+const { useBeginnerGuideStore } = await vite.ssrLoadModule('/src/stores/beginnerGuide.ts')
 const stores = []
 const clone = value => JSON.parse(JSON.stringify(value))
 const waitForSave = () => new Promise(resolve => setTimeout(resolve, 170))
@@ -45,7 +46,6 @@ function environment(initial = {}) {
   let failWrites = false
   let confirmCalls = 0
   let callbackId = 0
-  let secondaryUpdateGate = null
   function activate(label, pinia) {
     if (pinia) setActivePinia(pinia)
     globalThis.window = {
@@ -70,13 +70,14 @@ function environment(initial = {}) {
             return { models: [], categories: [], categoriesCn: [], modelDir: args.payload.modelDir }
           }
           if (command === 'get_model_storage_summary') return { models: [], modelDir: args.payload.modelDir }
+          if (command === 'get_managed_update_state') return { restartRequired: false }
+          if (command === 'unregister_custom_model') return { name: args.payload.name, deletedFiles: false, fileDeletionSupported: false, filesDeleted: [], errors: [] }
           if (command === 'confirm_model_dir_migration_switch') {
             if (++confirmCalls > 1) throw new Error('migration task not found')
             return { accepted: true }
           }
           if (command === 'plugin:event|listen' || command === 'plugin:event|unlisten') return ++callbackId
           if (command === 'check_managed_update') {
-            if (label !== 'main' && secondaryUpdateGate) await secondaryUpdateGate
             return {
               currentVersion: '0.0.12', version: '0.0.13', prerelease: false, distribution: 'portable',
               autoUpdateSupported: true, requiresManualInstall: false,
@@ -101,11 +102,6 @@ function environment(initial = {}) {
   }
   return {
     state, calls, writes, instance, fail: value => { failWrites = value },
-    holdSecondaryUpdateCheck() {
-      let resume
-      secondaryUpdateGate = new Promise(resolve => { resume = resolve })
-      return resume
-    },
   }
 }
 
@@ -113,6 +109,126 @@ const activeDownload = {
   taskId: 'download_a', model: 'Model', status: 'downloading', progress: 20,
   message: 'Downloading', completedFiles: 0, totalFiles: 1, updatedAt: 1, logs: [], seen: true,
 }
+
+test('legacy installations persist the tutorial invitation separately from their saved progress', async () => {
+  for (const status of ['unseen', 'pending', 'active', 'skipped', 'completed']) {
+    const env = environment({ 'app-settings': { startupOnboardingSeenVersion: '0.0.21', defaultDevice: 'cuda:0',
+      beginnerGuideProgress: { status, step: 0, stepId: 'toolsOverview' } } })
+    const main = env.instance('main')
+    await main.settings.initialize()
+    assert.equal(main.settings.shouldShowStartupOnboarding, false)
+    assert.equal(main.settings.beginnerGuideInvitationSeen, false)
+    const progress = clone(main.settings.beginnerGuideProgress)
+    const guide = useBeginnerGuideStore(main.pinia)
+    stores.push(guide)
+    guide.offer()
+    assert.equal(guide.phase, 'invitation', status)
+    await waitForSave()
+    assert.equal(env.state['app-settings'].beginnerGuideInvitationSeen, true)
+    assert.deepEqual(env.state['app-settings'].beginnerGuideProgress, progress)
+    assert.equal(env.state['app-settings'].defaultDevice, 'cuda:0')
+
+    const restarted = env.instance('main')
+    await restarted.settings.initialize()
+    const nextGuide = useBeginnerGuideStore(restarted.pinia)
+    stores.push(nextGuide)
+    nextGuide.offer()
+    assert.equal(nextGuide.phase, 'closed', status)
+    assert.deepEqual(clone(restarted.settings.beginnerGuideProgress), progress)
+  }
+})
+
+test('new users receive one tutorial invitation after setup and secondary windows cannot consume it', async () => {
+  const env = environment({ 'app-settings': { startupOnboardingSeen: false } })
+  const child = env.instance('editor-a')
+  await child.settings.initialize()
+  const childGuide = useBeginnerGuideStore(child.pinia)
+  stores.push(childGuide)
+  childGuide.offer(); childGuide.start(true); childGuide.end('skipped')
+  await waitForSave()
+  assert.equal(child.settings.beginnerGuideInvitationSeen, false)
+  assert.equal(env.writes.length, 0)
+
+  const main = env.instance('main')
+  await main.settings.initialize()
+  assert.equal(main.settings.shouldShowStartupOnboarding, true)
+  assert.equal(main.settings.beginnerGuideInvitationSeen, false)
+  await main.settings.markStartupOnboardingCompleted()
+  const guide = useBeginnerGuideStore(main.pinia)
+  stores.push(guide)
+  guide.offer(); guide.end('skipped')
+  await waitForSave()
+  const restarted = env.instance('main')
+  await restarted.settings.initialize()
+  assert.equal(restarted.settings.shouldShowStartupOnboarding, false)
+  assert.equal(restarted.settings.beginnerGuideInvitationSeen, true)
+  assert.equal(restarted.settings.beginnerGuideProgress.status, 'skipped')
+  const nextGuide = useBeginnerGuideStore(restarted.pinia)
+  stores.push(nextGuide)
+  nextGuide.offer()
+  assert.equal(nextGuide.phase, 'closed')
+})
+
+test('legacy MP3 bitrate is migrated without changing AAC preferences or unfinished guide progress', async () => {
+  const env = environment()
+  Object.assign(env.state['app-settings'], { mp3BitRate: '512k', m4aBitRate: '512k', beginnerGuideInvitationSeen: true,
+    beginnerGuideProgress: { status: 'active', step: 0, stepId: 'toolsOverview' } })
+  const main = env.instance('main')
+  await main.settings.initialize()
+  const progress = clone(main.settings.beginnerGuideProgress)
+  assert.equal(main.settings.mp3BitRate, '320k')
+  assert.equal(main.settings.getAudioParams().mp3_bit_rate, '320k')
+  assert.equal(main.settings.m4aBitRate, '512k')
+  await waitForSave()
+  assert.equal(env.state['app-settings'].mp3BitRate, '320k')
+  assert.equal(env.state['app-settings'].m4aBitRate, '512k')
+  assert.equal(env.state['app-settings'].proxyUrl, 'http://127.0.0.1:7001')
+  assert.deepEqual(env.state['app-settings'].beginnerGuideProgress, progress)
+  const reopened = env.instance('main')
+  await reopened.settings.initialize()
+  assert.equal(reopened.settings.mp3BitRate, '320k')
+  assert.equal(reopened.settings.m4aBitRate, '512k')
+  assert.deepEqual(clone(reopened.settings.beginnerGuideProgress), progress)
+})
+
+test('supported MP3 rates are preserved and invalid runtime values cannot be submitted or persisted', async () => {
+  for (const rate of ['128k', '192k', '256k', '320k']) {
+    const env = environment()
+    env.state['app-settings'].mp3BitRate = rate
+    const main = env.instance('main')
+    await main.settings.initialize()
+    assert.equal(main.settings.mp3BitRate, rate)
+    assert.equal(main.settings.getAudioParams().mp3_bit_rate, rate)
+  }
+  const env = environment()
+  const main = env.instance('main')
+  await main.settings.initialize()
+  main.settings.mp3BitRate = '512k'
+  assert.equal(main.settings.getAudioParams().mp3_bit_rate, '320k')
+  await waitForSave()
+  assert.equal(env.state['app-settings'].mp3BitRate, '320k')
+})
+
+test('secondary windows normalize legacy MP3 preferences without rewriting shared settings', async () => {
+  const env = environment()
+  env.state['app-settings'].mp3BitRate = '512k'
+  const child = env.instance('editor-a')
+  await child.settings.initialize()
+  assert.equal(child.settings.mp3BitRate, '320k')
+  assert.equal(child.settings.getAudioParams().mp3_bit_rate, '320k')
+  await waitForSave()
+  assert.equal(env.state['app-settings'].mp3BitRate, '512k')
+  assert.equal(env.writes.length, 0)
+})
+
+test('custom model removal sends the configured model directory to the worker', async () => {
+  const env = environment()
+  const main = env.instance('main')
+  await main.settings.initialize()
+  await main.models.removeCustomModel('my_model', true)
+  const removal = env.calls.find(call => call.command === 'unregister_custom_model')
+  assert.deepEqual(removal.args.payload, { name: 'my_model', deleteFiles: true, modelDir: 'D:/old-models' })
+})
 
 test('secondary workflow and audio windows preserve active downloads without persisting cache', async () => {
   for (const label of ['workflow-simple-editor-a', 'workflow-node-editor-a', 'editor-a']) {
@@ -208,7 +324,7 @@ test('only the main window confirms model migration and remaps registrations', a
   assert.equal(env.calls.filter(call => call.command === 'remap_custom_model_paths').length, 1)
 })
 
-test('a late secondary-window update check cannot clear newer deferred update preferences', async () => {
+test('secondary-window update checks stay idle and preserve newer main-window preferences', async () => {
   const env = environment()
   const main = env.instance('main')
   const mainUpdates = useUpdateStore(main.pinia)
@@ -220,7 +336,6 @@ test('a late secondary-window update check cannot clear newer deferred update pr
   useAppStore(child.pinia).buildInfoUpdateSupported = true
   stores.push(childUpdates)
   await childUpdates.initialize()
-  const resumeChild = env.holdSecondaryUpdateCheck()
   const childCheck = childUpdates.checkForUpdates()
   main.activate()
   await mainUpdates.checkForUpdates()
@@ -228,11 +343,17 @@ test('a late secondary-window update check cannot clear newer deferred update pr
   const baseline = clone(env.state['update-state'])
   assert.equal(baseline.deferredVersion, '0.0.13')
   child.activate()
-  resumeChild()
-  await childCheck
+  assert.equal(await childCheck, null)
+  assert.equal(await childUpdates.checkForUpdates(true), null)
   await waitForSave()
-  assert.equal(childUpdates.currentVersion, '0.0.12')
-  assert.equal(childUpdates.latestVersion, '0.0.13')
+  assert.equal(childUpdates.currentVersion, '')
+  assert.equal(childUpdates.latestVersion, '')
+  assert.equal(childUpdates.status, 'idle')
+  assert.equal(env.calls.some(call => call.label === 'workflow-simple-editor-a' && (
+    call.command === 'check_managed_update'
+    || call.command === 'plugin:event|listen'
+    || (call.command === 'load_app_store' && call.args.name === 'update-state')
+  )), false)
   assert.deepEqual(env.state['update-state'], baseline)
   assert.ok(env.writes.every(write => write.label === 'main'))
 })

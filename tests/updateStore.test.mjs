@@ -7,7 +7,7 @@ import { nextTick } from 'vue'
 
 const vite = await createServer({
   configFile: false,
-  server: { middlewareMode: true, hmr: false },
+  server: { watch: null, middlewareMode: true, hmr: false, preTransformRequests: false },
   appType: 'custom',
   optimizeDeps: { noDiscovery: true },
   resolve: { alias: { '@': fileURLToPath(new URL('../src', import.meta.url)) } },
@@ -16,15 +16,16 @@ const vite = await createServer({
     enforce: 'pre',
     transform(_code, id) {
       const path = id.replaceAll('\\', '/')
+      if (path.endsWith('/src/i18n/index.ts')) return `export default { global: { t: key => key } }`
       if (path.endsWith('/src/stores/app.ts')) {
-        return `export function useAppStore() {
-          return { buildInfoVersion: '0.0.16', buildInfoUpdateSupported: true }
-        }`
+        return `import { reactive } from 'vue'
+          export const application = reactive({ buildInfoVersion: '0.0.16', buildInfoUpdateSupported: true, runtimeInstallStatus: 'idle', runtimeCoreUpdateStatus: 'idle' })
+          export function useAppStore() { return application }`
       }
       if (path.endsWith('/src/stores/settings.ts')) {
-        return `export function useSettingsStore() {
-          return { developerMode: false, updateChannel: 'prerelease', updateEndpointOverride: '' }
-        }`
+        return `import { reactive } from 'vue'
+          export const settings = reactive({ developerMode: false, updateChannel: 'prerelease', updateSource: 'auto', updateEndpointOverride: '' })
+          export function useSettingsStore() { return settings }`
       }
       return null
     },
@@ -37,9 +38,16 @@ afterEach(() => {
 })
 
 const { useUpdateStore } = await vite.ssrLoadModule('/src/stores/update.ts')
+const { runWindowCloseGuards } = await vite.ssrLoadModule('/src/utils/windowCloseGuards.ts')
+const { settings } = await vite.ssrLoadModule('/src/stores/settings.ts')
+const { application } = await vite.ssrLoadModule('/src/stores/app.ts')
 const stores = []
 afterEach(() => {
   for (const store of stores.splice(0)) store.$dispose()
+  settings.updateSource = 'auto'
+  settings.isModelDirMigrating = false
+  application.runtimeInstallStatus = 'idle'
+  application.runtimeCoreUpdateStatus = 'idle'
 })
 
 const persisted016 = {
@@ -68,16 +76,19 @@ function browserStorage(raw = JSON.stringify(persisted016)) {
   return { values, writes }
 }
 
-function desktopStorage({ update = offeredUpdate, checkError, installError, loadError, onSave } = {}) {
+function desktopStorage({ update = offeredUpdate, checkError, checkRequest, installError, installRequest, exitError, destroyError, closeError, exitRequest, restartPending = false, loadError, onSave, windowLabel = 'main' } = {}) {
   let payload = structuredClone(persisted016)
   const writes = []
   const commands = []
+  const argumentsList = []
+  let eventCallback
   globalThis.window = {
     __TAURI_INTERNALS__: {
-      metadata: { currentWindow: { label: 'main' } },
-      transformCallback: () => 1,
+      metadata: { currentWindow: { label: windowLabel } },
+      transformCallback: callback => { eventCallback = callback; return 1 },
       invoke: async (command, args) => {
         commands.push(command)
+        argumentsList.push({ command, args })
         if (command === 'load_app_store') {
           assert.equal(args.name, 'update-state')
           if (loadError) throw loadError
@@ -95,17 +106,64 @@ function desktopStorage({ update = offeredUpdate, checkError, installError, load
           return 1
         }
         if (command === 'check_managed_update') {
-          assert.deepEqual(args, { channel: 'prerelease', endpointOverride: null })
+          assert.deepEqual(args, { channel: 'prerelease', endpointOverride: null, source: settings.updateSource })
           if (checkError) throw checkError
+          if (checkRequest) return checkRequest()
           return structuredClone(update)
         }
-        if (command === 'start_managed_update' && installError) throw installError
+        if (command === 'start_managed_update') {
+          if (installError) throw installError
+          if (installRequest) return installRequest()
+          return null
+        }
+        if (command === 'get_managed_update_state') return { restartRequired: restartPending }
+        if (command === 'plugin:process|exit') { if (exitError) throw exitError; return exitRequest ? exitRequest() : null }
+        if (command === 'plugin:window|destroy') { if (destroyError) throw destroyError; return null }
+        if (command === 'close_current_window') { if (closeError) throw closeError; return null }
         throw new Error(`Unexpected IPC command: ${command}`)
       },
     },
   }
-  return { writes, commands, payload: () => payload }
+  return { writes, commands, argumentsList, window: globalThis.window, payload: () => payload,
+    setExitErrors: (exit, destroy) => { exitError = exit; destroyError = destroy },
+    emit: payload => eventCallback?.({ event: 'pymss://managed-update-event', id: 1, payload }) }
 }
+
+for (const source of ['auto', 'github', 'modelscope']) {
+  test(`update checks and confirmed downloads retain the ${source} preference`, async () => {
+    settings.updateSource = source
+    const storage = desktopStorage({ update: { ...offeredUpdate, source: 'modelscope' }, installError: new Error('Download interrupted') })
+    const store = newStore()
+    await store.initialize()
+    await store.checkForUpdates(true)
+    assert.equal(store.selectedSource, 'modelscope')
+    await assert.rejects(store.downloadAndInstall(), /Download interrupted/)
+    assert.deepEqual(storage.argumentsList.find(call => call.command === 'start_managed_update').args, {
+      channel: 'prerelease', endpointOverride: null, expectedVersion: offeredUpdate.version, source,
+    })
+  })
+}
+
+test('switching download sources resets progress without losing the fallback log', async () => {
+  const storage = desktopStorage()
+  const store = newStore()
+  await store.initialize()
+  storage.emit({ event: 'SourceSelected', data: { source: 'github' } })
+  storage.emit({ event: 'Started', data: { contentLength: 1000 } })
+  storage.emit({ event: 'Progress', data: { downloadedBytes: 750, contentLength: 1000 } })
+  assert.equal(store.downloadDownloadedBytes, 750)
+  storage.emit({ event: 'SourceSelected', data: { source: 'modelscope', fallback: true } })
+  assert.equal(store.selectedSource, 'modelscope')
+  assert.equal(store.status, 'downloading')
+  assert.equal(store.downloadDownloadedBytes, 0)
+  assert.equal(store.downloadTotalBytes, 0)
+  assert.ok(store.downloadLogs.some(entry => entry.message === 'Retrying download from ModelScope'))
+  storage.emit({ event: 'Started', data: { contentLength: 1000 } })
+  storage.emit({ event: 'Progress', data: { downloadedBytes: 100, contentLength: 1000 } })
+  assert.equal(store.downloadDownloadedBytes, 100)
+  store.dismiss()
+  assert.equal(store.selectedSource, undefined)
+})
 
 test('browser update preferences written by 0.0.16 load without a rewrite', async () => {
   const storage = browserStorage()
@@ -168,11 +226,12 @@ test('a backend read failure leaves the stored data untouched and still register
   await store.initialize()
   assert.equal(store.status, 'idle')
   assert.equal(store.deferredVersion, '')
-  assert.deepEqual(storage.commands, ['load_app_store', 'plugin:event|listen'])
+  assert.deepEqual(storage.commands, ['load_app_store', 'write_frontend_log', 'plugin:event|listen', 'get_managed_update_state'])
   assert.deepEqual(storage.writes, [])
   assert.deepEqual(local.writes, [])
   assert.equal(local.values.get('pymss-studio:update-state'), JSON.stringify(persisted016))
-  assert.deepEqual(warning.mock.calls[0].arguments, ['Failed to load update state', failure])
+  assert.match(warning.mock.calls[0].arguments[0], /Studio.*Failed to load update state/)
+  assert.match(warning.mock.calls[0].arguments[1], /Store read failed/)
 })
 
 test('a backend without update-state keeps the existing local key and three-field payload', async () => {
@@ -350,4 +409,272 @@ test('manual-install releases never dispatch an in-place install', async () => {
   await assert.rejects(store.downloadAndInstall(), /manual installation/)
   assert.equal(storage.commands.includes('start_managed_update'), false)
   assert.deepEqual(storage.payload(), persisted016)
+})
+
+for (const distribution of ['macosApp', 'appImage']) {
+  test(`${distribution} installation leaves restart and exit to the backend`, async () => {
+    const storage = desktopStorage({ update: { ...offeredUpdate, distribution } })
+    const store = newStore()
+    await store.initialize()
+    await store.checkForUpdates(true)
+    assert.equal(await store.downloadAndInstall(), true)
+    assert.equal(store.status, 'installing')
+    assert.equal(storage.commands.includes('start_managed_update'), true)
+    assert.equal(storage.commands.includes('plugin:process|exit'), false)
+    assert.deepEqual(storage.payload(), persisted016)
+  })
+}
+
+test('Windows installation saves acceptance before exiting for its update helper', async () => {
+  const storage = desktopStorage()
+  const store = newStore()
+  await store.initialize()
+  await store.checkForUpdates(true)
+  assert.equal(await store.downloadAndInstall(), true)
+  assert.equal(storage.commands.at(-1), 'plugin:process|exit')
+  assert.deepEqual(storage.payload(), { lastAcceptedVersion: offeredUpdate.version })
+})
+
+test('an application update blocks window closing until installation finishes or fails', async () => {
+  const store = newStore()
+  for (const status of ['downloading', 'installing']) {
+    store.status = status
+    await assert.rejects(runWindowCloseGuards(), /update is in progress/)
+  }
+  store.status = 'failed'
+  await runWindowCloseGuards()
+})
+
+for (const windowLabel of ['editor-1', 'workflow-node-editor-1', 'workflow-simple-editor-1']) {
+  for (const status of ['downloading', 'installing']) {
+    test(`${windowLabel} ignores ${status} progress from a failed main-window update`, async () => {
+      const main = desktopStorage({ installError: new Error('Update interrupted') })
+      const origin = newStore()
+      await origin.initialize()
+      await origin.checkForUpdates(true)
+
+      const editor = desktopStorage({ windowLabel })
+      const recipient = newStore()
+      await recipient.initialize()
+      assert.equal(await recipient.checkForUpdates(true), null)
+      assert.equal(editor.commands.includes('plugin:event|listen'), false)
+      assert.equal(editor.commands.includes('check_managed_update'), false)
+
+      globalThis.window = main.window
+      const installation = origin.downloadAndInstall()
+      globalThis.window = editor.window
+      editor.emit({ event: 'SourceSelected', data: { source: 'github' } })
+      if (status === 'installing') editor.emit({ event: 'Finished' })
+
+      globalThis.window = main.window
+      await assert.rejects(installation, /Update interrupted/)
+      assert.equal(origin.status, 'failed')
+      assert.equal(recipient.status, 'idle')
+      assert.equal(recipient.isInstallOverlayVisible, false)
+
+      globalThis.window = editor.window
+      await runWindowCloseGuards()
+    })
+  }
+
+  test(`${windowLabel} never blocks closing for application update state`, async () => {
+    desktopStorage({ windowLabel })
+    const store = newStore()
+    for (const status of ['downloading', 'installing']) {
+      store.status = status
+      await runWindowCloseGuards()
+    }
+  })
+}
+
+for (const busy of ['installing', 'preparing', 'updating', 'migration']) {
+  test(`application updates do not start during ${busy}`, async () => {
+    const storage = desktopStorage()
+    const store = newStore()
+    await store.initialize()
+    await store.checkForUpdates(true)
+    const statusBefore = store.status
+    if (busy === 'installing') application.runtimeInstallStatus = busy
+    else if (busy === 'migration') settings.isModelDirMigrating = true
+    else application.runtimeCoreUpdateStatus = busy
+    assert.ok(store.installationBlockedReason)
+    await assert.rejects(store.downloadAndInstall())
+    assert.equal(storage.commands.includes('start_managed_update'), false)
+    assert.equal(storage.commands.includes('plugin:process|exit'), false)
+    assert.equal(store.status, statusBefore)
+  })
+}
+
+test('a backend busy rejection does not exit the application or record acceptance', async () => {
+  const storage = desktopStorage({ installError: new Error('APPLICATION_UPDATE_BUSY: active worker') })
+  const store = newStore()
+  await store.initialize()
+  await store.checkForUpdates(true)
+  await assert.rejects(store.downloadAndInstall())
+  assert.equal(store.status, 'failed')
+  assert.equal(storage.commands.includes('plugin:process|exit'), false)
+  assert.equal(storage.writes.length, 0)
+  assert.ok(!store.error.includes('APPLICATION_UPDATE_BUSY:'))
+})
+
+test('Windows exit rejection falls back to closing the main window', async () => {
+  const storage = desktopStorage({ exitError: new Error('exit rejected') })
+  const store = newStore()
+  await store.initialize()
+  await store.checkForUpdates(true)
+  assert.equal(await store.downloadAndInstall(), true)
+  assert.equal(storage.commands.at(-1), 'plugin:window|destroy')
+  assert.equal(store.restartRequired, true)
+})
+
+test('a hanging exit request has a bounded fallback', async () => {
+  const storage = desktopStorage({ exitRequest: () => new Promise(() => {}) })
+  const store = newStore()
+  await store.initialize()
+  await store.checkForUpdates(true)
+  assert.equal(await store.downloadAndInstall(), true)
+  assert.equal(storage.commands.at(-1), 'plugin:window|destroy')
+})
+
+test('staged exit failures keep a blocking state and retry without restaging', async () => {
+  const storage = desktopStorage({ exitError: new Error('exit rejected'), destroyError: new Error('close rejected') })
+  const store = newStore()
+  await store.initialize()
+  await store.checkForUpdates(true)
+  assert.equal(await store.downloadAndInstall(), false)
+  assert.equal(store.status, 'restart-required')
+  await runWindowCloseGuards()
+  store.dismissInstallError()
+  store.dismiss()
+  assert.equal(await store.deferUntilNextLaunch(), false)
+  await store.checkForUpdates(true)
+  assert.equal(store.isInstallOverlayVisible, true)
+  assert.equal(store.status, 'restart-required')
+  storage.emit({ event: 'Started', data: { contentLength: 123 } })
+  assert.equal(store.status, 'restart-required')
+  storage.setExitErrors(null, null)
+  assert.equal(await store.downloadAndInstall(), true)
+  assert.equal(storage.commands.filter(command => command === 'start_managed_update').length, 1)
+  assert.equal(storage.writes.length, 1)
+})
+
+test('a reloaded renderer restores the native pending-exit state', async () => {
+  const storage = desktopStorage({ restartPending: true })
+  const store = newStore()
+  await store.initialize()
+  assert.equal(store.status, 'restart-required')
+  assert.equal(store.isInstallOverlayVisible, true)
+  assert.equal(store.restartRequired, true)
+  await store.checkForUpdates(true)
+  assert.equal(storage.commands.includes('check_managed_update'), false)
+})
+
+test('pending updates offer an independent native close action after plugin exit failures', async () => {
+  const storage = desktopStorage({ exitError: new Error('exit rejected'), destroyError: new Error('destroy rejected') })
+  const store = newStore()
+  await store.initialize()
+  assert.equal(await store.closeForUpdate(), false)
+  assert.equal(storage.commands.includes('close_current_window'), false)
+  await store.checkForUpdates(true)
+  assert.equal(await store.downloadAndInstall(), false)
+  assert.equal(await store.closeForUpdate(), true)
+  assert.equal(storage.commands.at(-1), 'close_current_window')
+  assert.equal(store.restartRequired, true)
+  assert.equal(storage.commands.filter(command => command === 'start_managed_update').length, 1)
+})
+
+test('a failed native close action preserves the pending update overlay', async () => {
+  const storage = desktopStorage({ restartPending: true, closeError: new Error('native close rejected') })
+  const store = newStore()
+  await store.initialize()
+  assert.equal(await store.closeForUpdate(), false)
+  assert.equal(store.status, 'restart-required')
+  assert.equal(store.isInstallOverlayVisible, true)
+  assert.equal(storage.commands.at(-1), 'close_current_window')
+  await runWindowCloseGuards()
+})
+
+test('a native staged event restores pending exit after a renderer reload during download', async () => {
+  const storage = desktopStorage()
+  const store = newStore()
+  await store.initialize()
+  storage.emit({ event: 'SourceSelected', data: { source: 'github' } })
+  storage.emit({ event: 'Started', data: { contentLength: 1000 } })
+  storage.emit({ event: 'Progress', data: { downloadedBytes: 1000, contentLength: 1000 } })
+  storage.emit({ event: 'Finished' })
+  assert.equal(store.status, 'installing')
+  storage.emit({ event: 'RestartRequired' })
+  assert.equal(store.restartRequired, true)
+  assert.equal(store.status, 'restart-required')
+  assert.equal(store.isInstallOverlayVisible, true)
+  await runWindowCloseGuards()
+  assert.equal(storage.commands.includes('plugin:process|exit'), false)
+  assert.equal(await store.retryUpdateExit(), true)
+  assert.equal(storage.commands.at(-1), 'plugin:process|exit')
+  assert.equal(storage.commands.includes('start_managed_update'), false)
+})
+
+for (const outcome of ['release', 'empty', 'error']) {
+  test(`an older update check cannot replace pending exit with ${outcome}`, async () => {
+    let resolveCheck
+    let rejectCheck
+    const check = new Promise((resolve, reject) => { resolveCheck = resolve; rejectCheck = reject })
+    const storage = desktopStorage({ checkRequest: () => check })
+    const store = newStore()
+    await store.initialize()
+    store.availableUpdate = { ...offeredUpdate, version: '0.0.18' }
+    const cachedUpdate = store.availableUpdate
+    const checking = store.checkForUpdates(true)
+    assert.equal(store.status, 'checking')
+    storage.emit({ event: 'RestartRequired' })
+    const pendingExitError = store.error
+    if (outcome === 'error') rejectCheck(new Error('Check interrupted'))
+    else resolveCheck(outcome === 'release' ? offeredUpdate : null)
+    assert.equal(await checking, cachedUpdate)
+    assert.equal(store.restartRequired, true)
+    assert.equal(store.status, 'restart-required')
+    assert.equal(store.error, pendingExitError)
+    assert.equal(store.isInstallOverlayVisible, true)
+    assert.equal(store.currentVersion, '')
+    assert.equal(store.lastCheckedAt, '')
+    assert.equal(store.availableUpdate, cachedUpdate)
+    assert.deepEqual(storage.writes, [])
+    await runWindowCloseGuards()
+  })
+}
+
+test('an active installation saves acceptance before handling its staged exit', async () => {
+  let finishInstall
+  let finishSave
+  let notifySaveStarted
+  const installGate = new Promise(resolve => { finishInstall = resolve })
+  const saveGate = new Promise(resolve => { finishSave = resolve })
+  const saveStarted = new Promise(resolve => { notifySaveStarted = resolve })
+  const storage = desktopStorage({
+    installRequest: () => installGate,
+    onSave: async () => { notifySaveStarted(); await saveGate },
+  })
+  const store = newStore()
+  await store.initialize()
+  await store.checkForUpdates(true)
+  const installation = store.downloadAndInstall()
+  try {
+    storage.emit({ event: 'Finished' })
+    storage.emit({ event: 'RestartRequired' })
+    assert.equal(store.restartRequired, true)
+    assert.equal(store.status, 'installing')
+    await assert.rejects(runWindowCloseGuards(), /update is in progress/)
+    finishInstall()
+    await saveStarted
+    assert.equal(store.status, 'installing')
+    assert.equal(storage.commands.includes('plugin:process|exit'), false)
+    await assert.rejects(runWindowCloseGuards(), /update is in progress/)
+  } finally {
+    finishInstall()
+    finishSave()
+    await installation
+  }
+  assert.equal(await installation, true)
+  assert.deepEqual(storage.payload(), { lastAcceptedVersion: offeredUpdate.version })
+  assert.equal(storage.commands.at(-1), 'plugin:process|exit')
 })

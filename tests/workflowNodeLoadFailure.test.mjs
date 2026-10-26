@@ -37,7 +37,7 @@ function setup(definition, { createStarter = false, failed = false } = {}) {
     },
     seedStarterGraph() { calls.push('seed'); graph.nodes = [{ id: 'starter' }] },
     writeGraphDefaults: () => calls.push('defaults'), resetHistory: () => calls.push('history'),
-    litegraphToComfy: value => value, console: { error() {} },
+    litegraphToComfy: value => value, studioLog: { error() {} },
   }
   const editor = vm.runInNewContext(`${code}\n({ initializeGraph, snapshotDefinition, onSave })`, state)
   return { state, calls, editor }

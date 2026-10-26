@@ -14,6 +14,7 @@ const AUDIO_TOOL_PHASES = new Set<AudioToolPhase>([
   'preparing', 'converting', 'normalizing', 'merging', 'loading_reference', 'loading_estimated',
   'calculating', 'loading_model', 'loading_audio', 'transcribing', 'writing_output', 'probing',
   'analyzing_silence', 'writing_segments', 'loading_asr_model', 'recognizing_speech', 'writing_transcript',
+  'analyzing_tempo_key',
 ])
 
 type WorkerEvent = {
@@ -49,6 +50,10 @@ type PendingAudioToolRequest = {
   tool: AudioToolKey
   resolve: (result: AudioToolResult) => void
   reject: (error: Error) => void
+  settled: Promise<void>
+  launch?: Promise<unknown>
+  cancelRequested: boolean
+  cancellation?: Promise<boolean>
 }
 
 class AudioToolCancelledError extends Error {}
@@ -86,6 +91,16 @@ export function normalizeAudioToolRecovery(value: unknown): AudioToolRecovery | 
   }
 }
 
+// Tauri commands reject with plain strings; avoid "[object Object]" for anything else.
+export function errorMessage(error: unknown) {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string') return error
+  if (error && typeof error === 'object' && typeof (error as { message?: unknown }).message === 'string') {
+    return (error as { message: string }).message
+  }
+  try { return JSON.stringify(error) ?? String(error) } catch { return String(error) }
+}
+
 export function createAudioToolRuntime(): AudioToolRuntime {
   if (sharedRuntime) return sharedRuntime
   const { t } = useI18n()
@@ -121,6 +136,7 @@ export function createAudioToolRuntime(): AudioToolRuntime {
       probing: 'tools.phaseDetailProbing', analyzing_silence: 'tools.phaseDetailAnalyzingSilence',
       writing_segments: 'tools.phaseDetailWritingSegments', loading_asr_model: 'tools.phaseDetailLoadingAsrModel',
       recognizing_speech: 'tools.phaseDetailRecognizingSpeech', writing_transcript: 'tools.phaseDetailWritingTranscript',
+      analyzing_tempo_key: 'tools.phaseDetailAnalyzingTempoKey',
       completed: 'tools.phaseDetailCompleted', failed: 'tools.phaseDetailFailed',
       cancelled: 'tasks.statusCancelled',
     }
@@ -165,7 +181,7 @@ export function createAudioToolRuntime(): AudioToolRuntime {
   }
 
   function activityTarget(tool: AudioToolKey, payload: Record<string, unknown>) {
-    if (tool === 'convert' || tool === 'slicer') {
+    if (tool === 'convert' || tool === 'slicer' || tool === 'loudness' || tool === 'tempo_key') {
       const inputs = Array.isArray(payload.inputs) ? payload.inputs : []
       return inputs.length ? fileName(String(inputs[0])) : ''
     }
@@ -190,11 +206,13 @@ export function createAudioToolRuntime(): AudioToolRuntime {
     if (warning === 'no_notes_detected') return t('tools.midiWarningNoNotes')
     if (warning === 'stereo_downmix_fallback') return t('tools.midiWarningStereoFallback')
     if (warning === 'timestamps_unavailable') return t('tools.asrWarningNoTimestamps')
+    if (warning === 'loudness_target_not_reached') return t('tools.loudnessTargetNotReached')
+    if (warning === 'loudness_true_peak_exceeded') return t('tools.loudnessTruePeakExceeded')
     return warning
   }
 
   function describeError(error: unknown) {
-    const value = error instanceof Error ? error.message : String(error)
+    const value = errorMessage(error)
     if (!value.includes('Invalid worker event')) return value
     const output = value.match(/raw=(.*)$/s)?.[1]?.trim() || t('tools.unknownWorkerOutput')
     return t('tools.workerProtocolError', { output })
@@ -203,6 +221,19 @@ export function createAudioToolRuntime(): AudioToolRuntime {
   async function execute(tool: AudioToolKey, payload: Record<string, unknown>) {
     if (busyTool.value) return null
     const requestId = `audio_tool_${tool}_${Date.now()}_${++requestSequence}`
+    let resolveCompletion!: (result: AudioToolResult) => void
+    let rejectCompletion!: (error: Error) => void
+    let finish!: () => void
+    const completion = new Promise<AudioToolResult>((resolve, reject) => {
+      resolveCompletion = resolve
+      rejectCompletion = reject
+    })
+    const pending: PendingAudioToolRequest = {
+      id: requestId, tool, resolve: resolveCompletion, reject: rejectCompletion,
+      settled: new Promise<void>(resolve => { finish = resolve }),
+      cancelRequested: false,
+    }
+    pendingRequest = pending
     busyTool.value = tool
     cancelling.value = false
     delete results[tool]
@@ -210,13 +241,14 @@ export function createAudioToolRuntime(): AudioToolRuntime {
     delete recoveries[tool]
     beginActivity(tool, activityTarget(tool, payload))
     try {
-      await start()
-      const completion = new Promise<AudioToolResult>((resolve, reject) => {
-        pendingRequest = { id: requestId, tool, resolve, reject }
-      })
-      await invoke<{ taskId: string; started: boolean }>('start_audio_tool', {
+      // Cancellation can settle the task while event-listener setup is pending.
+      await Promise.race([start(), completion])
+      if (pending.cancelRequested) throw new AudioToolCancelledError('Audio tool task cancelled')
+      const nativeAnalysis = tool === 'tempo_key' || (tool === 'midi' && payload.action === 'detect_bpm')
+      pending.launch = invoke<{ taskId: string; started: boolean }>(nativeAnalysis ? 'start_tempo_key_analysis' : 'start_audio_tool', {
         payload: { ...payload, operation: tool, requestId },
       })
+      await pending.launch
       const response = await completion
       results[tool] = response
       const activity = activities[tool]
@@ -228,10 +260,12 @@ export function createAudioToolRuntime(): AudioToolRuntime {
       appendLog(tool, 'completed', progress, warnings.join(' '))
       if (warnings.length) message.warning(warnings.join(' '))
       else if ((response.failed?.length || 0) + (response.skipped?.length || 0) > 0) message.warning(t('tools.completedWithSkipped'))
+      else if (response.operation === 'midi' && response.action === 'detect_bpm') message.success(t('tools.bpmDetected', { bpm: response.roundedBpm }))
       else message.success(t('tools.completed'))
       return response
     } catch (error) {
-      if (pendingRequest?.id === requestId) pendingRequest = undefined
+      // Also settle completion when listener setup or the launch command fails.
+      pending.reject(error instanceof Error ? error : new Error(errorMessage(error)))
       if (error instanceof AudioToolCancelledError) {
         delete errors[tool]
         const activity = activities[tool]
@@ -254,29 +288,59 @@ export function createAudioToolRuntime(): AudioToolRuntime {
       appendLog(tool, 'failed', progress, description)
       return null
     } finally {
+      if (pendingRequest === pending) pendingRequest = undefined
       stopElapsedTimer()
       busyTool.value = null
       cancelling.value = false
+      finish()
     }
   }
 
-  async function cancel() {
-    if (!pendingRequest || cancelling.value) return false
-    cancelling.value = true
+  function cancel(): Promise<boolean> {
+    const pending = pendingRequest
+    if (!pending) return Promise.resolve(false)
+    if (!pending.cancellation) {
+      pending.cancelRequested = true
+      cancelling.value = true
+      pending.cancellation = cancelRequest(pending)
+    }
+    return pending.cancellation
+  }
+
+  async function cancelRequest(pending: PendingAudioToolRequest) {
+    if (!pending.launch) {
+      pending.reject(new AudioToolCancelledError('Audio tool task cancelled'))
+      await pending.settled
+      return true
+    }
+    // A launch acknowledgement guarantees the backend has registered this id.
+    // Cancelling earlier can report "not running" and orphan a later launch.
+    try { await pending.launch }
+    catch {
+      await pending.settled
+      return false
+    }
+    if (pendingRequest !== pending) {
+      await pending.settled
+      return false
+    }
     try {
-      const accepted = await invoke<boolean>('cancel_task', { taskId: pendingRequest.id })
+      const accepted = await invoke<boolean>('cancel_task', { taskId: pending.id })
       if (!accepted) {
         // The Rust registry no longer knows this task (for example, the worker
         // exited before its terminal event reached the UI). Reject the pending
         // request instead of leaving the tool stuck in a permanent busy state.
-        const completion = pendingRequest
-        pendingRequest = undefined
-        cancelling.value = false
-        completion.reject(new Error('Audio tool task is no longer running'))
+        if (pendingRequest === pending) {
+          pending.reject(new Error('Audio tool task is no longer running'))
+        }
       }
+      // A native cancellation acknowledgement precedes actual resource cleanup.
+      await pending.settled
       return accepted
     } catch (error) {
-      cancelling.value = false
+      if (pendingRequest === pending) cancelling.value = false
+      pending.cancelRequested = false
+      pending.cancellation = undefined
       throw error
     }
   }
@@ -320,7 +384,9 @@ export function createAudioToolRuntime(): AudioToolRuntime {
               errors[pending.tool] = t('tools.asrModelIncompleteError')
             }
             pendingRequest = undefined
-            pending.reject(new Error(String(workerEvent.payload?.message || 'Audio tool failed')))
+            const failure = workerEvent.payload?.code === 'MERGE_SAME_DIRECTORY'
+              ? t('tools.mergeSameDirectory') : String(workerEvent.payload?.message || 'Audio tool failed')
+            pending.reject(new Error(failure))
           }
           return
         }
@@ -340,7 +406,7 @@ export function createAudioToolRuntime(): AudioToolRuntime {
         }
         if (workerEvent.type !== 'audio_tool_progress') return
         const payload = workerEvent.payload
-        if (!payload?.operation || payload.operation !== busyTool.value || (eventId && eventId !== pending?.id)) return
+        if (!pending || eventId !== pending.id || !payload?.operation || payload.operation !== busyTool.value) return
         recordProgress(payload.operation, {
           completed: Math.max(0, Number(payload.completed || 0)), total: Math.max(0, Number(payload.total || 0)),
           current: String(payload.current || ''), phase: normalizePhase(payload.phase),

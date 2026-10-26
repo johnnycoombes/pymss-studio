@@ -1,0 +1,14 @@
+[package]
+name = "pymss-vst2-host"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[dependencies]
+soundcraft-dsp = { path = "../vendor/soundcraft-dsp" }
+soundcraft-vst3-host = { path = "../vendor/soundcraft-vst3-host" }
+serde = { version = "1", features = ["derive"] }
+libloading = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"

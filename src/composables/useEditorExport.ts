@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import type { MessageApiInjection } from 'naive-ui/es/message/src/MessageProvider'
@@ -6,6 +7,8 @@ import type { EditorExportFormat, EditorExportSampleRate } from '@/types/editor'
 import type { useEditorStore } from '@/stores/editor'
 import { EditorExportCancelledError } from '@/stores/editor'
 import type { useSettingsStore } from '@/stores/settings'
+
+const studioLog = createLogger('ui.composables.useEditorExport')
 
 type EditorStore = ReturnType<typeof useEditorStore>
 type SettingsStore = ReturnType<typeof useSettingsStore>
@@ -26,7 +29,7 @@ export function useEditorExport(options: UseEditorExportOptions) {
   const exportWavBitDepthDraft = ref('PCM_24')
   const exportFlacBitDepthDraft = ref('PCM_24')
   const exportSampleRateDraft = ref<EditorExportSampleRate>('auto')
-  const exportPeakProtectionDraft = ref(true)
+  const exportPeakProtectionDraft = ref(false)
   const exportFileNameDraft = ref('')
   const exportDirDraft = ref('')
   const exportDirPicking = ref(false)
@@ -121,9 +124,7 @@ export function useEditorExport(options: UseEditorExportOptions) {
       const format = exportFormatDraft.value
       const wavBitDepth = exportWavBitDepthDraft.value
       const flacBitDepth = exportFlacBitDepthDraft.value
-      const peakProtection = format !== 'wav'
-        || wavBitDepth !== 'FLOAT'
-        || exportPeakProtectionDraft.value
+      const peakProtection = exportPeakProtectionDraft.value
       const result = await editor.exportMix({
         format,
         exportDir: exportDirDraft.value.trim() || undefined,
@@ -137,10 +138,11 @@ export function useEditorExport(options: UseEditorExportOptions) {
       })
       editor.exportFormat = format
       message.success(t('editor.exported', { path: result.path }))
+      if (result.pluginTailLimited) message.warning(t('editor.plugins.tailLimited'), { duration: 10000 })
       try {
         await settings.saveEditorExportPreference({ format, bitDepth: format === 'wav' ? wavBitDepth : flacBitDepth })
       } catch (error) {
-        console.warn('Failed to save editor export preference', error)
+        studioLog.warn('Failed to save editor export preference', error)
         message.warning(t('editor.exportPreferencesSaveFailed'))
       }
       if (result.peakProtectionApplied && Number(result.peakAdjustmentDb) < 0) {

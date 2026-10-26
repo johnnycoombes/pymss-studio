@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from worker_protocol import emit
-from .common import _available_path, _require_directory, _require_file, _run_ffmpeg, _subprocess_detail
+from .common import _available_path, _render_output, _require_directory, _require_file, _run_ffmpeg, _subprocess_detail
 
 OUTPUT_FORMATS = {"wav", "flac", "mp3", "ogg"}
 SAMPLE_RATES = {32000, 44100, 48000}
@@ -108,18 +108,20 @@ def _convert_audio(payload: dict[str, Any]) -> dict[str, Any]:
         })
         output_path = _available_path(output_dir / f"{input_path.stem}{suffix}.{output_format}")
         try:
-            command = _build_conversion_command(
-                input_path,
-                output_path,
-                output_format,
-                sample_rate,
-                channels,
-                wav_bit_depth,
-                flac_bit_depth,
-                mp3_bit_rate,
-                ogg_bit_rate,
-            )
-            _run_ffmpeg(command)
+            def render(temporary: Path) -> None:
+                command = _build_conversion_command(
+                    input_path,
+                    temporary,
+                    output_format,
+                    sample_rate,
+                    channels,
+                    wav_bit_depth,
+                    flac_bit_depth,
+                    mp3_bit_rate,
+                    ogg_bit_rate,
+                )
+                _run_ffmpeg(command)
+            output_path = _render_output(output_path, render)
             output_paths.append(str(output_path))
         except subprocess.CalledProcessError as error:
             failures.append({"path": str(input_path), "message": _subprocess_detail(error)})

@@ -1,9 +1,40 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createRuntimeQueryQueue, isRuntimeBusyError } from '../src/utils/runtimeQueries.ts'
+import { createRuntimeQueryQueue, createRuntimeReadCache, isRuntimeBusyError } from '../src/utils/runtimeQueries.ts'
 
 const busy = new Error('worker error: Another runtime operation is in progress. Wait for it to finish and retry.')
+
+test('page reads reuse an in-flight query and a recent result, then expire', async () => {
+  let clock = 0
+  let calls = 0
+  const cache = createRuntimeReadCache<number>(100, () => clock)
+  const load = async () => ++calls
+  assert.deepEqual(await Promise.all([cache.read(load), cache.read(load)]), [1, 1])
+  clock = 99
+  assert.equal(await cache.read(load), 1)
+  clock = 100
+  assert.equal(await cache.read(load), 2)
+  assert.equal(await cache.read(load, true), 3)
+})
+
+test('a result started before a runtime mutation cannot refill the cache', async () => {
+  const cache = createRuntimeReadCache<string>(1000)
+  let finish!: (value: string) => void
+  const old = cache.read(() => new Promise(resolve => { finish = resolve }))
+  cache.invalidate()
+  assert.equal(await cache.read(async () => 'new'), 'new')
+  finish('old')
+  await old
+  assert.equal(await cache.read(async () => 'unexpected'), 'new')
+})
+
+test('an explicit refresh failure leaves the read cache retryable', async () => {
+  const cache = createRuntimeReadCache<string>(1000)
+  await cache.read(async () => 'old')
+  await assert.rejects(cache.read(async () => { throw new Error('unavailable') }, true), /unavailable/)
+  assert.equal(await cache.read(async () => 'recovered'), 'recovered')
+})
 
 test('info and sizes queries never overlap and each queued callback runs', async () => {
   const queue = createRuntimeQueryQueue()

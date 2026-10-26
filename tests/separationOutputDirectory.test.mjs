@@ -49,6 +49,7 @@ afterEach(async () => {
   Reflect.deleteProperty(globalThis, 'window')
   Reflect.deleteProperty(globalThis, 'localStorage')
   settings.outputDir = 'D:/DefaultOutput'
+  settings.maxConcurrentSeparations = 1
 })
 
 function storage(initial = {}) {
@@ -124,36 +125,57 @@ test('legacy persisted custom directories are ignored on startup', async () => {
   assert.equal(task.separateOutputDir, 'D:/DefaultOutput')
 })
 
-test('native graph submission and retry preserve graph parameters and the output root as one task', async () => {
+for (const selectedDirectory of [undefined, 'E:/WorkflowOutput']) {
+  test(`native graph submission and retry preserve the ${selectedDirectory ? 'selected' : 'default'} output root and graph parameters`, async () => {
+    storage()
+    const task = await newStore()
+    const definition = {
+      nodes: [
+        { id: 1, type: 'pymss_load_audio_batch', widgets_values: ['D:/Music', true, false, ''] },
+        { id: 2, type: 'pymss_save_audio', widgets_values: ['', 'stems', '44100'] },
+      ], links: [[1, 1, 0, 2, 0, 'AUDIO']],
+    }
+    const saved = structuredClone(definition)
+    const bindings = {
+      inputs: { '1': { files: ['D:/Other/first.wav', 'D:/Other/second.wav'] } },
+      outputs: { '2': 'E:/Ignored' }, primaryInput: '1', outputLayout: 'folders',
+      outputDirectory: selectedDirectory,
+    }
+    const submitted = await task.startWorkbenchInference({ ...workflow, definition }, bindings)
+    assert.equal(submitted.total, 1)
+    const original = submitted.tasks[0]
+    assert.equal(original.input, '')
+    assert.equal(original.output, selectedDirectory || 'D:/DefaultOutput')
+    assert.equal(original.jobOutput, original.output)
+    assert.equal(settings.outputDir, 'D:/DefaultOutput')
+    assert.equal(original.runConfig.outputLayout, 'flat')
+    assert.equal(original.runConfig.workbench.nativeGraph, true)
+    assert.deepEqual(original.runConfig.workflowDefinition, saved)
+    assert.deepEqual(original.runConfig.workbench.outputs, {})
+    definition.nodes[0].widgets_values[0] = 'D:/Changed'
+    assert.deepEqual(original.runConfig.workbench.sourceDefinition, saved)
+    original.status = 'failed'
+    settings.outputDir = 'F:/NextRun'
+    bindings.outputDirectory = 'G:/NextSelection'
+    const retried = await task.retryTask(original.id)
+    assert.equal(retried.output, original.output)
+    assert.deepEqual(retried.runConfig, JSON.parse(JSON.stringify(original.runConfig)))
+  })
+}
+
+test('clearing the native graph directory restores the current default for new runs', async () => {
   storage()
   const task = await newStore()
-  const definition = {
-    nodes: [
-      { id: 1, type: 'pymss_load_audio_batch', widgets_values: ['D:/Music', true, false, ''] },
-      { id: 2, type: 'pymss_save_audio', widgets_values: ['', 'stems', '44100'] },
-    ], links: [[1, 1, 0, 2, 0, 'AUDIO']],
-  }
-  const saved = structuredClone(definition)
-  const submitted = await task.startWorkbenchInference({ ...workflow, definition }, {
-    inputs: { '1': { files: ['D:/Other/first.wav', 'D:/Other/second.wav'] } },
-    outputs: { '2': 'E:/Ignored' }, primaryInput: '1', outputLayout: 'folders',
-  })
-  assert.equal(submitted.total, 1)
-  const original = submitted.tasks[0]
-  assert.equal(original.input, '')
-  assert.equal(original.output, 'D:/DefaultOutput')
-  assert.equal(original.runConfig.outputLayout, 'flat')
-  assert.equal(original.runConfig.workbench.nativeGraph, true)
-  assert.deepEqual(original.runConfig.workflowDefinition, saved)
-  assert.deepEqual(original.runConfig.workbench.outputs, {})
-  definition.nodes[0].widgets_values[0] = 'D:/Changed'
-  assert.deepEqual(original.runConfig.workbench.sourceDefinition, saved)
-  original.status = 'failed'
-  settings.outputDir = 'F:/NextRun'
-  const retried = await task.retryTask(original.id)
-  assert.equal(retried.output, 'D:/DefaultOutput')
-  assert.deepEqual(retried.runConfig, JSON.parse(JSON.stringify(original.runConfig)))
+  const graph = { ...workflow, definition: { nodes: [{ id: 1, type: 'pymss_save_audio' }], links: [] } }
+  const bindings = { inputs: {}, outputs: {}, primaryInput: '', outputLayout: 'flat', outputDirectory: 'E:/Selected' }
+  const first = await task.startWorkbenchInference(graph, bindings)
+  delete bindings.outputDirectory
+  settings.outputDir = 'F:/NewDefault'
+  const second = await task.startWorkbenchInference(graph, bindings)
+  assert.equal(first.tasks[0].output, 'E:/Selected')
+  assert.equal(second.tasks[0].output, 'F:/NewDefault')
 })
+
 
 for (const layout of ['flat', 'folders']) {
   test(`simple workbench ${layout} output roots use the chosen directory and remain frozen on retry`, async () => {
@@ -435,4 +457,223 @@ for (const mode of ['model', 'workflow']) {
       assert.equal(retried.output, savedDirectory)
     })
   }
+}
+
+for (const count of [0, 2]) {
+  test(`separation rejects a graph with ${count} inputs before creating tasks`, async () => {
+    storage()
+    const task = await newStore()
+    const definition = { nodes: [
+      ...Array.from({ length: count }, (_, index) => ({ id: index + 1, type: 'pymss_load_audio', widgets_values: ['input.wav', 'same'] })),
+      { id: 10, type: 'pymss_save_audio' },
+    ], links: [] }
+    await assert.rejects(task.startWorkflowInference({ ...workflow, definition }), {
+      message: count ? 'separate.workflowMultipleInputs' : 'separate.workflowNoInput',
+    })
+    assert.equal(task.tasks.length, 0)
+  })
+}
+
+test('multi-input graphs retain native execution through the workflow workbench', async () => {
+  storage()
+  const task = await newStore()
+  const definition = { nodes: [
+    { id: 1, type: 'pymss_load_audio', widgets_values: ['D:/first.wav', ''] },
+    { id: 2, type: 'pymss_load_audio', widgets_values: ['D:/second.wav', ''] },
+    { id: 3, type: 'pymss_save_audio' },
+  ], links: [] }
+  const result = await task.startWorkbenchInference({ ...workflow, definition }, {
+    inputs: {}, outputs: {}, primaryInput: '', outputLayout: 'flat', outputDirectory: 'D:/Output',
+  })
+  assert.equal(result.total, 1)
+  assert.equal(result.tasks[0].runConfig.workbench.nativeGraph, true)
+  assert.deepEqual(result.tasks[0].runConfig.workflowDefinition, definition)
+})
+
+test('retry cannot bypass the separation input restriction in older task snapshots', async () => {
+  storage()
+  const task = await newStore()
+  const queued = await task.startWorkflowInference(workflow)
+  const existing = task.tasks.find(item => item.id === queued.tasks[0].id)
+  existing.status = 'failed'
+  existing.runConfig.workflowDefinition = { nodes: [
+    { id: 1, type: 'input_audio' }, { id: 2, type: 'pymss_load_audio' },
+    { id: 3, type: 'pymss_save_audio' },
+  ], links: [] }
+  const count = task.tasks.length
+  await assert.rejects(task.retryTask(existing.id), { message: 'separate.workflowMultipleInputs' })
+  assert.equal(task.tasks.length, count)
+})
+
+function queuedWorkflowSnapshots(count, inputCounts, workbench = false) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `restored-${index}`, jobId: 'restored-workflow', model: 'Workflow',
+    input: `D:/Audio/${index}.wav`, jobOutput: 'D:/Outputs', output: `D:/Outputs/${index}`,
+    status: 'queued', createdAt: index + 1, updatedAt: index + 1, files: [], outputs: [], logs: [],
+    runConfig: {
+      runMode: 'workflow', workflowId: workflow.id, workflowName: workflow.name,
+      workflowDefinition: { nodes: [
+        ...Array.from({ length: inputCounts[index] }, (_, node) => ({ id: node + 1, type: 'pymss_load_audio' })),
+        { id: 10, type: 'pymss_save_audio' },
+      ], links: [] },
+      outputLayout: 'folders', device: 'cpu', outputFormat: 'wav', inferenceParams: {},
+      ...(workbench ? { workbench: { version: 1, nativeGraph: true } } : {}),
+    },
+  }))
+}
+
+async function resumeRestoredQueue(snapshots, concurrency = 1) {
+  storage({ 'task-history': { tasks: snapshots } })
+  const task = await newStore()
+  settings.maxConcurrentSeparations = concurrency
+  const calls = []
+  const startedIds = new Set()
+  window.__TAURI_INTERNALS__ = {
+    metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
+    async invoke(command, args) {
+      if (command === 'start_workflow_inference' || command === 'start_separation') {
+        calls.push({ command, ...args.payload })
+        if (startedIds.has(args.payload.taskId)) throw new Error(`task already exists: ${args.payload.taskId}`)
+        startedIds.add(args.payload.taskId)
+      }
+      return { started: true }
+    },
+  }
+  task.scheduleQueue()
+  await new Promise(resolve => setTimeout(resolve, 0))
+  return { task, calls }
+}
+
+async function restoreWorkflowQueue(count, inputCounts, workbench = false) {
+  return resumeRestoredQueue(queuedWorkflowSnapshots(count, inputCounts, workbench))
+}
+
+for (const count of [1, 2]) {
+  for (const inputs of [0, 2]) {
+    test(`restoring ${count} queued workflow task(s) rejects ${inputs} inputs before dispatch`, async () => {
+      const { task, calls } = await restoreWorkflowQueue(count, Array(count).fill(inputs))
+      assert.equal(calls.length, 0)
+      assert.equal(task.tasks.length, count)
+      assert.ok(task.tasks.every(item => item.status === 'failed'))
+      assert.ok(task.tasks.every(item => item.error === (inputs ? 'separate.workflowMultipleInputs' : 'separate.workflowNoInput')))
+    })
+  }
+
+  test(`restoring ${count} queued single-input task(s) still dispatches normally`, async () => {
+    const { task, calls } = await restoreWorkflowQueue(count, Array(count).fill(1))
+    assert.equal(calls.length, 1)
+    assert.equal(Boolean(calls[0].tasks), count > 1)
+    assert.ok(task.tasks.every(item => item.status === 'preparing'))
+  })
+
+  test(`restoring ${count} queued multi-input workbench task(s) preserves editor execution`, async () => {
+    const { task, calls } = await restoreWorkflowQueue(count, Array(count).fill(2), true)
+    assert.equal(calls.length, 1)
+    assert.ok(task.tasks.every(item => item.status === 'preparing'))
+  })
+}
+
+test('a restored workflow batch validates every task before starting the worker', async () => {
+  const { task, calls } = await restoreWorkflowQueue(2, [1, 2])
+  assert.equal(calls.length, 0)
+  assert.ok(task.tasks.every(item => item.status === 'failed' && item.error === 'separate.workflowMultipleInputs'))
+})
+
+function queuedBatch(id, inputCount, mode = 'workflow', createdAt = 1) {
+  return queuedWorkflowSnapshots(2, [inputCount, inputCount]).map((task, index) => ({
+    ...task, id: `${id}-${index}`, jobId: id, createdAt: createdAt + index,
+    runConfig: { ...task.runConfig, runMode: mode },
+  }))
+}
+
+for (const mode of ['workflow', 'model']) {
+  test(`a rejected batch cannot resubmit the following ${mode} batch during concurrent scheduling`, async () => {
+    const { task, calls } = await resumeRestoredQueue([
+      ...queuedBatch('invalid', 2), ...queuedBatch('valid', 1, mode, 10),
+    ], 2)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].command, mode === 'workflow' ? 'start_workflow_inference' : 'start_separation')
+    assert.equal(calls[0].taskId, 'valid-0')
+    assert.ok(task.tasks.filter(item => item.jobId === 'invalid').every(item => item.status === 'failed'))
+    assert.ok(task.tasks.filter(item => item.jobId === 'valid').every(item => item.status === 'preparing' && !item.error))
+  })
+}
+
+test('rejected batches free Worker slots without duplicate starts or starving later jobs', async () => {
+  const invalid = Array.from({ length: 25 }, (_, index) => queuedBatch(`invalid-${index}`, 2, 'workflow', index * 2 + 1)).flat()
+  const { task, calls } = await resumeRestoredQueue([
+    ...invalid, ...queuedBatch('first', 1, 'workflow', 100),
+    ...queuedBatch('second', 1, 'model', 110), ...queuedBatch('third', 1, 'workflow', 120),
+  ], 2)
+  assert.deepEqual(calls.map(call => call.taskId), ['first-0', 'second-0'])
+  assert.ok(task.tasks.filter(item => item.jobId.startsWith('invalid-')).every(item => item.status === 'failed'))
+  assert.ok(task.tasks.filter(item => item.jobId === 'third').every(item => item.status === 'queued'))
+  task.scheduleQueue()
+  assert.equal(calls.length, 2)
+  for (const id of ['first-0', 'first-1']) {
+    task.handleWorkerEvent({ type: 'task_done', taskId: id, payload: { outputDir: 'D:/Outputs', files: [], outputs: [] } })
+  }
+  assert.deepEqual(calls.map(call => call.taskId), ['first-0', 'second-0', 'third-0'])
+  assert.ok(task.tasks.filter(item => item.jobId === 'third').every(item => item.status === 'preparing'))
+})
+
+for (const platform of ['linux', 'darwin']) {
+  test(`${platform} output selection preserves significant trailing spaces in native directories`, async () => {
+    storage()
+    const task = await newStore(platform)
+    settings.outputDir = '/tmp/default '
+    assert.equal(task.separateOutputDir, '/tmp/default ')
+    task.separateTemporaryOutputDir = '/tmp/selected '
+    assert.equal(task.separateOutputDir, '/tmp/selected ')
+    const run = await task.startWorkflowInference(workflow, { outputDir: '/tmp/chosen ', outputLayout: 'flat' })
+    assert.equal(run.tasks[0].output, '/tmp/chosen ')
+    assert.equal(run.tasks[0].jobOutput, '/tmp/chosen ')
+    const bindings = { inputs: { input: { files: ['/audio/song.wav'] } }, outputs: {},
+      outputDirectory: '/tmp/workbench ', primaryInput: 'input', outputLayout: 'folders' }
+    const prepared = (await task.startWorkbenchInference({ ...workflow, updatedAt: 1 }, bindings)).tasks[0]
+    assert.equal(prepared.output, '/tmp/workbench /song')
+    assert.equal(prepared.runConfig.workbench.outputs['save:split:vocals'], '/tmp/workbench /song')
+  })
+
+  test(`simple workbench ${platform} folders preserve native backslashes through submission and retry`, async () => {
+    storage()
+    const task = await newStore(platform)
+    settings.outputDir = '/tmp/default'
+    const root = '/tmp/results\\'
+    const bindings = { inputs: { input: { files: ['/audio/AC\\DC.wav'] } }, outputs: {},
+      outputDirectory: root, primaryInput: 'input', outputLayout: 'folders' }
+    const original = (await task.startWorkbenchInference({ ...workflow, updatedAt: 1 }, bindings)).tasks[0]
+    const directory = `${root}/AC\\DC`
+    assert.equal(original.output, directory)
+    assert.equal(original.runConfig.workbench.outputs['save:split:vocals'], directory)
+    original.status = 'failed'
+    settings.outputDir = '/tmp/changed'
+    const retried = await task.retryTask(original.id)
+    assert.equal(retried.output, directory)
+    assert.deepEqual(retried.runConfig.workbench.outputs, original.runConfig.workbench.outputs)
+  })
+
+  test(`legacy ${platform} files-only responses preserve native paths and filenames`, async () => {
+    const values = storage()
+    const task = await newStore(platform)
+    task.clearInputFiles()
+    task.addInputFiles(['/audio/song.mix.wav'])
+    const root = '/tmp/results\\'
+    const original = (await task.startWorkflowInference(workflow, { outputDir: root, outputLayout: 'folders' })).tasks[0]
+    original.outputPrefix = undefined
+    task.handleWorkerEvent({ type: 'task_done', taskId: original.id,
+      payload: { outputDir: root, outputRoot: root, files: ['vocals.wav', 'parts/voice.flac', 'tail.wav ', 'AC\\DC.wav', 'song.mix_vocals.wav', '../input.wav'], outputs: [] } })
+    const expected = [`${root}/vocals.wav`, `${root}/parts/voice.flac`, `${root}/tail.wav `, `${root}/AC\\DC.wav`, `${root}/song.mix_vocals.wav`]
+    assert.deepEqual(original.outputs.map(output => output.path), expected)
+    assert.equal(original.outputs.at(-1).stem, 'vocals')
+    assert.deepEqual(task.resultTrashTargets(original), expected)
+    await waitForSave()
+    const restored = (await newStore(platform)).getTaskById(original.id)
+    assert.deepEqual(restored.outputs.map(output => output.path), expected)
+    const data = JSON.parse(values.get('pymss-studio:task-history'))
+    data.tasks.find(item => item.id === original.id).outputs = []
+    globalThis.localStorage.setItem('pymss-studio:task-history', JSON.stringify(data))
+    const legacyRestored = (await newStore(platform)).getTaskById(original.id)
+    assert.deepEqual(legacyRestored.outputs.map(output => output.path), expected)
+  })
 }

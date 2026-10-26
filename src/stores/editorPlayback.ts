@@ -19,6 +19,7 @@ export const useEditorPlaybackStore = defineStore('editor-playback', () => {
   const masterLevel = ref<[number, number]>([0, 0])
   const trackLevels = ref<Record<string, [number, number]>>({})
   const suppressedTrackIds = ref<string[]>([])
+  const recordingProjectId = ref<string | null>(null)
   const error = ref<string | null>(null)
   const requestId = ref(0)
 
@@ -144,6 +145,10 @@ export const useEditorPlaybackStore = defineStore('editor-playback', () => {
     suppressedTrackIds.value = [...new Set(trackIds.filter(Boolean))]
   }
 
+  function setRecordingProjectId(value: string | null) {
+    recordingProjectId.value = value
+  }
+
   function setLoop(value: boolean) {
     loop.value = Boolean(value)
   }
@@ -157,6 +162,7 @@ export const useEditorPlaybackStore = defineStore('editor-playback', () => {
     masterLevel.value = [0, 0]
     trackLevels.value = {}
     suppressedTrackIds.value = []
+    recordingProjectId.value = null
     error.value = null
     requestId.value = 0
   }
@@ -170,6 +176,7 @@ export const useEditorPlaybackStore = defineStore('editor-playback', () => {
     masterLevel,
     trackLevels,
     suppressedTrackIds,
+    recordingProjectId,
     error,
     requestId,
     transportVisualState,
@@ -192,6 +199,7 @@ export const useEditorPlaybackStore = defineStore('editor-playback', () => {
     setTrackLevels,
     clearTrackLevels,
     setSuppressedTrackIds,
+    setRecordingProjectId,
     setLoop,
     reset,
   }

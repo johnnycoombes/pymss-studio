@@ -30,3 +30,11 @@ test('preserves explicit stem metadata and drops malformed entries', () => {
 test('keeps custom workflow filenames when no input prefix is present', () => {
   assert.equal(stemFromOutputPath('D:/results/custom_mix.wav', 'D:/audio/song.wav'), 'custom_mix')
 })
+
+test('native POSIX stems preserve literal backslashes while Windows input hints stay compatible', () => {
+  assert.equal(stemFromOutputPath('/results/custom\\mix.wav', '/audio/song.wav'), 'custom\\mix')
+  assert.equal(stemFromOutputPath('/results/AC\\DC_vocals.wav', '/audio/AC\\DC.wav'), 'vocals')
+  assert.deepEqual(normalizeStemOutputs([{ path: 'song_vocals.wav' }], 'C:\\audio\\song.wav'), [
+    { path: 'song_vocals.wav', stem: 'vocals' },
+  ])
+})

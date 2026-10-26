@@ -8,7 +8,7 @@ import { parse } from 'vue/compiler-sfc'
 const descriptor = parse(readFileSync(new URL('../src/views/ResultsView.vue', import.meta.url), 'utf8')).descriptor
 const source = ts.createSourceFile('results.ts', descriptor.scriptSetup.content, ts.ScriptTarget.Latest, true)
 const names = new Set(['removalItems', 'removeResultRecords', 'cleanupLinkedEditorProjects', 'ensureLinkedEditorProjectsClosed',
-  'handleRemoveResult', 'handleRemoveSelected', 'handleClearResults', 'groupTaskIds', 'trashTargets', 'trashEmptyDirs',
+  'handleRemoveResult', 'handleRemoveSelected', 'handleClearResults', 'groupTaskIds', 'trashEmptyDirs',
   'trashTargetsForItems', 'trashEmptyDirsForItems'])
 const statements = source.statements.filter(statement => ts.isFunctionDeclaration(statement) && names.has(statement.name?.text))
 assert.equal(statements.length, names.size)
@@ -16,7 +16,7 @@ const code = ts.transpileModule(statements.map(statement => statement.getText(so
   compilerOptions: { target: ts.ScriptTarget.ES2022 },
 }).outputText
 
-function environment({ open = false, cleanupFailed = false, writeFailed = false, active = false } = {}) {
+function environment({ open = false, cleanupFailed = false, writeFailed = false, active = false, retained = 0 } = {}) {
   const calls = [], dialogs = [], messages = [], checks = []
   const items = [{ id: 'success' }, { id: 'failed-sibling' }]
   const group = { id: 'run', items: [items[0]] }
@@ -37,6 +37,7 @@ function environment({ open = false, cleanupFailed = false, writeFailed = false,
       getRemovalTasks() { if (active) throw new Error('Batch is running'); return items },
       async removeResults(ids) { calls.push(['records', Array.from(ids)]); if (writeFailed) throw new Error('Disk write failed') },
       resultTrashTargets: item => [`D:/out/${item.id}.wav`], resultTrashEmptyDirs: () => [],
+      resultTrashTargetsForTasks: items => ({ paths: items.slice(retained).map(item => `D:/out/${item.id}.wav`), retained }),
       async trashResultPaths(paths) { calls.push(['trash', Array.from(paths)]); return { failed: [] } },
     },
   }
@@ -86,6 +87,20 @@ for (const action of ['handleRemoveResult', 'handleRemoveSelected', 'handleClear
     env.open(action)
     assert.equal(await env.confirm(), false)
     assert.deepEqual(env.messages, [['error', 'Disk write failed']])
+  })
+
+  test(`${action} reports protected files while removing the result records`, async () => {
+    for (const retained of [1, 2]) {
+      const env = environment({ retained })
+      env.open(action)
+      await env.confirm(true)
+      assert.ok(env.calls.some(call => Array.isArray(call) && call[0] === 'records'))
+      const trash = env.calls.find(call => Array.isArray(call) && call[0] === 'trash')
+      if (retained === 1) assert.deepEqual(trash, ['trash', ['D:/out/failed-sibling.wav']])
+      else assert.equal(trash, undefined)
+      assert.ok(env.messages.some(([level, key]) => level === 'success' && key === 'results.removeFilesRetained'))
+      assert.ok(!env.messages.some(([, key]) => key.startsWith('results.removeNoFiles')))
+    }
   })
 }
 

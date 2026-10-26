@@ -14,6 +14,8 @@ import {
 } from '@vicons/ionicons5'
 import type { DownloadLogEntry, DownloadTask } from '@/stores/model'
 import { formatBytes, formatSpeedMBps } from '@/utils/format'
+import TaskLogConsole from '@/components/TaskLogConsole.vue'
+import { formatLogRecord, normalizeLogRecord } from '@/utils/logRecord'
 
 const props = defineProps<{
   show: boolean
@@ -156,10 +158,6 @@ function formatTime(ts: number) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
-function levelClass(level: string) {
-  return `dl-log--${level}`
-}
-
 async function scrollToBottom() {
   if (!autoScroll.value) return
   await nextTick()
@@ -190,7 +188,7 @@ function onScroll(e: Event) {
 async function copyAllLogs() {
   if (!props.task) return
   const text = props.task.logs
-    .map((log) => `[${formatTime(log.ts)}] [${log.level}] ${log.message}`)
+    .map((log) => log.record ? formatLogRecord(log.record) : `[${formatTime(log.ts)}] [${log.level}] ${log.message}`)
     .join('\n')
   if (!text) {
     message.info(t('models.downloadLogsEmpty'))
@@ -296,22 +294,14 @@ function handleClose() {
           </div>
           <div
             ref="logContainerRef"
-            class="ddm-logs"
+            class="ddm-logs console-scrollbar"
             :class="{ 'ddm-logs--empty': !logs.length }"
             @scroll="onScroll"
           >
             <div v-if="!logs.length" class="ddm-logs-empty">
               {{ t('models.downloadLogsEmpty') }}
             </div>
-            <div
-              v-for="(log, idx) in logs"
-              :key="idx"
-              :class="['dl-log', levelClass(log.level)]"
-            >
-              <span class="dl-log-time">{{ formatTime(log.ts) }}</span>
-              <span class="dl-log-level">{{ log.level }}</span>
-              <span class="dl-log-msg">{{ log.message }}</span>
-            </div>
+            <TaskLogConsole v-else :lines="logs.map(log => log.record || normalizeLogRecord({ message: log.message, level: log.level, timestamp: new Date(log.ts).toISOString(), source: 'worker' }))" embedded />
           </div>
           <!-- Scrolling up pauses the follow-along so a line being read does not slide away; this
                is how to get back to it. -->
@@ -365,8 +355,8 @@ function handleClose() {
 <style scoped>
 .download-detail-modal {
   --download-tone: var(--primary);
-  width: min(720px, calc(100vw - 48px));
-  max-height: min(640px, calc(100dvh - 64px));
+  width: var(--modal-width-md);
+  max-height: min(640px, var(--modal-max-height));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -556,12 +546,9 @@ function handleClose() {
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.55;
-  scrollbar-width: thin;
-  scrollbar-color: #73839c transparent;
 }
 
 @supports selector(::-webkit-scrollbar) {
-  .ddm-logs { scrollbar-width: auto; scrollbar-color: auto; }
   .download-detail-modal :deep(.n-card-content) { scrollbar-width: auto; scrollbar-color: auto; }
 }
 .download-detail-modal :deep(.n-card-content::-webkit-scrollbar),
@@ -572,13 +559,6 @@ function handleClose() {
 .ddm-error-text::-webkit-scrollbar-thumb { border-radius: 999px; background: color-mix(in srgb, var(--on-surface-muted) 40%, transparent); }
 .download-detail-modal :deep(.n-card-content::-webkit-scrollbar-button),
 .ddm-error-text::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
-.ddm-logs::-webkit-scrollbar { width: 9px; }
-.ddm-logs::-webkit-scrollbar-track { background: transparent; }
-.ddm-logs::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 999px; background: rgb(148 163 184 / 45%) padding-box; }
-.ddm-logs::-webkit-scrollbar-thumb:hover { background: rgb(148 163 184 / 65%) padding-box; }
-.ddm-logs::-webkit-scrollbar-button,
-.ddm-logs::-webkit-scrollbar-corner { display: none; width: 0; height: 0; }
-
 .ddm-logs-empty {
   color: var(--on-surface-muted);
   text-align: center;
@@ -675,7 +655,7 @@ function handleClose() {
 .ddm-footer-hint { flex: 1 1 240px; align-self: center; color: var(--on-surface-muted); font-size: 11px; line-height: 1.5; }
 
 @media (max-width: 560px) {
-  .download-detail-modal { width: calc(100vw - 24px); max-height: calc(100dvh - 24px); border-radius: 16px; }
+  .download-detail-modal { width: var(--modal-width-md); max-height: var(--modal-max-height); border-radius: 16px; }
   .download-detail-modal :deep(.n-card-header) { padding: 16px 16px 12px; }
   .download-detail-modal :deep(.n-card-footer),
   .download-detail-modal :deep(.n-card__footer) { padding: 12px 16px 16px; }

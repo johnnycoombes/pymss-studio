@@ -1,5 +1,9 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { masterLimiterRenderRate, normalizeMasterLimiter } from '@/utils/masterLimiter'
+import { createLogger } from '@/utils/logger'
+import { clonePluginChain, hasEditorPlugins, neutralPluginRenderProject, normalizePluginChain, pluginProcessingProject, projectPluginSlots, pluginProjectVersion } from '@/utils/editorPlugins'
+import { assertPluginProjectSupported, currentPluginSession, discardUnavailablePluginSession, observePluginSession, PluginHostDialogPendingError, pluginHostCapabilities, reloadPluginSession, snapshotPluginStates, unloadPluginSession, type PluginSessionState } from '@/utils/pluginHost'
+import { computed, onScopeDispose, ref, watch } from 'vue'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import i18n, { getCurrentLocale } from '@/i18n'
@@ -8,10 +12,12 @@ import {
   syncSingleClipFadeCompatibility,
   timelineDuration,
 } from '@/utils/editorClips'
-import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
+import { registerWindowCloseGuard, WindowClosePersistenceError } from '@/utils/windowCloseGuards'
 import { isTauriRuntime } from '@/utils/appStore'
 import type { SeparationTask, StemOutput } from '@/stores/task'
 import type {
+  EditorMasterLimiter,
+  EditorPluginSlot,
   EditorExportFormat,
   EditorExportOptions,
   EditorProjectSummary,
@@ -20,9 +26,10 @@ import type {
   EditorSourceRole,
   EditorClip,
   EditorTrack,
-  EditorTrackEffects,
   EditorAssetTreeNode,
 } from '@/types/editor'
+
+const studioLog = createLogger('ui.stores.editor')
 
 export type {
   EditorExportFormat,
@@ -32,7 +39,6 @@ export type {
   EditorSource,
   EditorSourceRole,
   EditorTrack,
-  EditorTrackEffects,
   EditorAssetTreeNode,
 } from '@/types/editor'
 
@@ -40,6 +46,8 @@ type HistorySnapshot = {
   tracks: EditorTrack[]
   masterVolume: number
   masterPan: number
+  masterLimiter?: EditorMasterLimiter
+  pluginChain?: EditorPluginSlot[]
   selectedTrackId: string | null
   selectedClipId: string | null
 }
@@ -115,6 +123,7 @@ type ExportResult = {
   format: string
   peakProtectionApplied?: boolean
   peakAdjustmentDb?: number
+  pluginTailLimited?: boolean
 }
 
 export type EditorExportProgress = {
@@ -135,6 +144,7 @@ type PendingEditorExport = {
   id: string
   projectId: string
   exportDir?: string
+  progressOffset?: number
   resolve: (result: ExportResult) => void
   reject: (error: Error) => void
 }
@@ -150,6 +160,7 @@ type PersistedSession = EditorSession & { version?: number }
 
 const HISTORY_LIMIT = 80
 const AUTO_SAVE_DELAY = 420
+const NATIVE_RENDER_PROGRESS_WEIGHT = 75
 const WAVEFORM_FULL_RESOLUTION = 2200
 const COLOR_BY_STEM: Record<string, string> = {
   vocals: '#ff6b7c',
@@ -296,22 +307,19 @@ function duplicatedTrackColor(source: EditorSource) {
   return trackColor(source.role, source.stemKey)
 }
 
+function cloneLegacyTrackEffects(effects: unknown): EditorTrack['effects'] {
+  return effects && typeof effects === 'object' && !Array.isArray(effects)
+    ? JSON.parse(JSON.stringify(effects)) as Record<string, unknown>
+    : undefined
+}
+
 function cloneTracks(tracks: EditorTrack[]) {
   return tracks.map((track) => ({
     ...track,
-    effects: track.effects ? { ...track.effects } : undefined,
+    effects: cloneLegacyTrackEffects(track.effects),
+    pluginChain: clonePluginChain(track.pluginChain),
     clips: track.clips?.map((clip) => ({ ...clip })),
   }))
-}
-
-function normalizeTrackEffects(effects?: Partial<EditorTrackEffects> | null): EditorTrackEffects {
-  return {
-    reverb: clamp(Number(effects?.reverb ?? 0), 0, 1),
-    delay: clamp(Number(effects?.delay ?? 0), 0, 1),
-    delayTime: clamp(Number(effects?.delayTime ?? 0.24), 0.05, 1.2),
-    clarity: clamp(Number(effects?.clarity ?? 0), 0, 1),
-    compressor: clamp(Number(effects?.compressor ?? 0), 0, 1),
-  }
 }
 
 function normalizeSource(source: Partial<EditorSource>): EditorSource {
@@ -459,7 +467,8 @@ function normalizeTrack(
     solo: Boolean(track.solo),
     fadeIn,
     fadeOut,
-    effects: normalizeTrackEffects(track.effects),
+    effects: cloneLegacyTrackEffects(track.effects),
+    pluginChain: normalizePluginChain(track.pluginChain),
     type: track.type === 'recording' || role === 'recording'
       ? 'recording'
       : (track.type === 'audio' ? 'audio' : role),
@@ -484,6 +493,8 @@ function normalizeSession(session: PersistedSession): EditorSession {
     sourceResultDir: session.sourceResultDir ? String(session.sourceResultDir) : undefined,
     masterVolume: clamp(Number(session.masterVolume ?? 1), 0, 2),
     masterPan: clamp(Number(session.masterPan ?? 0), -1, 1),
+    masterLimiter: session.masterLimiter ? normalizeMasterLimiter(session.masterLimiter) : undefined,
+    pluginChain: normalizePluginChain(session.pluginChain),
     sources,
     tracks,
     createdAt: Number(session.createdAt || Date.now()),
@@ -494,7 +505,8 @@ function normalizeSession(session: PersistedSession): EditorSession {
 function toPersistedSession(session: EditorSession) {
   return {
     ...session,
-    version: 3,
+    version: pluginProjectVersion(session),
+    pluginChain: clonePluginChain(session.pluginChain),
     tracks: cloneTracks(session.tracks),
     sources: session.sources.map((source) => ({
       ...source,
@@ -563,7 +575,6 @@ function trackToExportTrack(track: EditorTrack, source?: EditorSource) {
     pan: track.pan,
     muted: track.muted,
     solo: track.solo,
-    effects: track.effects ? { ...track.effects } : undefined,
     clips,
   }
 }
@@ -577,6 +588,9 @@ export const useEditorStore = defineStore('editor', () => {
   const exportProgress = ref<EditorExportProgress | null>(null)
   const lastExport = ref<ExportResult | null>(null)
   const lastError = ref<string | null>(null)
+  const pluginStateDirty = ref(false)
+  const pluginStateError = ref<string | null>(null)
+  const pluginStateUnavailable = ref(false)
   const selectedTrackId = ref<string | null>(null)
   const selectedClipId = ref<string | null>(null)
   const pixelsPerSecond = ref(96)
@@ -592,7 +606,9 @@ export const useEditorStore = defineStore('editor', () => {
   let exportListenerPromise: Promise<void> | null = null
   let exportStartPromise: Promise<void> | null = null
   let exportCancelRequested = false
+  let exportRenderController: AbortController | null = null
   let exportRequestSequence = 0
+  let nativeRenderTaskId: string | null = null
 
   const canUndo = computed(() => undoStack.value.length > 0)
   const canRedo = computed(() => redoStack.value.length > 0)
@@ -691,6 +707,8 @@ export const useEditorStore = defineStore('editor', () => {
       tracks: cloneTracks(session.value.tracks),
       masterVolume: session.value.masterVolume,
       masterPan: session.value.masterPan,
+      masterLimiter: session.value.masterLimiter ? { ...session.value.masterLimiter } : undefined,
+      pluginChain: clonePluginChain(session.value.pluginChain),
       selectedTrackId: selectedTrackId.value,
       selectedClipId: selectedClipId.value,
     }
@@ -701,6 +719,8 @@ export const useEditorStore = defineStore('editor', () => {
     session.value.tracks = cloneTracks(next.tracks)
     session.value.masterVolume = next.masterVolume
     session.value.masterPan = next.masterPan
+    session.value.masterLimiter = next.masterLimiter ? { ...next.masterLimiter } : undefined
+    session.value.pluginChain = clonePluginChain(next.pluginChain)
     selectedTrackId.value = next.selectedTrackId
     selectedClipId.value = next.selectedClipId
   }
@@ -748,39 +768,152 @@ export const useEditorStore = defineStore('editor', () => {
     interactionDepth.value = 0
   }
 
+  let pluginSaveTimer: ReturnType<typeof setTimeout> | null = null
   let saveTimer: ReturnType<typeof setTimeout> | null = null
   let saveDrainTask: Promise<EditorSession | null> | null = null
   const pendingProjectSaves = new Map<string, PersistedSession>()
   const suspendedProjectSaves = new Set<string>()
+  let discardingWindowChanges = false
 
   function queueSessionSave() {
-    if (!session.value) return null
+    if (!session.value || discardingWindowChanges) return null
     const project = toPersistedSession(session.value)
     if (suspendedProjectSaves.has(project.id)) return null
     pendingProjectSaves.set(project.id, project)
     return project.id
   }
 
+  async function capturePluginState(project: EditorSession, force = false, recovery = false) {
+    try {
+      return await snapshotPluginStates(project, { force, recovery })
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause)
+      const error = cause instanceof PluginHostDialogPendingError ? detail : String(i18n.global.t('editor.plugins.stateCaptureFailed', { detail }))
+      if (session.value?.id === project.id || currentPluginSession()?.project === project) {
+        pluginStateDirty.value = true
+        pluginStateError.value = error
+        if (!(cause instanceof PluginHostDialogPendingError)) lastError.value = error
+      }
+      if (cause instanceof PluginHostDialogPendingError) throw cause
+      throw new Error(error)
+    }
+  }
+
+  function schedulePluginStateSave(project: EditorSession, attempt = 0) {
+    if (discardingWindowChanges) return
+    if (pluginSaveTimer) clearTimeout(pluginSaveTimer)
+    pluginSaveTimer = setTimeout(async () => {
+      pluginSaveTimer = null
+      if (session.value !== project) return
+      try {
+        await capturePluginState(project)
+        if (discardingWindowChanges || session.value !== project) return
+        queueSessionSave()
+        await drainPendingSaves()
+      } catch {
+        // One automatic retry handles transient capture/storage failures; further retries are explicit.
+        if (attempt === 0 && session.value === project) schedulePluginStateSave(project, 1)
+      }
+    }, attempt === 0 ? 900 : 2000)
+  }
+
+  let pendingDialogMessage: string | null = null
+  const stopObservingPlugins = observePluginSession(host => {
+    if (!host || host.project !== session.value) return
+    pluginStateUnavailable.value = host.unavailable
+    if (host.error) {
+      pluginStateDirty.value = true
+      pluginStateError.value = host.interactionRequired ? host.error : String(i18n.global.t('editor.plugins.stateCaptureFailed', { detail: host.error }))
+      pendingDialogMessage = host.interactionRequired ? pluginStateError.value : null
+      if (!host.interactionRequired) lastError.value = pluginStateError.value
+      return
+    }
+    if (pendingDialogMessage) {
+      if (pluginStateError.value === pendingDialogMessage) pluginStateError.value = null
+      if (lastError.value === pendingDialogMessage) lastError.value = null
+      pendingDialogMessage = null
+    }
+    if (host.dirty) {
+      pluginStateDirty.value = true
+      schedulePluginStateSave(host.project)
+    }
+  })
+  watch(() => session.value?.id, () => {
+    pendingDialogMessage = null
+    if (pluginSaveTimer) clearTimeout(pluginSaveTimer)
+    pluginSaveTimer = null
+    pluginStateDirty.value = false
+    pluginStateError.value = null
+    pluginStateUnavailable.value = false
+  })
+  onScopeDispose(() => {
+    stopObservingPlugins()
+    if (pluginSaveTimer) clearTimeout(pluginSaveTimer)
+  })
+
+  async function retryPluginStateSave() { return saveProject() }
+
+  async function restoreSavedPluginSession() {
+    const project = session.value
+    if (!project) return
+    const persisted = await invoke<PersistedSession>('load_editor_project', { projectId: project.id })
+    if (session.value !== project) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+    const savedSlots = projectPluginSlots(persisted)
+    for (const slot of projectPluginSlots(project)) {
+      const saved = savedSlots.find(item => item.id === slot.id && item.path === slot.path && item.pluginId === slot.pluginId)
+      if (saved?.state !== undefined) slot.state = saved.state
+      else delete slot.state
+    }
+    await reloadPluginSession(project)
+    await saveProject()
+  }
+
+
+  async function releasePluginSession(project: EditorSession) {
+    if (currentPluginSession()?.project.id !== project.id) return
+    if (pluginSaveTimer) clearTimeout(pluginSaveTimer)
+    pluginSaveTimer = null
+    await capturePluginState(project, true)
+    pendingProjectSaves.set(project.id, toPersistedSession(project))
+    await drainPendingSaves()
+    await unloadPluginSession(project.id)
+  }
+
   async function drainPendingSaves() {
+    if (discardingWindowChanges) return null
     if (saveDrainTask) return saveDrainTask
     const task = (async () => {
       saving.value = true
       try {
         while (pendingProjectSaves.size) {
+          if (discardingWindowChanges) return null
           const next = pendingProjectSaves.entries().next().value as [string, PersistedSession] | undefined
           if (!next) break
           const [projectId, project] = next
           pendingProjectSaves.delete(projectId)
           try {
-            const result = await invoke<PersistedSession>('save_editor_project', { project })
-            if (session.value?.id === projectId && result.updatedAt) {
-              session.value.updatedAt = Number(result.updatedAt)
+            const target = session.value?.id === projectId ? session.value : project
+            if (hasEditorPlugins(target)) await capturePluginState(target)
+            if (discardingWindowChanges) return null
+            const captured = toPersistedSession(target)
+            const result = await invoke<PersistedSession>('save_editor_project', { project: captured })
+            if (session.value?.id === projectId) {
+              if (result.updatedAt) session.value.updatedAt = Number(result.updatedAt)
+              const host = currentPluginSession()
+              pluginStateDirty.value = Boolean(host?.project === session.value && host.dirty)
+              pluginStateError.value = null
+              lastError.value = null
+              if (!pluginStateDirty.value && pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
             }
-            lastError.value = null
           } catch (error) {
             // Keep a newer snapshot if edits arrived while this save was in flight.
-            if (!pendingProjectSaves.has(projectId)) pendingProjectSaves.set(projectId, project)
-            lastError.value = error instanceof Error ? error.message : String(error)
+            if (!discardingWindowChanges && !pendingProjectSaves.has(projectId)) pendingProjectSaves.set(projectId, toPersistedSession(session.value?.id === projectId ? session.value : project))
+            const detail = error instanceof Error ? error.message : String(error)
+            if (!(error instanceof PluginHostDialogPendingError)) lastError.value = detail
+            if (session.value?.id === projectId && hasEditorPlugins(project)) {
+              pluginStateDirty.value = true
+              pluginStateError.value = detail
+            }
             throw error
           }
         }
@@ -808,22 +941,46 @@ export const useEditorStore = defineStore('editor', () => {
 
   async function flushSave() {
     queueSessionSave()
-    if (saveTimer) {
-      clearTimeout(saveTimer)
-      saveTimer = null
-    }
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+    if (pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
+    const host = currentPluginSession()
+    if (host && host.project !== session.value && (host.dirty || host.error)) await releasePluginSession(host.project)
+    if (session.value && hasEditorPlugins(session.value)) await capturePluginState(session.value, true)
     return drainPendingSaves()
   }
 
   // The store outlives the editor route. Keeping persistence here ensures a
   // delayed autosave is still flushed when the user closes from another page.
-  registerWindowCloseGuard(async () => {
-    await flushSave()
-  }, -100)
+  onScopeDispose(registerWindowCloseGuard(async () => {
+    const closingProject = session.value
+    try {
+      await flushSave()
+      const host = currentPluginSession()
+      if (host?.project === closingProject) await unloadPluginSession(host.project.id)
+      else if (host) await releasePluginSession(host.project)
+    } catch (cause) {
+      throw new WindowClosePersistenceError(cause, async () => {
+        if (session.value !== closingProject) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+        discardingWindowChanges = true
+        try {
+          if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+          if (pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
+          await saveDrainTask?.catch(() => undefined)
+          if (session.value !== closingProject) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+          const host = currentPluginSession()
+          if (host && host.project !== closingProject) throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+          if (host) await unloadPluginSession(host.project.id, { discardUnsaved: true })
+          pendingProjectSaves.clear()
+        } finally {
+          discardingWindowChanges = false
+        }
+      })
+    }
+  }, -100))
 
-  registerWindowCloseGuard(async () => {
+  onScopeDispose(registerWindowCloseGuard(async () => {
     if (exporting.value) await cancelExport()
-  }, 100)
+  }, 100))
 
   function selectTrack(trackId: string | null) {
     selectedTrackId.value = trackId
@@ -1080,15 +1237,21 @@ export const useEditorStore = defineStore('editor', () => {
 
   async function saveProject() {
     if (!queueSessionSave() && !pendingProjectSaves.size) return null
-    if (saveTimer) {
-      clearTimeout(saveTimer)
-      saveTimer = null
-    }
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+    if (pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
+    const host = currentPluginSession()
+    if (host && host.project !== session.value && (host.dirty || host.error)) await releasePluginSession(host.project)
+    if (session.value && hasEditorPlugins(session.value)) await capturePluginState(session.value, true)
     return drainPendingSaves()
   }
 
   async function getMetadata(path: string) {
     return invoke<AudioMetadata>('get_audio_metadata', { payload: { path } })
+  }
+
+  function hasUsableAudioMetadata(metadata: AudioMetadata | EditorSource | null | undefined) {
+    return Boolean(metadata && [metadata.duration, metadata.sampleRate, metadata.channels]
+      .every((value) => Number.isFinite(value) && value > 0))
   }
 
   async function ensurePeaks(sourceId: string) {
@@ -1285,17 +1448,16 @@ export const useEditorStore = defineStore('editor', () => {
 
   async function ensureSourceByPath(path: string, options?: Partial<EditorSource>) {
     if (!session.value) throw new Error('Editor session is not loaded')
+    const targetSession = session.value
     const normalized = normalizePathKey(path)
     const existing = session.value.sources.find((source) => normalizePathKey(source.path) === normalized)
     if (existing) return existing
 
-    const metadata = await getMetadata(path).catch(() => ({
-      path,
-      name: fileName(path),
-      duration: 0,
-      sampleRate: 0,
-      channels: 0,
-    }))
+    const metadata = await getMetadata(path)
+    if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+    if (!hasUsableAudioMetadata(metadata)) throw new Error(String(i18n.global.t('editor.assetMetadataInvalid')))
+    const concurrentSource = targetSession.sources.find((source) => normalizePathKey(source.path) === normalized)
+    if (concurrentSource) return concurrentSource
     const source: EditorSource = {
       id: makeId('source'),
       role: 'reference',
@@ -1336,7 +1498,6 @@ export const useEditorStore = defineStore('editor', () => {
       solo: false,
       fadeIn: 0,
       fadeOut: 0,
-      effects: normalizeTrackEffects(),
       type: 'reference',
       clips: [normalizeClip({
         id: makeId('clip'),
@@ -1368,7 +1529,6 @@ export const useEditorStore = defineStore('editor', () => {
       solo: false,
       fadeIn: 0,
       fadeOut: 0,
-      effects: normalizeTrackEffects(),
       clips: [],
     }
     session.value.tracks.push(track)
@@ -1443,24 +1603,67 @@ export const useEditorStore = defineStore('editor', () => {
     return source
   }
 
-  async function scanAssets(paths: string[]) {
+  async function scanAssets(paths: string[], options?: { addTracks?: boolean }) {
     if (!session.value) throw new Error('Editor session is not loaded')
+    const targetSession = session.value
     const imported = await invoke<ImportEditorAssetsResult>('import_editor_assets', {
-      projectId: session.value.id,
+      projectId: targetSession.id,
       paths,
     })
+    if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+    const sourcePaths = new Map<string, string>()
+    const warnings = [...(imported.warnings || [])]
     for (const asset of imported.files || []) {
-      await ensureSourceByPath(asset.path, {
-        originKind: asset.originKind,
-        originRoot: asset.originRoot || null,
-        relativePath: asset.relativePath || fileName(asset.path),
-        missing: asset.missing,
+      if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+      try {
+        const source = await ensureSourceByPath(asset.path, {
+          originKind: asset.originKind,
+          originRoot: asset.originRoot || null,
+          relativePath: asset.relativePath || fileName(asset.path),
+          missing: asset.missing,
+        })
+        if (source.missing || !hasUsableAudioMetadata(source)) {
+          throw new Error(String(i18n.global.t('editor.assetMetadataInvalid')))
+        }
+        if (!sourcePaths.has(source.id)) sourcePaths.set(source.id, asset.path)
+      } catch (error) {
+        if (session.value !== targetSession) throw error
+        const detail = error instanceof Error ? error.message : String(error)
+        warnings.push(String(i18n.global.t('editor.assetImportFailed', { name: fileName(asset.path), detail })))
+      }
+    }
+    // Metadata can finish while a slider or clip is being dragged. Keep the
+    // imported tracks in their own undo action after that interaction ends.
+    while (options?.addTracks && sourcePaths.size && interactionDepth.value > 0 && session.value === targetSession) {
+      await new Promise<void>((resolve) => {
+        const stop = watch([interactionDepth, session], () => {
+          if (interactionDepth.value > 0 && session.value === targetSession) return
+          stop()
+          resolve()
+        }, { flush: 'sync' })
       })
+    }
+    if (session.value !== targetSession) throw new Error('Editor project changed during asset import')
+    const currentSources = new Map(targetSession.sources.map((source) => [source.id, source]))
+    for (const [sourceId, path] of sourcePaths) {
+      const source = currentSources.get(sourceId)
+      if (source && !source.missing && hasUsableAudioMetadata(source)) continue
+      sourcePaths.delete(sourceId)
+      const detail = String(i18n.global.t(source ? 'editor.assetMetadataInvalid' : 'editor.assetRemovedDuringImport'))
+      warnings.push(String(i18n.global.t('editor.assetImportFailed', { name: fileName(path), detail })))
+    }
+    if (options?.addTracks && sourcePaths.size) {
+      beginInteraction()
+      try {
+        for (const sourceId of sourcePaths.keys()) addTrackFromSourceId(sourceId)
+      } finally {
+        commitInteraction()
+      }
     }
     await saveProject()
     return {
-      files: (imported.files || []).map((asset) => asset.path),
-      warnings: imported.warnings || [],
+      files: [...sourcePaths.values()],
+      warnings,
     } satisfies ScanAudioPathsResult
   }
 
@@ -1571,13 +1774,6 @@ export const useEditorStore = defineStore('editor', () => {
     if (interactionDepth.value === 0) scheduleSave()
   }
 
-  function setTrackEffects(trackId: string, patch: Partial<EditorTrackEffects>) {
-    const track = session.value?.tracks.find((item) => item.id === trackId)
-    if (!track) return
-    track.effects = normalizeTrackEffects({ ...track.effects, ...patch })
-    if (interactionDepth.value === 0) scheduleSave()
-  }
-
   function setClipFades(
     trackId: string,
     clipId: string,
@@ -1621,6 +1817,16 @@ export const useEditorStore = defineStore('editor', () => {
   function setMasterVolume(value: number) {
     if (!session.value) return
     session.value.masterVolume = clamp(Number(value), 0, 2)
+    if (interactionDepth.value === 0) scheduleSave()
+  }
+
+  function setMasterLimiter(patch: Partial<EditorMasterLimiter>) {
+    if (!session.value) return
+    const previous = normalizeMasterLimiter(session.value.masterLimiter)
+    const next = normalizeMasterLimiter({ ...previous, ...patch })
+    if (JSON.stringify(previous) === JSON.stringify(next)) return
+    pushHistory()
+    session.value.masterLimiter = next
     if (interactionDepth.value === 0) scheduleSave()
   }
 
@@ -1704,14 +1910,36 @@ export const useEditorStore = defineStore('editor', () => {
         const workerEvent = event.payload
         const pending = pendingExport
         const eventId = workerEvent.taskId || workerEvent.requestId
+        if (workerEvent.type === 'editor_plugin_render_progress') {
+          if (!nativeRenderTaskId || eventId !== nativeRenderTaskId || exportCancelRequested) return
+          const payload = workerEvent.payload || {}
+          const total = Number(payload.total)
+          const completed = Number(payload.completed)
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(completed) || completed < 0 || completed > total) return
+          const next = completed / total * NATIVE_RENDER_PROGRESS_WEIGHT
+          const previous = exportProgress.value
+          if (previous && next < previous.completed / Math.max(1, previous.total) * 100) return
+          const phase = payload.phase === 'preparing' ? 'preparing'
+            : payload.phase === 'rendering' ? 'rendering' : 'finalizing'
+          exportProgress.value = { phase, completed: next, total: 100, current: '' }
+          return
+        }
         if (!pending || eventId !== pending.id) return
 
         if (workerEvent.type === 'editor_export_progress') {
           const payload = workerEvent.payload || {}
+          const total = Number(payload.total ?? 100)
+          const completed = Number(payload.completed ?? 0)
+          if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(completed) || completed < 0 || completed > total) return
+          const offset = pending.progressOffset || 0
+          const nextCompleted = offset ? offset + completed / total * (100 - offset) : completed
+          const nextTotal = offset ? 100 : total
+          const previous = exportProgress.value
+          if (previous && nextCompleted / nextTotal < previous.completed / Math.max(1, previous.total)) return
           exportProgress.value = {
             phase: String(payload.phase || 'preparing') as EditorExportProgress['phase'],
-            completed: Math.max(0, Number(payload.completed || 0)),
-            total: Math.max(1, Number(payload.total || 100)),
+            completed: nextCompleted,
+            total: nextTotal,
             current: String(payload.current || ''),
           }
           return
@@ -1731,7 +1959,10 @@ export const useEditorStore = defineStore('editor', () => {
 
         if (workerEvent.type === 'error') {
           pendingExport = null
-          pending.reject(new Error(String(workerEvent.payload?.message || 'Editor export failed')))
+          const message = workerEvent.payload?.code === 'EDITOR_EXPORT_PEAK_EXCEEDED'
+            ? String(i18n.global.t('editor.exportPeakExceeded'))
+            : String(workerEvent.payload?.message || 'Editor export failed')
+          pending.reject(new Error(message))
         }
       }).then((unlisten) => {
         exportUnlisten = unlisten
@@ -1751,6 +1982,12 @@ export const useEditorStore = defineStore('editor', () => {
       : (options || {})
     const fmt = normalized.format || exportFormat.value
     const taskId = `editor_export_${Date.now().toString(36)}_${++exportRequestSequence}_${Math.random().toString(36).slice(2, 8)}`
+    const exportProject = session.value
+    let snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
+    const renderController = new AbortController()
+    exportRenderController = renderController
+    const pluginRenderRequired = projectPluginSlots(snapshot).some(slot => !slot.bypassed) || normalizeMasterLimiter(snapshot.masterLimiter).enabled
+    let pluginTailLimited = false
     exporting.value = true
     exportCancelling.value = false
     exportCancelRequested = false
@@ -1759,11 +1996,42 @@ export const useEditorStore = defineStore('editor', () => {
     try {
       await ensureEditorExportListener()
       if (exportCancelRequested) throw new EditorExportCancelledError()
+      const prepared = pluginRenderRequired
+        ? await (async () => {
+            const hostCapabilities = await pluginHostCapabilities()
+            if (!hostCapabilities.enabled) throw new Error(String(i18n.global.t('editor.plugins.unavailable')))
+            assertPluginProjectSupported(exportProject, hostCapabilities.formats || ['vst3'])
+            if (projectPluginSlots(exportProject).some(slot => !slot.bypassed)) await capturePluginState(exportProject, true)
+            if (exportCancelRequested) throw new EditorExportCancelledError()
+            // Capture can wait while the project is edited. Freeze its complete
+            // post-capture version instead of mixing fresh plugin states into an older mix.
+            snapshot = JSON.parse(JSON.stringify(exportProject)) as EditorSession
+            assertPluginProjectSupported(snapshot, hostCapabilities.formats || ['vst3'])
+            nativeRenderTaskId = taskId
+            exportProgress.value = { phase: 'preparing', completed: 0, total: 100, current: '' }
+            try {
+              const rendered = await invoke<{ path: string; duration: number; sampleRate: number; channels: number; tailLimited?: boolean }>('plugin_host_render', {
+                project: pluginProcessingProject(snapshot), taskId,
+                sampleRate: normalizeMasterLimiter(snapshot.masterLimiter).enabled
+                  ? masterLimiterRenderRate(snapshot, normalized.audioParams?.sampleRate) : undefined,
+              })
+              exportProgress.value = { phase: 'finalizing', completed: NATIVE_RENDER_PROGRESS_WEIGHT, total: 100, current: '' }
+              pluginTailLimited = rendered.tailLimited === true
+              return { session: neutralPluginRenderProject(snapshot, rendered), sourceSampleRate: rendered.sampleRate }
+            } finally {
+              nativeRenderTaskId = null
+            }
+          })()
+        : { session: snapshot, sourceSampleRate: undefined }
+      exportRenderController = null
+      if (exportCancelRequested) throw new EditorExportCancelledError()
+      const project = prepared.session
       const completion = new Promise<ExportResult>((resolve, reject) => {
         pendingExport = {
           id: taskId,
-          projectId: session.value!.id,
+          projectId: snapshot.id,
           exportDir: normalized.exportDir,
+          progressOffset: prepared.session !== snapshot ? NATIVE_RENDER_PROGRESS_WEIGHT : 0,
           resolve,
           reject,
         }
@@ -1776,32 +2044,41 @@ export const useEditorStore = defineStore('editor', () => {
           fileName: normalized.fileName,
           audioParams: normalized.audioParams || {},
           project: {
-            id: session.value.id,
-            name: session.value.name,
-            masterVolume: session.value.masterVolume,
-            masterPan: session.value.masterPan,
-            assets: session.value.sources.map(sourceToExportAsset),
-            tracks: session.value.tracks.map((track) => trackToExportTrack(track, sourceMap.value.get(track.sourceId))),
+            id: project.id,
+            name: project.name,
+            masterVolume: project.masterVolume,
+            masterPan: project.masterPan,
+            sourceSampleRate: prepared.sourceSampleRate,
+            assets: project.sources.map(sourceToExportAsset),
+            tracks: project.tracks.map((track) => trackToExportTrack(track, project.sources.find(source => source.id === track.sourceId))),
           },
         },
       }).then(() => undefined)
       await exportStartPromise
       exportStartPromise = null
       const result = await completion
+      if (pluginTailLimited) result.pluginTailLimited = true
       lastExport.value = result
       return result
     } catch (error) {
       if (pendingExport?.id === taskId) pendingExport = null
-      lastError.value = error instanceof EditorExportCancelledError
+      const failure = renderController.signal.aborted ? new EditorExportCancelledError() : error
+      lastError.value = failure instanceof EditorExportCancelledError
         ? null
-        : error instanceof Error ? error.message : String(error)
-      throw error
+        : failure instanceof Error ? failure.message : String(failure)
+      throw failure
     } finally {
+      if (pluginRenderRequired) {
+        await invoke('plugin_host_cleanup_render', { taskId }).catch(error => {
+          studioLog.warn('Failed to clean up plugin render files', error)
+        })
+      }
       exporting.value = false
       exportCancelling.value = false
       exportProgress.value = null
       exportStartPromise = null
       exportCancelRequested = false
+      exportRenderController = null
     }
   }
 
@@ -1820,12 +2097,68 @@ export const useEditorStore = defineStore('editor', () => {
     exportCancelling.value = true
     exportCancelRequested = true
     try {
+      if (exportRenderController) {
+        exportRenderController.abort()
+        if (nativeRenderTaskId) await invoke('plugin_host_cancel_render', { taskId: nativeRenderTaskId })
+        return true
+      }
       if (exportStartPromise) await exportStartPromise
       if (!pendingExport) return true
       return cancelPendingExportTask(pendingExport)
     } catch (error) {
       exportCancelling.value = false
       throw error
+    }
+  }
+
+  function setPluginChain(trackId: string | null, chain: EditorPluginSlot[]) {
+    if (!session.value) return
+    const target = trackId ? session.value.tracks.find(track => track.id === trackId) : session.value
+    if (!target) return
+    pushHistory()
+    target.pluginChain = clonePluginChain(chain)
+    scheduleSave()
+  }
+
+  async function recoverPluginChain(options: {
+    project: EditorSession; trackId: string | null; chain: EditorPluginSlot[];
+    host: PluginSessionState; sessionId: string; signature: string;
+  }) {
+    const { project, trackId, host, sessionId, signature } = options
+    const validate = () => {
+      const target = trackId === null ? project : project.tracks.find(track => track.id === trackId)
+      if (session.value !== project || !target || JSON.stringify(target.pluginChain || []) !== signature) {
+        throw new Error(String(i18n.global.t('editor.plugins.stateCaptureSuperseded')))
+      }
+    }
+    const clearTimers = () => {
+      if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+      if (pluginSaveTimer) { clearTimeout(pluginSaveTimer); pluginSaveTimer = null }
+    }
+    validate()
+    const resumeProjectSave = saveTimer !== null || pendingProjectSaves.has(project.id)
+    const resumePluginSave = pluginSaveTimer !== null
+    clearTimers()
+    try {
+      if (saveDrainTask) await saveDrainTask.catch(() => undefined)
+      validate()
+      await discardUnavailablePluginSession(project, host, sessionId)
+      validate()
+      clearTimers()
+      const previousError = pluginStateError.value
+      setPluginChain(trackId, options.chain)
+      pluginStateDirty.value = false
+      pluginStateError.value = null
+      pluginStateUnavailable.value = false
+      if (lastError.value === previousError) lastError.value = null
+      await flushSave()
+    } catch (cause) {
+      // A rejected recovery must not cancel edits that were already waiting for autosave.
+      if (!discardingWindowChanges && session.value === project) {
+        if (saveTimer === null && (resumeProjectSave || pendingProjectSaves.has(project.id))) scheduleSave()
+        if (pluginSaveTimer === null && resumePluginSave) schedulePluginStateSave(project)
+      }
+      throw cause
     }
   }
 
@@ -1843,6 +2176,15 @@ export const useEditorStore = defineStore('editor', () => {
 
   return {
     session,
+    setPluginChain,
+    recoverPluginChain,
+    pluginStateDirty,
+    pluginStateError,
+    pluginStateUnavailable,
+    restoreSavedPluginSession,
+    capturePluginState,
+    retryPluginStateSave,
+    releasePluginSession,
     loading,
     saving,
     exporting,
@@ -1914,11 +2256,11 @@ export const useEditorStore = defineStore('editor', () => {
     toggleTrackFlag,
     setTrackVolume,
     setTrackPan,
-    setTrackEffects,
     setClipFades,
     setClipTiming,
     setMasterVolume,
     setMasterPan,
+    setMasterLimiter,
     removeTrack,
     removeClip,
     removeSource,

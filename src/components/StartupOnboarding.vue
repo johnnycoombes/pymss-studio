@@ -1,19 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
 import { useRouter } from 'vue-router'
-import { CheckmarkOutline, ColorPaletteOutline, FolderOpenOutline, HardwareChipOutline, LanguageOutline, MoonOutline } from '@vicons/ionicons5'
+import { open } from '@tauri-apps/plugin-shell'
+import { ArrowForwardOutline, CheckmarkOutline, ColorPaletteOutline, FolderOpenOutline, HardwareChipOutline, LogoGithub, MusicalNotesOutline, OpenOutline, RefreshOutline } from '@vicons/ionicons5'
 import AppBrandMark from '@/components/AppBrandMark.vue'
 import { SYSTEM_LOCALE, setLocale, type LocaleSetting } from '@/i18n'
 import { useSettingsStore } from '@/stores/settings'
 import { useAppStore, type RuntimeBackend } from '@/stores/app'
 import { formatBytes } from '@/utils/format'
+import { isTauriRuntime } from '@/utils/appStore'
 import {
   detectRuntimePlatform,
   preferredInstalledRuntimeBackend,
   recommendedRuntimeBackend,
+  runtimeEnvironmentForBackend,
   runtimeBackendLabel as runtimeBackendName,
   runtimeSizeHint,
 } from '@/utils/runtime'
@@ -31,7 +34,7 @@ const emit = defineEmits<{
   completed: []
 }>()
 
-const { t, locale: currentLocale } = useI18n()
+const { t } = useI18n()
 const message = useMessage()
 const router = useRouter()
 const settings = useSettingsStore()
@@ -47,35 +50,35 @@ const {
 } = storeToRefs(settings)
 
 const step = ref(0)
-const totalSteps = 5
+const projectRepositoryUrl = 'https://github.com/pymss-project/pymss-studio'
 const checkingModelDir = ref(false)
 const overlayRef = ref<HTMLElement | null>(null)
-const completeButtonRef = ref<HTMLElement | null>(null)
-const selectedBackend = ref<RuntimeBackend>('cpu')
-const runtimeMirror = ref('auto')
 const runtimeChecking = ref(false)
+const runtimeActionError = ref('')
+const finishing = ref(false)
 
 const runtimePlatform = computed(() => detectRuntimePlatform(app.runtimeInfo))
+const selectedBackend = ref<RuntimeBackend>(runtimePlatform.value.isMac ? 'mlx' : 'cpu')
+const waveform = [16, 24, 38, 30, 19, 44, 60, 36, 22, 48, 72, 52, 34, 62, 86, 54, 28, 46, 68, 42, 24, 56, 78, 48, 32, 64, 90, 58, 36, 50, 72, 44, 26, 38, 60, 32]
 
 // An environment counts as installed even when it is not the active one, so this reads the
 // installed list rather than app.runtimeReadyForBackend() (which only answers for the active backend).
 function backendInstalled(backend: RuntimeBackend) {
-  return (app.runtimeInfo?.installedEnvironments || []).some((entry) => entry.backend === backend)
+  const entry = runtimeEnvironmentForBackend(app.runtimeInfo, backend)
+  return Boolean(entry && entry.health !== 'broken')
 }
 
 const runtimeBackendChoices = computed(() => {
-  const { isMac, isAppleSilicon } = runtimePlatform.value
+  const { isMac } = runtimePlatform.value
+  const backend: RuntimeBackend = isMac ? 'mlx' : 'cpu'
   const items: Array<{ value: RuntimeBackend; label: string; hint: string }> = [
-    { value: 'cpu', label: runtimeBackendName('cpu'), hint: t('onboarding.runtimeCpu') },
+    { value: backend, label: runtimeBackendName(backend), hint: t(isMac ? 'onboarding.runtimeMlx' : 'onboarding.runtimeCpu') },
   ]
   if (!isMac) {
     items.push(
       { value: 'cuda', label: runtimeBackendName('cuda'), hint: t('onboarding.runtimeCuda') },
-      { value: 'rocm', label: runtimeBackendName('rocm'), hint: t('onboarding.runtimeRocm') },
+      { value: 'rocm', label: runtimeBackendName('rocm'), hint: t(app.runtimeInfo?.platform === 'linux' ? 'onboarding.runtimeRocmLinux' : 'onboarding.runtimeRocm') },
     )
-  }
-  if (isAppleSilicon) {
-    items.push({ value: 'mlx', label: runtimeBackendName('mlx'), hint: t('onboarding.runtimeMlx') })
   }
   return items.map((item) => ({
     ...item,
@@ -85,8 +88,8 @@ const runtimeBackendChoices = computed(() => {
   }))
 })
 
-const runtimeRecommendedBackend = computed(() => recommendedRuntimeBackend(app.runtimeInfo))
-const preferredRuntimeBackend = computed(() => preferredInstalledRuntimeBackend(app.runtimeInfo) || runtimeRecommendedBackend.value)
+const runtimeRecommendedBackend = computed(() => runtimePlatform.value.isMac ? 'mlx' : recommendedRuntimeBackend(app.runtimeInfo))
+const preferredRuntimeBackend = computed(() => runtimePlatform.value.isMac ? 'mlx' : preferredInstalledRuntimeBackend(app.runtimeInfo) || runtimeRecommendedBackend.value)
 
 // runtimeInfo arrives asynchronously, so preselect once it can actually answer — but never
 // override a choice the user has already made.
@@ -99,7 +102,29 @@ watch(preferredRuntimeBackend, (backend) => {
 }, { immediate: true })
 
 const selectedBackendInstalled = computed(() => backendInstalled(selectedBackend.value))
-const selectedBackendSize = computed(() => runtimeSizeHint(selectedBackend.value))
+const selectedBackendReady = computed(() => !(app.runtimeInstallStatus === 'installing' && app.runtimeInstallBackend === selectedBackend.value)
+  && app.runtimeReadyForBackend(selectedBackend.value))
+const selectedRuntime = computed(() => runtimeEnvironmentForBackend(app.runtimeInfo, selectedBackend.value))
+const runtimeBusy = computed(() => runtimeChecking.value)
+const runtimeError = computed(() => runtimeActionError.value || app.runtimeInfoError)
+const runtimeStatusKey = computed(() => runtimeBusy.value ? 'onboarding.runtimeChecking'
+  : selectedBackendReady.value ? 'onboarding.runtimeReady'
+    : selectedBackendInstalled.value ? 'onboarding.runtimeNeedsActivation'
+      : app.runtimeManagementSupported ? 'onboarding.runtimeNeedsInstall' : 'onboarding.runtimeUnavailable')
+const runtimeRecommendationKey = computed(() => {
+  if (runtimePlatform.value.isMac) return 'onboarding.runtimeMacHint'
+  if (selectedBackendReady.value) return 'onboarding.runtimeReadyHint'
+  if (selectedBackendInstalled.value) return 'onboarding.runtimeSwitchHint'
+  if (runtimeRecommendedBackend.value === 'cuda') return 'onboarding.runtimeNvidiaHint'
+  if (runtimeRecommendedBackend.value === 'rocm') return 'onboarding.runtimeAmdHint'
+  return 'onboarding.runtimeChooseHint'
+})
+const primaryActionLabel = computed(() => {
+  if (currentStep.value !== 'runtime') return t(currentStep.value === 'welcome' ? 'onboarding.begin' : 'common.next')
+  if (runtimeBusy.value) return t('onboarding.runtimeChecking')
+  if (selectedBackendReady.value) return t('onboarding.startUsing')
+  return t('onboarding.manageRuntime')
+})
 
 const languageOptions = computed(() => [
   { label: t('settings.languageSystem'), value: SYSTEM_LOCALE },
@@ -123,43 +148,41 @@ const accentOptions = computed(() =>
 
 const stepList = computed(() => [
   {
-    icon: LanguageOutline,
-    title: t('onboarding.languageTitle'),
-    description: t('onboarding.languageDescription'),
+    key: 'welcome',
+    icon: MusicalNotesOutline,
+    title: t('onboarding.welcomeTitle'),
+    description: t('onboarding.welcomeDescription'),
   },
   {
-    icon: MoonOutline,
-    title: t('onboarding.themeTitle'),
-    description: t('onboarding.themeDescription'),
-  },
-  {
+    key: 'appearance',
     icon: ColorPaletteOutline,
-    title: t('onboarding.accentTitle'),
-    description: t('onboarding.accentDescription'),
+    title: t('onboarding.appearanceTitle'),
+    description: t('onboarding.appearanceDescription'),
   },
   {
+    key: 'dataDir',
     icon: FolderOpenOutline,
     title: t('onboarding.dataDirTitle'),
     description: t('onboarding.dataDirDescription'),
   },
   {
+    key: 'runtime',
     icon: HardwareChipOutline,
     title: t('onboarding.runtimeTitle'),
-    description: t('onboarding.runtimeDescription'),
+    description: t(runtimePlatform.value.isMac ? 'onboarding.runtimeMacDescription' : 'onboarding.runtimeDescription'),
   },
 ])
 
+const totalSteps = computed(() => stepList.value.length)
 const stepMeta = computed(() => stepList.value[step.value])
-
-const dataDirStepIndex = 3
-const runtimeStepIndex = 4
+const currentStep = computed(() => stepMeta.value.key)
 
 const canGoNext = computed(() => {
-  if (step.value === dataDirStepIndex) {
+  if (currentStep.value === 'dataDir') {
     return !checkingModelDir.value && !isModelDirMigrating.value && modelDirMigrationState.value.status !== 'confirm'
   }
-  if (step.value === runtimeStepIndex && runtimeChecking.value) return false
-  return true
+  if (currentStep.value === 'runtime' && runtimeBusy.value) return false
+  return !finishing.value
 })
 const modelDirMigrationVisible = computed(() => modelDirMigrationState.value.status !== 'idle' && modelDirMigrationState.value.status !== 'confirm')
 const modelDirMigrationProgress = computed(() => {
@@ -226,6 +249,18 @@ async function changeOutputDir() {
   if (folder) outputDir.value = folder
 }
 
+async function openProjectUrl(url: string) {
+  try {
+    if (isTauriRuntime()) {
+      await open(url)
+    } else {
+      window.open(url, '_blank', 'noopener,noreferrer')
+    }
+  } catch {
+    message.error(t('onboarding.projectLinkFailed'))
+  }
+}
+
 function closeModelDirMigrationDialog() {
   if (modelDirMigrationState.value.status === 'confirm') {
     settings.cancelModelDirChangeConfirmation()
@@ -253,7 +288,7 @@ async function resolveModelDirConflict(action: 'overwrite' | 'skip' | 'abort') {
 }
 
 async function nextStep() {
-  if (step.value < totalSteps - 1) {
+  if (step.value < totalSteps.value - 1) {
     step.value += 1
     return true
   }
@@ -261,246 +296,207 @@ async function nextStep() {
 }
 
 function previousStep() {
-  if (step.value <= 0) return
+  if (step.value <= 0 || runtimeBusy.value || finishing.value) return
   step.value -= 1
 }
 
-function getElementOrigin(element: HTMLElement | null) {
-  if (!element) return null
-  const rect = element.getBoundingClientRect()
-  return {
-    x: rect.left + rect.width / 2,
-    y: rect.top + rect.height / 2,
+async function refreshRuntime() {
+  if (runtimeBusy.value || app.runtimeInstallStatus === 'installing') return
+  runtimeChecking.value = true
+  runtimeActionError.value = ''
+  try {
+    await app.checkRuntimeInfo()
+  } catch (error) {
+    runtimeActionError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    runtimeChecking.value = false
   }
 }
 
-async function finishOnboarding(event?: MouseEvent) {
-  const origin = event
-    ? { x: event.clientX, y: event.clientY }
-    : getElementOrigin(completeButtonRef.value) || {
-        x: window.innerWidth / 2,
-        y: window.innerHeight / 2,
+async function finishOnboarding(event?: MouseEvent, skipRuntime = false, manageRuntime = false) {
+  if (finishing.value || runtimeBusy.value || !canGoNext.value || (!skipRuntime && !selectedBackendReady.value)) return
+  finishing.value = true
+  try {
+    const destination = manageRuntime
+      ? { name: 'settings', query: { section: 'runtime', backend: selectedBackend.value } }
+      : { name: 'separate' }
+    const origin = event ? { x: event.clientX, y: event.clientY } : centerOrigin()
+    await runRippleViewTransition(async () => {
+      await router.push(destination)
+      await settings.markStartupOnboardingCompleted()
+      emit('completed')
+    }, origin)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    finishing.value = false
   }
-  const backend = selectedBackend.value
-  const alreadyReady = app.runtimeReadyForBackend(backend)
-  const alreadyInstalled = backendInstalled(backend)
-  const needsRuntimeSettings = !alreadyReady
-  await runRippleViewTransition(async () => {
-    await settings.markStartupOnboardingCompleted()
-    if (needsRuntimeSettings) {
-      await router.push({ name: 'settings', query: { section: 'runtime' } })
-    }
-    emit('completed')
-  }, origin)
-  // Runtime errors are handled by the store and surfaced in Settings.
-  if (alreadyReady) return
-  if (alreadyInstalled) {
-    // Installed but not active — switching is enough, no need to download it again.
-    const installed = app.runtimeInfo?.installedEnvironments?.find((entry) => entry.backend === backend)
-    app.activateRuntime(backend, { pythonPath: installed?.pythonPath }).catch(() => {})
-  } else {
-    app.installRuntime(backend, runtimeMirror.value, currentLocale.value).catch(() => {})
+}
+
+function primaryAction(event: MouseEvent) {
+  if (!canGoNext.value) return
+  if (currentStep.value !== 'runtime') return nextStep()
+  if (selectedBackendReady.value) return finishOnboarding(event)
+  return finishOnboarding(event, true, true)
+}
+
+function trapFocus(event: KeyboardEvent) {
+  if (event.key !== 'Tab') return
+  const focusable = Array.from(overlayRef.value?.querySelectorAll<HTMLElement>('button:not([disabled]), a[href], input:not([disabled]), [tabindex="0"], summary') || [])
+    .filter(element => element.getClientRects().length > 0 && !element.closest('[inert]'))
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last?.focus()
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first?.focus()
   }
 }
 
 onMounted(() => {
-  runtimeChecking.value = true
-  app.checkRuntimeInfo()
-    .catch(() => {})
-    .finally(() => {
-      runtimeChecking.value = false
-    })
-  void app.loadRuntimeCoreVersions().catch(() => {})
+  void refreshRuntime()
+  void nextTick(() => overlayRef.value?.querySelector<HTMLElement>('[tabindex="0"], button')?.focus())
 })
 </script>
 
 <template>
-  <div ref="overlayRef" class="onboarding-overlay">
+  <div ref="overlayRef" class="onboarding-overlay" role="dialog" aria-modal="true" aria-labelledby="onboarding-title" @keydown="trapFocus">
     <div class="onboarding-card">
       <aside class="onboarding-rail">
         <div class="onboarding-brand">
-          <AppBrandMark :size="46" variant="hero" shadow />
-          <div class="onboarding-brand__text">
-            <strong>{{ t('onboarding.title') }}</strong>
-            <span>{{ t('onboarding.subtitle') }}</span>
-          </div>
+          <AppBrandMark :size="42" variant="hero" shadow />
+          <div><strong>Pymss Studio</strong><span>{{ t('onboarding.title') }}</span></div>
         </div>
-
-        <ol class="onboarding-nav">
-          <li
-            v-for="(meta, index) in stepList"
-            :key="index"
-            class="onboarding-nav__item"
-            :class="{ active: index === step, done: index < step }"
-          >
-            <span class="onboarding-nav__marker">
-              <n-icon :component="index < step ? CheckmarkOutline : meta.icon" size="16" />
-            </span>
-            <span class="onboarding-nav__label">{{ meta.title }}</span>
+        <ol class="onboarding-nav" :aria-label="t('onboarding.title')">
+          <li v-for="(meta, index) in stepList" :key="meta.key" class="onboarding-nav__item" :class="{ active: index === step, done: index < step }" :aria-current="index === step ? 'step' : undefined">
+            <span class="onboarding-nav__marker"><n-icon :component="index < step ? CheckmarkOutline : meta.icon" size="17" /></span>
+            <span>{{ meta.title }}</span>
           </li>
         </ol>
+        <p class="onboarding-rail__hint">{{ t('onboarding.subtitle') }}</p>
       </aside>
 
       <section class="onboarding-content">
         <header class="onboarding-content__head">
-          <span class="onboarding-content__counter">
-            {{ t('onboarding.stepCounter', { current: step + 1, total: totalSteps }) }}
-          </span>
-          <h1>{{ stepMeta.title }}</h1>
+          <div class="onboarding-heading">
+            <span class="onboarding-content__counter">{{ t('onboarding.stepCounter', { current: step + 1, total: totalSteps }) }}</span>
+            <h1 id="onboarding-title">{{ currentStep === 'welcome' ? t('onboarding.welcomeHeadline') : stepMeta.title }}</h1>
+          </div>
+          <n-select class="onboarding-language" :value="locale" :options="languageOptions" :disabled="finishing" :aria-label="t('onboarding.languageTitle')" :to="overlayRef || undefined" @update:value="selectLocaleOption" />
           <p>{{ stepMeta.description }}</p>
         </header>
 
         <div class="onboarding-content__body">
-          <section v-if="step === 0" class="onboarding-section">
-            <n-select :value="locale" :options="languageOptions" size="large" :to="overlayRef || undefined" @update:value="selectLocaleOption" />
-            <p v-if="locale === SYSTEM_LOCALE" class="onboarding-hint">
-              {{ t('settings.languageFollowSystemHint', { locale: currentLocale === 'en' ? t('settings.languageEnglish') : t('settings.languageSimplifiedChinese') }) }}
-            </p>
-          </section>
-
-          <section v-else-if="step === 1" class="onboarding-section onboarding-chip-grid">
-            <button
-              v-for="item in themeModeOptions"
-              :key="item.value"
-              type="button"
-              class="onboarding-chip"
-              :class="{ active: themeMode === item.value }"
-              @click="selectThemeMode(item.value)"
-            >
-              {{ item.label }}
-            </button>
-          </section>
-
-          <section v-else-if="step === 2" class="onboarding-section onboarding-accent-grid">
-            <button
-              v-for="accent in accentOptions"
-              :key="accent.value"
-              type="button"
-              class="onboarding-accent-card"
-              :class="{ active: themeAccent === accent.value }"
-              @click="selectThemeAccent(accent.value)"
-            >
-              <span class="onboarding-accent-card__swatches">
-                <span
-                  v-for="swatch in accent.preview"
-                  :key="swatch"
-                  class="onboarding-accent-card__swatch"
-                  :style="{ background: swatch }"
-                />
-              </span>
-              <span class="onboarding-accent-card__label">{{ accent.label }}</span>
-            </button>
-          </section>
-
-          <section v-else-if="step === dataDirStepIndex" class="onboarding-section">
-            <div class="onboarding-path-card">
-              <span>{{ t('onboarding.currentModelDir') }}</span>
-              <code :title="modelDir">{{ modelDir }}</code>
-            </div>
-            <div class="onboarding-path-card__actions">
-              <n-button secondary :loading="checkingModelDir" :disabled="isModelDirMigrating" @click="changeModelDir">
-                {{ t('onboarding.chooseModelDirectory') }}
-              </n-button>
-            </div>
-
-            <div class="onboarding-path-card">
-              <span>{{ t('onboarding.currentOutputDir') }}</span>
-              <code :title="outputDir">{{ outputDir }}</code>
-            </div>
-            <div class="onboarding-path-card__actions">
-              <n-button secondary @click="changeOutputDir">
-                {{ t('onboarding.chooseOutputDirectory') }}
-              </n-button>
-              <p class="onboarding-hint">{{ t('onboarding.dataDirReady') }}</p>
-            </div>
-          </section>
-
-          <section v-else class="onboarding-section onboarding-runtime-section">
-            <div v-if="runtimeChecking" class="onboarding-runtime-locked">
-              <n-spin size="small" />
-              <div class="onboarding-runtime-locked__copy">
-                <strong>{{ t('settings.checkingEnv') }}</strong>
-                <span>{{ t('onboarding.runtimeDetecting') }}</span>
+          <section v-if="currentStep === 'welcome'" class="onboarding-welcome">
+            <div class="onboarding-audio-flow" aria-hidden="true">
+              <div class="onboarding-audio-flow__input">
+                <n-icon :component="MusicalNotesOutline" size="22" />
+                <span>{{ t('onboarding.audioInput') }}</span>
+                <div class="onboarding-waveform"><i v-for="(height, index) in waveform" :key="index" :style="{ height: height + '%' }" /></div>
+              </div>
+              <n-icon class="onboarding-audio-flow__arrow" :component="ArrowForwardOutline" size="24" />
+              <div class="onboarding-audio-flow__stems">
+                <div><span>{{ t('onboarding.vocals') }}</span><div class="onboarding-waveform"><i v-for="(height, index) in waveform.slice(0, 24)" :key="index" :style="{ height: height * 0.7 + '%' }" /></div></div>
+                <div><span>{{ t('onboarding.instrumental') }}</span><div class="onboarding-waveform"><i v-for="(height, index) in waveform.slice(8, 32)" :key="index" :style="{ height: height + '%' }" /></div></div>
               </div>
             </div>
+            <div class="onboarding-project__notice">
+              <strong>{{ t('onboarding.projectHeadline') }}</strong>
+              <p>{{ t('onboarding.projectNotice') }}</p>
+              <p>{{ t('onboarding.projectDownloadHint') }}</p>
+            </div>
+            <a class="onboarding-project__repository" :href="projectRepositoryUrl" :aria-label="t('onboarding.projectVisitRepository')" target="_blank" rel="noopener noreferrer" @click.prevent="openProjectUrl(projectRepositoryUrl)">
+              <n-icon :component="LogoGithub" size="20" /><span>{{ t('onboarding.projectRepositoryLabel') }}</span><n-icon :component="OpenOutline" size="15" />
+            </a>
+          </section>
 
-            <div class="onboarding-runtime-grid">
-              <button
-                v-for="choice in runtimeBackendChoices"
-                :key="choice.value"
-                type="button"
-                class="onboarding-runtime-card"
-                :class="{ active: selectedBackend === choice.value }"
-                @click="selectedBackend = choice.value; backendTouched = true"
-              >
-                <span class="onboarding-runtime-card__title">
-                  <strong class="onboarding-runtime-card__label">{{ choice.label }}</strong>
-                  <n-tag v-if="choice.installed" :bordered="false" size="small" type="success" round>
-                    {{ t('onboarding.runtimeInstalledTag') }}
-                  </n-tag>
-                  <n-tag v-if="choice.recommended" :bordered="false" size="small" type="warning" round>
-                    {{ t('onboarding.runtimeRecommendedTag') }}
-                  </n-tag>
-                </span>
-                <span class="onboarding-runtime-card__hint">{{ choice.hint }}</span>
-                <span v-if="!choice.installed" class="onboarding-runtime-card__size">
-                  {{ t('onboarding.runtimeSizeHint', { size: choice.size }) }}
-                </span>
+          <section v-else-if="currentStep === 'appearance'" class="onboarding-appearance">
+            <div class="onboarding-appearance__controls">
+              <fieldset class="onboarding-fieldset">
+                <legend>{{ t('onboarding.themeTitle') }}</legend>
+                <div class="onboarding-chip-grid" role="group" :aria-label="t('onboarding.themeTitle')">
+                  <button v-for="item in themeModeOptions" :key="item.value" type="button" class="onboarding-chip" :class="{ active: themeMode === item.value }" :aria-pressed="themeMode === item.value" @click="selectThemeMode(item.value)">{{ item.label }}</button>
+                </div>
+              </fieldset>
+              <fieldset class="onboarding-fieldset">
+                <legend>{{ t('onboarding.accentTitle') }}</legend>
+                <div class="onboarding-accent-grid" role="group" :aria-label="t('onboarding.accentTitle')">
+                  <button v-for="accent in accentOptions" :key="accent.value" type="button" class="onboarding-accent-card" :class="{ active: themeAccent === accent.value }" :aria-pressed="themeAccent === accent.value" @click="selectThemeAccent(accent.value)">
+                    <span class="onboarding-accent-card__swatches"><i v-for="swatch in accent.preview" :key="swatch" :style="{ background: swatch }" /></span><span>{{ accent.label }}</span>
+                  </button>
+                </div>
+              </fieldset>
+            </div>
+            <figure class="onboarding-preview" :aria-label="t('onboarding.appearancePreview')">
+              <div class="onboarding-preview__workspace">
+                <strong>{{ t('onboarding.appearancePreview') }}</strong>
+                <div class="onboarding-preview__selection"><span>{{ t('nav.separate') }}</span><n-icon :component="CheckmarkOutline" size="17" /></div>
+                <div class="onboarding-preview__field"><span>{{ t('tools.outputFormat') }}</span><strong>{{ settings.defaultFormat.toUpperCase() }}</strong></div>
+                <div class="onboarding-preview__statuses"><span>{{ t('tasks.statusQueued') }}</span><span>{{ t('tasks.statusDone') }}</span></div>
+                <div class="onboarding-preview__actions"><span>{{ t('common.cancel') }}</span><span class="onboarding-preview__action">{{ t('common.confirm') }}</span></div>
+              </div>
+              <figcaption>{{ t('onboarding.appearancePreviewHint') }}</figcaption>
+            </figure>
+          </section>
+
+          <section v-else-if="currentStep === 'dataDir'" class="onboarding-directories">
+            <div class="onboarding-directory">
+              <n-icon :component="FolderOpenOutline" size="22" />
+              <div><strong>{{ t('onboarding.currentModelDir') }}</strong><p>{{ t('onboarding.modelDirHint') }}</p></div>
+              <n-button secondary :loading="checkingModelDir" :disabled="isModelDirMigrating" @click="changeModelDir">{{ t('onboarding.changeDirectory') }}</n-button>
+              <code :title="modelDir">{{ modelDir || t('onboarding.defaultDirectory') }}</code>
+            </div>
+            <div class="onboarding-directory">
+              <n-icon :component="FolderOpenOutline" size="22" />
+              <div><strong>{{ t('onboarding.currentOutputDir') }}</strong><p>{{ t('onboarding.outputDirHint') }}</p></div>
+              <n-button secondary @click="changeOutputDir">{{ t('onboarding.changeDirectory') }}</n-button>
+              <code :title="outputDir">{{ outputDir || t('onboarding.defaultDirectory') }}</code>
+            </div>
+            <p class="onboarding-hint">{{ t('onboarding.dataDirReady') }}</p>
+          </section>
+
+          <section v-else-if="currentStep === 'runtime'" class="onboarding-runtime-section" :aria-busy="runtimeBusy">
+            <div class="onboarding-runtime-status" :class="{ 'is-ready': selectedBackendReady && !runtimeBusy }" role="status" aria-live="polite">
+              <n-spin v-if="runtimeBusy" size="small" />
+              <n-icon v-else :component="selectedBackendReady ? CheckmarkOutline : HardwareChipOutline" size="24" />
+              <div><strong>{{ t(runtimeStatusKey) }}</strong><p>{{ t(runtimeRecommendationKey) }}</p></div>
+              <n-button v-if="!runtimeBusy" quaternary circle :aria-label="t('onboarding.checkAgain')" @click="refreshRuntime"><template #icon><n-icon :component="RefreshOutline" /></template></n-button>
+            </div>
+
+            <div v-if="app.runtimeManagementSupported" class="onboarding-runtime-grid" role="group" :aria-label="t('onboarding.runtimeTitle')">
+              <button v-for="choice in runtimeBackendChoices" :key="choice.value" type="button" class="onboarding-runtime-card" :class="{ active: selectedBackend === choice.value }" :aria-pressed="selectedBackend === choice.value" :disabled="runtimeBusy || finishing" @click="selectedBackend = choice.value; backendTouched = true; runtimeActionError = ''">
+                <strong>{{ choice.label }}</strong>
+                <span class="onboarding-runtime-card__tags"><n-tag v-if="choice.installed" :bordered="false" size="small" type="success">{{ t('onboarding.runtimeInstalledTag') }}</n-tag><n-tag v-if="choice.recommended" :bordered="false" size="small">{{ t('onboarding.runtimeRecommendedTag') }}</n-tag></span>
+                <span>{{ choice.hint }}</span><small v-if="!choice.installed">{{ t('onboarding.runtimeSizeHint', { size: choice.size }) }}</small>
               </button>
             </div>
-
-            <div class="onboarding-runtime-mirror">
-              <n-select
-                v-model:value="runtimeMirror"
-                size="small"
-                :to="overlayRef || undefined"
-                :options="[
-                  { label: t('onboarding.runtimeMirrorAuto'), value: 'auto' },
-                  { label: t('onboarding.runtimeMirrorUstc'), value: 'ustc' },
-                  { label: t('onboarding.runtimeMirrorTsinghua'), value: 'tsinghua' },
-                  { label: t('onboarding.runtimeMirrorAliyun'), value: 'aliyun' },
-                  { label: t('onboarding.runtimeMirrorTencent'), value: 'tencent' },
-                  { label: t('onboarding.runtimeMirrorPypi'), value: 'pypi' },
-                ]"
-              />
-              <span class="onboarding-runtime-mirror__hint">{{ t('onboarding.runtimeMirrorHint') }}</span>
+            <div v-else class="onboarding-runtime-single">
+              <n-icon :component="HardwareChipOutline" size="26" />
+              <div><strong>{{ runtimePlatform.isMac ? 'Apple MLX' : runtimeBackendName(selectedBackend) }}</strong><p>{{ t(runtimePlatform.isMac ? 'onboarding.runtimeMlx' : 'onboarding.runtimeReadOnlyHint') }}</p></div>
+              <n-tag :bordered="false" :type="selectedBackendReady ? 'success' : 'warning'">{{ t(selectedBackendReady ? 'onboarding.runtimeReady' : 'onboarding.runtimeUnavailable') }}</n-tag>
             </div>
 
-            <p class="onboarding-hint">
-              {{ t('onboarding.runtimeDriverHint') }}
-              <template v-if="selectedBackendInstalled">
-                <br />
-                <span>{{ t('onboarding.runtimeAlreadyReady') }}</span>
-              </template>
-              <template v-else>
-                <br />
-                <span>{{ t('onboarding.runtimeSizeHint', { size: selectedBackendSize }) }}</span>
-              </template>
-            </p>
+            <div v-if="selectedBackendReady && !runtimeBusy" class="onboarding-readiness">
+              <div><span>{{ t('onboarding.runtimeVersion') }}</span><strong>{{ selectedRuntime?.pymssVersion || app.runtimeInfo?.pymssVersion || '—' }}</strong></div>
+              <p>{{ t('onboarding.readyToUse') }}</p>
+            </div>
+
+            <p v-if="!selectedBackendReady && !runtimeBusy" class="onboarding-hint">{{ t(app.runtimeManagementSupported ? 'onboarding.runtimeManageHint' : 'onboarding.runtimeReadOnlyHint') }}</p>
+            <n-alert v-if="runtimeError" type="error" :show-icon="true"><template #header>{{ t('onboarding.runtimeFailed') }}</template><p class="onboarding-runtime-error">{{ runtimeError }}</p></n-alert>
           </section>
         </div>
 
         <footer class="onboarding-content__foot">
-          <n-button v-if="step > 0" quaternary size="large" @click="previousStep">
-            {{ t('common.back') }}
-          </n-button>
+          <n-button v-if="step > 0" quaternary :disabled="runtimeBusy || finishing" @click="previousStep">{{ t('common.back') }}</n-button>
           <span class="onboarding-content__spacer" />
-          <n-button
-            v-if="step === totalSteps - 1"
-            ref="completeButtonRef"
-            type="primary"
-            size="large"
-            :disabled="!canGoNext"
-            @click="finishOnboarding"
-          >
-            {{ t('onboarding.complete') }}
-          </n-button>
-          <n-button v-else type="primary" size="large" :disabled="!canGoNext" @click="nextStep">
-            {{ step === totalSteps - 1 ? t('onboarding.complete') : t('common.next') }}
-          </n-button>
+          <n-button v-if="currentStep === 'runtime' && !selectedBackendReady" quaternary :disabled="runtimeBusy || finishing" @click="finishOnboarding($event, true)">{{ t('onboarding.setUpLater') }}</n-button>
+          <n-button type="primary" :disabled="!canGoNext" :loading="finishing || (currentStep === 'runtime' && runtimeBusy)" @click="primaryAction">{{ primaryActionLabel }}<template v-if="!runtimeBusy && !finishing" #icon><n-icon :component="ArrowForwardOutline" /></template></n-button>
         </footer>
       </section>
     </div>
+
 
     <n-modal
       :show="checkingModelDir"
@@ -664,285 +660,155 @@ onMounted(() => {
   display: grid;
   place-items: center;
   padding: 32px;
-  background:
-    radial-gradient(circle at 12% 8%, color-mix(in srgb, var(--primary-glow) 30%, transparent), transparent 32%),
-    radial-gradient(circle at 88% 92%, color-mix(in srgb, var(--primary-soft) 22%, transparent), transparent 30%),
-    color-mix(in srgb, var(--surface) 90%, rgba(0, 0, 0, 0.7));
+  background: color-mix(in srgb, var(--surface) 94%, transparent);
   backdrop-filter: blur(18px);
 }
-
 .onboarding-card {
-  width: min(816px, 100%);
   display: grid;
-  grid-template-columns: 272px 1fr;
-  border-radius: 24px;
-  border: 1px solid color-mix(in srgb, var(--primary-border) 24%, var(--outline));
-  background: var(--surface-1);
-  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.26);
+  grid-template-columns: 218px minmax(0, 1fr);
+  width: min(1040px, 100%);
+  height: min(640px, 100%);
+  min-height: 0;
   overflow: hidden;
+  border: 1px solid var(--outline);
+  border-radius: 22px;
+  background: var(--surface-1);
+  box-shadow: var(--shadow-panel);
 }
-
-/* Left rail */
 .onboarding-rail {
   display: flex;
   flex-direction: column;
-  gap: 28px;
-  padding: 28px 22px;
-  border-right: 1px solid color-mix(in srgb, var(--outline) 80%, transparent);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--primary-softer) 70%, transparent), transparent 46%),
-    color-mix(in srgb, var(--surface-2) 50%, var(--surface-1));
-}
-
-.onboarding-brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+  gap: 42px;
   min-width: 0;
+  padding: 28px 18px 24px;
+  border-right: 1px solid var(--outline);
+  background: color-mix(in srgb, var(--surface-2) 52%, var(--surface-1));
 }
-
-.onboarding-brand__text {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
+.onboarding-brand { display: flex; align-items: center; gap: 10px; padding: 0 2px; }
+.onboarding-brand > div { display: grid; gap: 4px; }
+.onboarding-brand strong { font-size: 15px; color: var(--on-surface-heading); }
+.onboarding-brand span { font-size: 11px; color: var(--on-surface-muted); }
+.onboarding-nav { display: grid; gap: 8px; list-style: none; margin: 0; padding: 0; }
+.onboarding-nav__item { display: flex; align-items: center; gap: 12px; padding: 12px 10px; color: var(--on-surface-muted); font-size: 13px; border-radius: 10px; }
+.onboarding-nav__marker { display: grid; place-items: center; width: 28px; height: 28px; flex: none; border: 1px solid var(--outline); border-radius: 8px; }
+.onboarding-nav__item.active { background: var(--primary-softer); color: var(--on-surface-heading); }
+.onboarding-nav__item.active .onboarding-nav__marker { border-color: var(--primary-border); color: var(--primary-strong); background: var(--primary-soft); }
+.onboarding-nav__item.done .onboarding-nav__marker { color: var(--success); border-color: transparent; }
+.onboarding-rail__hint { margin: auto 8px 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.8; }
+.onboarding-content { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; padding: 30px 34px 22px; }
+.onboarding-content__head { display: grid; grid-template-columns: minmax(0, 1fr) 156px; align-items: start; gap: 14px 16px; padding-bottom: 22px; }
+.onboarding-heading { display: grid; gap: 8px; }
+.onboarding-content__counter { color: var(--on-surface-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.onboarding-content__head h1 { margin: 0; color: var(--on-surface-heading); font-size: 27px; line-height: 1.35; letter-spacing: -0.025em; text-wrap: balance; }
+.onboarding-content__head p { grid-column: 1 / -1; margin: 0; max-width: 60ch; font-size: 13px; line-height: 1.75; color: var(--on-surface-muted); }
+.onboarding-language { margin-top: 10px; }
+.onboarding-content__body { min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--outline-strong) transparent; padding: 2px 2px 16px; }
+.onboarding-content__foot { display: flex; align-items: center; gap: 10px; padding-top: 16px; border-top: 1px solid var(--outline); }
+.onboarding-content__spacer { flex: 1; }
+.onboarding-hint { margin: 0; font-size: 12px; line-height: 1.75; color: var(--on-surface-muted); }
+.onboarding-welcome { display: grid; gap: 28px; }
+.onboarding-audio-flow { display: grid; grid-template-columns: minmax(0, 1fr) 24px minmax(0, 1fr); align-items: center; gap: 18px; padding: 26px 22px; border-radius: 14px; background: var(--surface-2); }
+.onboarding-audio-flow__input { display: grid; grid-template-columns: 24px 1fr; align-items: center; gap: 10px; font-size: 13px; }
+.onboarding-audio-flow__input > .n-icon { color: var(--primary-strong); }
+.onboarding-audio-flow__input > .onboarding-waveform { grid-column: 1 / -1; height: 70px; margin-top: 8px; }
+.onboarding-waveform { display: flex; align-items: center; justify-content: space-between; gap: 3px; height: 50px; overflow: hidden; }
+.onboarding-waveform i { flex: 1; min-width: 2px; max-width: 5px; border-radius: 3px; background: var(--primary); opacity: 0.8; }
+.onboarding-audio-flow__arrow { color: var(--on-surface-muted); }
+.onboarding-audio-flow__stems { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 14px; align-items: center; font-size: 12px; }
+.onboarding-audio-flow__stems > div { display: contents; }
+.onboarding-audio-flow__stems .onboarding-waveform { height: 44px; }
+.onboarding-audio-flow__stems > div:last-child i { opacity: 0.4; }
+.onboarding-project__notice strong { display: block; margin-bottom: 10px; color: var(--on-surface-heading); font-size: 15px; }
+.onboarding-project__notice p { margin: 6px 0 0; color: var(--on-surface-muted); font-size: 13px; line-height: 1.85; }
+.onboarding-project__repository { display: inline-flex; align-items: center; justify-self: start; gap: 10px; color: var(--primary-strong); font-size: 12px; padding: 6px 0; }
+.onboarding-appearance { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.95fr); align-items: start; gap: 26px; }
+.onboarding-appearance__controls { display: grid; gap: 28px; }
+.onboarding-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.onboarding-fieldset legend { margin-bottom: 12px; color: var(--on-surface); font-size: 12px; }
+.onboarding-chip-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.onboarding-chip, .onboarding-accent-card { border: 1px solid var(--outline); background: var(--surface-2); color: var(--on-surface-muted); border-radius: 8px; cursor: pointer; transition: border-color 160ms, background 160ms; }
+.onboarding-chip { padding: 11px 4px; min-width: 0; font-size: 12px; }
+.onboarding-chip.active, .onboarding-accent-card.active, .onboarding-runtime-card.active { border-color: var(--primary-border); background: var(--primary-softer); color: var(--on-surface); }
+.onboarding-chip:hover, .onboarding-accent-card:hover, .onboarding-runtime-card:hover:not(:disabled) { border-color: var(--primary); }
+.onboarding-accent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.onboarding-accent-card { display: flex; align-items: center; gap: 8px; padding: 11px 10px; font-size: 12px; text-align: left; }
+.onboarding-accent-card__swatches { display: flex; gap: 3px; }
+.onboarding-accent-card__swatches i { width: 10px; height: 18px; border-radius: 3px; border: 1px solid var(--outline); }
+.onboarding-preview { margin: 0; overflow: hidden; border: 1px solid var(--outline); border-radius: 12px; background: var(--surface); }
+.onboarding-preview__workspace { display: grid; gap: 20px; padding: 22px 20px; }
+.onboarding-preview__workspace > strong { font-size: 13px; color: var(--on-surface-heading); }
+.onboarding-preview__selection { display: flex; justify-content: space-between; align-items: center; padding: 12px; border: 1px solid var(--primary-border); border-radius: 8px; background: var(--primary-softer); color: var(--primary-strong); font-size: 12px; }
+.onboarding-preview__field { display: flex; justify-content: space-between; align-items: center; font-size: 12px; }
+.onboarding-preview__field > span { color: var(--on-surface-muted); }
+.onboarding-preview__field > strong { padding: 7px 10px; border: 1px solid var(--outline); border-radius: 6px; font-size: 11px; }
+.onboarding-preview__statuses { display: flex; gap: 8px; font-size: 11px; }
+.onboarding-preview__statuses > span { padding: 4px 8px; border-radius: 4px; background: var(--surface-2); color: var(--on-surface-muted); }
+.onboarding-preview__statuses > span:last-child { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
+.onboarding-preview__actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 2px; text-align: center; font-size: 12px; }
+.onboarding-preview__actions > span { padding: 9px 12px; border: 1px solid var(--outline); border-radius: 6px; }
+.onboarding-preview__actions > .onboarding-preview__action { border-color: transparent; background: var(--primary); color: var(--surface); }
+.onboarding-preview figcaption { padding: 0 20px 18px; color: var(--on-surface-muted); font-size: 11px; line-height: 1.6; }
+.onboarding-directories { display: grid; gap: 20px; }
+.onboarding-directory { display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; gap: 12px 14px; align-items: center; padding: 20px; border: 1px solid var(--outline); border-radius: 12px; }
+.onboarding-directory > .n-icon { color: var(--primary-strong); }
+.onboarding-directory strong { font-size: 14px; color: var(--on-surface-heading); }
+.onboarding-directory p { margin: 5px 0 0; font-size: 12px; line-height: 1.6; color: var(--on-surface-muted); }
+.onboarding-directory code { grid-column: 2 / -1; min-width: 0; padding: 10px 12px; background: var(--surface-2); border-radius: 6px; font-size: 12px; overflow-wrap: anywhere; }
+.onboarding-runtime-section { display: grid; gap: 18px; }
+.onboarding-runtime-status { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 16px 18px; border: 1px solid var(--outline); border-radius: 12px; background: var(--surface-2); }
+.onboarding-runtime-status.is-ready { border-color: color-mix(in srgb, var(--success) 30%, var(--outline)); }
+.onboarding-runtime-status.is-ready > .n-icon { color: var(--success); }
+.onboarding-runtime-status strong { color: var(--on-surface-heading); font-size: 14px; }
+.onboarding-runtime-status p { margin: 5px 0 0; color: var(--on-surface-muted); line-height: 1.65; font-size: 12px; }
+.onboarding-runtime-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.onboarding-runtime-card { display: flex; flex-direction: column; align-items: start; gap: 10px; min-width: 0; padding: 16px 14px; border: 1px solid var(--outline); border-radius: 10px; background: transparent; color: var(--on-surface); text-align: left; cursor: pointer; transition: border-color 160ms, background 160ms; }
+.onboarding-runtime-card:disabled { opacity: 0.6; cursor: default; }
+.onboarding-runtime-card strong { font-size: 13px; }
+.onboarding-runtime-card > span:not(.onboarding-runtime-card__tags), .onboarding-runtime-card small { color: var(--on-surface-muted); font-size: 11px; line-height: 1.6; }
+.onboarding-runtime-card small { margin-top: auto; }
+.onboarding-runtime-card__tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.onboarding-runtime-card__tags:empty { display: none; }
+.onboarding-runtime-single { display: flex; align-items: center; gap: 14px; padding: 20px 4px; }
+.onboarding-runtime-single > .n-icon { color: var(--primary-strong); }
+.onboarding-runtime-single > div:not(.n-tag) { flex: 1; }
+.onboarding-runtime-single strong { color: var(--on-surface-heading); font-size: 17px; }
+.onboarding-runtime-single p { margin: 6px 0 0; color: var(--on-surface-muted); font-size: 12px; }
+.onboarding-readiness { display: grid; gap: 12px; padding: 0 4px; }
+.onboarding-readiness > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.onboarding-readiness > div > span { color: var(--on-surface-muted); }
+.onboarding-readiness strong { font-size: 12px; }
+.onboarding-readiness > p { margin: 3px 0 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.75; }
+.onboarding-runtime-error { margin: 0 0 8px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.onboarding-overlay :is(button, a, summary):focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+@media (max-width: 1000px) {
+  .onboarding-overlay { padding: 20px; }
+  .onboarding-card { grid-template-columns: 190px minmax(0, 1fr); }
+  .onboarding-content { padding: 24px 26px 20px; }
+  .onboarding-appearance { gap: 18px; }
+  .onboarding-accent-card { flex-wrap: wrap; }
 }
-
-.onboarding-brand__text strong {
-  font-size: 15px;
-  letter-spacing: 0.01em;
+@media (max-width: 760px) {
+  .onboarding-overlay { padding: 12px; }
+  .onboarding-card { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: 100%; }
+  .onboarding-rail { padding: 12px; border-right: 0; border-bottom: 1px solid var(--outline); }
+  .onboarding-brand, .onboarding-rail__hint { display: none; }
+  .onboarding-nav { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+  .onboarding-nav__item { flex-direction: column; gap: 6px; padding: 8px 2px; font-size: 11px; text-align: center; }
+  .onboarding-content { padding: 20px 18px 16px; }
+  .onboarding-content__head { grid-template-columns: minmax(0, 1fr) 140px; }
+  .onboarding-content__head h1 { font-size: 23px; }
+  .onboarding-appearance { grid-template-columns: minmax(0, 1fr); }
+  .onboarding-preview { max-width: 360px; width: 100%; justify-self: center; }
+  .onboarding-runtime-grid { grid-template-columns: minmax(0, 1fr); }
+  .onboarding-runtime-card { display: grid; grid-template-columns: 1fr auto; }
+  .onboarding-runtime-card > span:not(.onboarding-runtime-card__tags) { grid-column: 1 / -1; }
+  .onboarding-content__foot { gap: 5px; flex-wrap: wrap; }
+  .onboarding-directory { padding: 14px; gap: 10px; }
+  .onboarding-directory code { grid-column: 1 / -1; }
+  .onboarding-audio-flow { padding: 18px 12px; gap: 10px; }
 }
-
-.onboarding-brand__text span {
-  color: var(--on-surface-muted);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.onboarding-nav {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 4px;
-  position: relative;
-}
-
-.onboarding-nav__item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  color: var(--on-surface-muted);
-  transition: color 180ms ease, background 180ms ease;
-  min-width: 0;
-}
-
-.onboarding-nav__item.active {
-  color: var(--on-surface);
-  background: color-mix(in srgb, var(--primary-soft) 32%, transparent);
-}
-
-.onboarding-nav__item.done {
-  color: var(--on-surface);
-}
-
-.onboarding-nav__marker {
-  flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
-  display: grid;
-  place-items: center;
-  border-radius: 9px;
-  border: 1px solid color-mix(in srgb, var(--outline) 80%, transparent);
-  background: color-mix(in srgb, var(--surface-1) 90%, transparent);
-  color: var(--on-surface-muted);
-  transition: 180ms ease;
-}
-
-.onboarding-nav__item.active .onboarding-nav__marker {
-  color: var(--primary-strong);
-  border-color: color-mix(in srgb, var(--primary-border) 80%, transparent);
-  background: color-mix(in srgb, var(--primary-soft) 60%, var(--surface-2));
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary-glow) 18%, transparent);
-}
-
-.onboarding-nav__item.done .onboarding-nav__marker {
-  color: var(--primary);
-  border-color: color-mix(in srgb, var(--primary-border) 70%, transparent);
-  background: color-mix(in srgb, var(--primary-softer) 80%, var(--surface-2));
-}
-
-.onboarding-nav__label {
-  flex: 1 1 auto;
-  font-size: 13px;
-  font-weight: 600;
-  min-width: 0;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-height: 1.35;
-  white-space: normal;
-}
-
-/* Right content */
-.onboarding-content {
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  gap: 20px;
-  padding: 32px 32px 24px;
-  min-width: 0;
-}
-
-.onboarding-content__head {
-  display: grid;
-  gap: 6px;
-}
-
-.onboarding-content__counter {
-  color: var(--primary-strong);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-.onboarding-content__head h1 {
-  margin: 0;
-  font-size: 24px;
-  letter-spacing: 0.01em;
-}
-
-.onboarding-content__head p {
-  margin: 0;
-  color: var(--on-surface-muted);
-  line-height: 1.6;
-  font-size: 13px;
-}
-
-.onboarding-content__body {
-  align-self: start;
-}
-
-.onboarding-content__foot {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.onboarding-content__spacer {
-  flex: 1 1 auto;
-}
-
-.onboarding-section {
-  display: grid;
-  gap: 14px;
-}
-
-.onboarding-chip-grid {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.onboarding-chip {
-  min-width: 0;
-  border: 1px solid color-mix(in srgb, var(--outline) 76%, transparent);
-  border-radius: 14px;
-  padding: 14px 16px;
-  color: var(--on-surface-muted);
-  background: color-mix(in srgb, var(--surface-2) 74%, transparent);
-  cursor: pointer;
-  transition: 180ms ease;
-}
-
-.onboarding-chip:hover,
-.onboarding-chip.active {
-  color: var(--on-surface);
-  border-color: color-mix(in srgb, var(--primary-border) 84%, transparent);
-  background: color-mix(in srgb, var(--primary-soft) 34%, var(--surface-2));
-}
-
-.onboarding-accent-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  display: grid;
-  gap: 10px;
-}
-
-.onboarding-accent-card {
-  display: grid;
-  gap: 8px;
-  justify-items: flex-start;
-  padding: 14px 16px;
-  border-radius: 16px;
-  border: 1px solid color-mix(in srgb, var(--outline) 76%, transparent);
-  background: color-mix(in srgb, var(--surface-2) 68%, transparent);
-  color: var(--on-surface);
-  cursor: pointer;
-  transition: 180ms ease;
-}
-
-.onboarding-accent-card.active,
-.onboarding-accent-card:hover {
-  border-color: color-mix(in srgb, var(--primary-border) 88%, transparent);
-  background: color-mix(in srgb, var(--primary-soft) 22%, var(--surface-2));
-  box-shadow: 0 10px 24px color-mix(in srgb, var(--primary-glow) 12%, transparent);
-}
-
-.onboarding-accent-card__swatches {
-  display: inline-flex;
-  gap: 8px;
-}
-
-.onboarding-accent-card__swatch {
-  width: 24px;
-  height: 24px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--outline) 70%, transparent);
-}
-
-.onboarding-accent-card__label {
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.onboarding-path-card {
-  display: grid;
-  gap: 8px;
-  padding: 16px;
-  border-radius: 16px;
-  border: 1px solid color-mix(in srgb, var(--outline) 72%, transparent);
-  background: color-mix(in srgb, var(--surface-2) 56%, transparent);
-}
-
-.onboarding-path-card span,
-.onboarding-hint {
-  color: var(--on-surface-muted);
-  font-size: 13px;
-  line-height: 1.6;
-}
-
-.onboarding-path-card code {
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid color-mix(in srgb, var(--outline) 72%, transparent);
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
-  color: var(--on-surface);
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, "MiSans", "PingFang SC", "Microsoft YaHei", ui-monospace, monospace;
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.onboarding-path-card__actions {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-wrap: wrap;
-}
-
-.onboarding-path-card__actions .onboarding-hint {
-  margin: 0;
+@media (prefers-reduced-motion: reduce) {
+  .onboarding-overlay *, .onboarding-overlay *::before, .onboarding-overlay *::after { transition: none !important; }
 }
 
 .checking-dialog {
@@ -1068,141 +934,4 @@ onMounted(() => {
   color: var(--on-surface-muted);
 }
 
-.onboarding-content__body :deep(.n-base-selection) {
-  border-radius: 12px;
-}
-
-@media (max-width: 720px) {
-  .onboarding-overlay {
-    padding: 16px;
-  }
-
-  .onboarding-card {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .onboarding-rail {
-    border-right: none;
-    border-bottom: 1px solid color-mix(in srgb, var(--outline) 80%, transparent);
-    padding: 20px;
-    gap: 18px;
-  }
-
-  .onboarding-nav {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .onboarding-content {
-    padding: 24px 20px 20px;
-  }
-
-  .onboarding-chip-grid,
-  .onboarding-accent-grid,
-  .onboarding-runtime-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .migration-summary-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .migration-dialog__status,
-  .migration-progress-meta {
-    flex-direction: column;
-  }
-}
-
-.onboarding-runtime-section {
-  gap: 14px;
-}
-
-.onboarding-runtime-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.onboarding-runtime-card {
-  display: grid;
-  gap: 6px;
-  padding: 16px;
-  border-radius: 16px;
-  border: 1px solid color-mix(in srgb, var(--outline) 76%, transparent);
-  background: color-mix(in srgb, var(--surface-2) 68%, transparent);
-  color: var(--on-surface);
-  cursor: pointer;
-  text-align: left;
-  transition: 180ms ease;
-}
-
-.onboarding-runtime-card.active,
-.onboarding-runtime-card:hover {
-  border-color: color-mix(in srgb, var(--primary-border) 88%, transparent);
-  background: color-mix(in srgb, var(--primary-soft) 22%, var(--surface-2));
-  box-shadow: 0 8px 20px color-mix(in srgb, var(--primary-glow) 10%, transparent);
-}
-
-.onboarding-runtime-card__title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.onboarding-runtime-card__label {
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-}
-
-.onboarding-runtime-card__size {
-  color: var(--on-surface-muted);
-  font-size: 11px;
-  opacity: 0.8;
-}
-
-.onboarding-runtime-card__hint {
-  color: var(--on-surface-muted);
-  font-size: 12px;
-  line-height: 1.55;
-}
-
-.onboarding-runtime-mirror {
-  max-width: 260px;
-  display: grid;
-  gap: 6px;
-}
-
-.onboarding-runtime-mirror__hint {
-  color: var(--on-surface-muted);
-  font-size: 11px;
-  line-height: 1.45;
-}
-
-.onboarding-runtime-locked {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 18px;
-  border-radius: 16px;
-  border: 1px solid color-mix(in srgb, var(--outline) 76%, transparent);
-  background: color-mix(in srgb, var(--surface-2) 68%, transparent);
-  color: var(--on-surface-muted);
-}
-
-.onboarding-runtime-locked__copy {
-  display: grid;
-  gap: 4px;
-}
-
-.onboarding-runtime-locked__copy strong {
-  color: var(--on-surface);
-  font-size: 14px;
-  font-weight: 700;
-}
-
-.onboarding-runtime-locked__copy span {
-  font-size: 12px;
-  line-height: 1.55;
-}
 </style>

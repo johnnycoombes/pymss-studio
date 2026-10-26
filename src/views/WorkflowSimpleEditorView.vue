@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { useMessage } from 'naive-ui'
@@ -34,6 +36,8 @@ import {
 } from '@/utils/simpleWorkflowEditor'
 import { isSimpleWorkflowDefinition } from '@/workflows/formats'
 import { WorkflowEditorInUseError } from '@/utils/workflowEditorState'
+
+const studioLog = createLogger('ui.views.WorkflowSimpleEditorView')
 
 const route = useRoute()
 const router = useRouter()
@@ -424,7 +428,7 @@ onMounted(async () => {
   // delaying the editor window.
   if (!model.modelsLoaded) {
     void model.loadModels().catch((error) => {
-      console.warn('Failed to refresh models for simple workflow editor', error)
+      studioLog.warn('Failed to refresh models for simple workflow editor', error)
     })
   }
   const id = String(route.query.workflowId || '').trim()

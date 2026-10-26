@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from worker_protocol import emit
-from .common import SUPPORTED_AUDIO_SUFFIXES, _available_path, _require_directory, _run_ffmpeg, _subprocess_detail
+from .common import AudioToolError, SUPPORTED_AUDIO_SUFFIXES, _available_path, _render_output, _require_directory, _run_ffmpeg, _subprocess_detail
 
 
 def _audio_files_in_folder(folder: Path) -> list[Path]:
@@ -15,7 +15,7 @@ def _audio_files_in_folder(folder: Path) -> list[Path]:
         (
             path.resolve()
             for path in folder.iterdir()
-            if path.is_file() and path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES
+            if path.is_file() and not path.name.startswith('.pymss-') and path.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES
         ),
         key=lambda path: path.name.casefold(),
     )
@@ -88,7 +88,12 @@ def _ffmpeg_concat_path(path: Path) -> str:
 
 def _merge_audio(payload: dict[str, Any]) -> dict[str, Any]:
     input_dir = _require_directory(payload.get("inputDir"), "Input directory")
-    output_dir = _require_directory(payload.get("outputDir"), "Output directory", create=True)
+    output_value = str(payload.get("outputDir") or '').strip()
+    output_candidate = Path(output_value).expanduser()
+    if output_value and (output_candidate.resolve() == input_dir
+                         or (output_candidate.exists() and output_candidate.samefile(input_dir))):
+        raise AudioToolError('MERGE_SAME_DIRECTORY', 'Input and output directories must be different')
+    output_dir = _require_directory(output_value, "Output directory", create=True)
     sort_by = str(payload.get("sortBy") or "name").strip().lower()
     sort_direction = str(payload.get("sortDirection") or "asc").strip().lower()
     regex_pattern = str(payload.get("regexPattern") or "")
@@ -139,10 +144,10 @@ def _merge_audio(payload: dict[str, Any]) -> dict[str, Any]:
             "current": output_path.name,
         })
         try:
-            _run_ffmpeg([
+            output_path = _render_output(output_path, lambda temporary: _run_ffmpeg([
                 "-f", "concat", "-safe", "0", "-i", str(concat_file),
-                "-c:a", "copy", "-y", str(output_path),
-            ])
+                "-c:a", "copy", "-y", str(temporary),
+            ]))
             emit("audio_tool_progress", {
                 "operation": "merge",
                 "phase": "merging",

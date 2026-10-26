@@ -58,7 +58,7 @@ jobs:
           PYMSS_BUILD_VARIANT: windows-x64-cuda
           PYMSS_BUILD_UPDATE_SUPPORTED: 'true'
           PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
-        run: pnpm tauri build --no-bundle
+        run: pnpm plugins:build --no-bundle
 
       - name: Prepare Windows bundled tools
         shell: pwsh
@@ -111,6 +111,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
           ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           @"
           Pymss Studio $version Windows x64 CUDA
@@ -143,7 +144,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Staged CUDA pymss.graph import failed" }
           & "$stage\python-runtime\runtime-envs\cuda\Scripts\python.exe" "$stage\python\worker.py" list_models --payload "{}"
           if ($LASTEXITCODE -ne 0) { throw "Staged CUDA list_models failed with exit code $LASTEXITCODE" }
-          & "$stage\python-runtime\runtime-envs\cuda\Scripts\python.exe" "$stage\python\runtime_audio_probe.py"
+          & "$stage\python-runtime\runtime-envs\cuda\Scripts\python.exe" "$stage\python\runtime_audio_probe.py" --check-core
           if ($LASTEXITCODE -ne 0) { throw "Staged CUDA audio decoding failed with exit code $LASTEXITCODE" }
           ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -TemplateRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           $workspacePattern = [regex]::Escape((Resolve-Path ".").Path)
@@ -152,6 +153,11 @@ jobs:
             Select-String -Pattern $workspacePattern -List
           if ($leakedConfig) { throw "CI workspace path leaked into staged CUDA runtime env config" }
 
+      - name: Verify staged native plugin helper
+        shell: pwsh
+        run: |
+          python scripts/verify-native-plugins.py "release/${{ steps.meta.outputs.stage_name }}/Pymss Studio.exe" --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "Staged native plugin helper verification failed" }
       - name: Upload CUDA stage artifact
         uses: actions/upload-artifact@v4
         with:
@@ -255,7 +261,7 @@ jobs:
           PYMSS_BUILD_VARIANT: windows-x64-cpu
           PYMSS_BUILD_UPDATE_SUPPORTED: 'true'
           PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
-        run: pnpm tauri build --no-bundle
+        run: pnpm plugins:build --no-bundle
 
       - name: Prepare Windows bundled tools
         shell: pwsh
@@ -308,6 +314,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
            ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           @"
           Pymss Studio $version Windows x64 CPU
@@ -339,6 +346,11 @@ jobs:
             Select-String -Pattern $workspacePattern -List
           if ($leakedConfig) { throw "CI workspace path leaked into staged CPU runtime env config" }
 
+      - name: Verify staged native plugin helper
+        shell: pwsh
+        run: |
+          python scripts/verify-native-plugins.py "release/${{ steps.meta.outputs.stage_name }}/Pymss Studio.exe" --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "Staged native plugin helper verification failed" }
       - name: Upload CPU stage artifact
         uses: actions/upload-artifact@v4
         with:
@@ -437,7 +449,7 @@ jobs:
           PYMSS_BUILD_VARIANT: windows-x64-managed
           PYMSS_BUILD_UPDATE_SUPPORTED: 'true'
           PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
-        run: pnpm tauri build --no-bundle
+        run: pnpm plugins:build --no-bundle
       - name: Prepare Windows bundled tools
         shell: pwsh
         run: |
@@ -473,6 +485,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
           @"
           Pymss Studio ${{ steps.meta.outputs.version }} Windows x64 Online
           This package installs the selected CPU, CUDA, or ROCm environment on first start.
@@ -490,6 +503,11 @@ jobs:
              Remove-Item -Recurse -Force
            Get-ChildItem "$stage\python" -Recurse -File -Include "*.pyc", "*.pyo" |
              Remove-Item -Force
+      - name: Verify staged native plugin helper
+        shell: pwsh
+        run: |
+          python scripts/verify-native-plugins.py "release/${{ steps.meta.outputs.stage_name }}/Pymss Studio.exe" --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "Staged native plugin helper verification failed" }
       - name: Upload online stage artifact
         uses: actions/upload-artifact@v4
         with:
@@ -594,7 +612,7 @@ jobs:
           PYMSS_BUILD_VARIANT: windows-x64-rocm
           PYMSS_BUILD_UPDATE_SUPPORTED: 'true'
           PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
-        run: pnpm tauri build --no-bundle
+        run: pnpm plugins:build --no-bundle
       - name: Prepare ROCm portable tools
         shell: pwsh
         run: |
@@ -628,6 +646,7 @@ jobs:
           Copy-Item "python" "$stage/python" -Recurse
           Copy-Item "python-runtime" "$stage/python-runtime" -Recurse
           Copy-Item "release/bin" "$stage/bin" -Recurse
+          ./scripts/stage-plugin-sdk.ps1 -StagePath $stage
           ./scripts/prepare-python-runtime.ps1 -RewriteRuntimeEnvConfigs -RuntimeEnvsDir "$stage/python-runtime/runtime-envs" -RuntimeDir "$stage/python-runtime"
           if (Test-Path "$stage\python-runtime\runtime-envs\rocm\Scripts\offload-arch.exe") { throw "Staged ROCm offload-arch launcher still embeds the build Python path" }
           $rocmSdkPackage = Get-ChildItem "$stage\python-runtime\runtime-envs\rocm\Lib\site-packages" -Directory -Filter "_rocm_sdk_core*" |
@@ -665,6 +684,11 @@ jobs:
             Where-Object { $_.Extension -in @('.cfg', '.json', '.txt', '.ini') } |
             Select-String -Pattern $workspacePattern -List
           if ($leakedConfig) { throw "CI workspace path leaked into staged ROCm runtime env config" }
+      - name: Verify staged native plugin helper
+        shell: pwsh
+        run: |
+          python scripts/verify-native-plugins.py "release/${{ steps.meta.outputs.stage_name }}/Pymss Studio.exe" --platform windows
+          if ($LASTEXITCODE -ne 0) { throw "Staged native plugin helper verification failed" }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.stage_artifact }}

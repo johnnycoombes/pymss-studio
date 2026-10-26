@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import shutil
+import os
+import json
+import re
 import subprocess
+import tempfile
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from worker_audio import _publish_export_path
 
 SUPPORTED_AUDIO_SUFFIXES = {
     ".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus",
@@ -62,6 +69,50 @@ def _available_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Unable to allocate an output filename for {path.name}")
+
+
+def _render_output(path: Path, render: Callable[[Path], None]) -> Path:
+    # Preserve the extension for FFmpeg's muxer. A killed worker can leave only
+    # this private partial, never an incomplete file with the final output name.
+    token = os.environ.get('PYMSS_STUDIO_AUDIO_TEMP_TOKEN', '')
+    state = os.environ.get('PYMSS_STUDIO_AUDIO_TEMP_STATE', '')
+    prefix = '.pymss-audio-'
+    if token or state:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{16,96}', token) or not state:
+            raise RuntimeError('Audio temporary-file state is invalid')
+        for attempt in range(10):
+            try:
+                scope = json.loads(Path(state).read_text(encoding='utf-8'))
+                launcher_pid = scope['pid']
+                if (
+                    scope['token'] == token
+                    and type(launcher_pid) is int
+                    and launcher_pid > 0
+                    and launcher_pid in {os.getpid(), os.getppid()}
+                    and Path(scope['directory']).resolve() == path.parent.resolve()
+                ):
+                    prefix = f'.pymss-audio-{token}-{launcher_pid}-'
+                    break
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            if attempt == 9:
+                raise RuntimeError('Audio temporary-file state is unavailable')
+            time.sleep(.02)
+    fd, value = tempfile.mkstemp(prefix=prefix, suffix=path.suffix, dir=path.parent)
+    os.close(fd)
+    temporary = Path(value)
+    try:
+        render(temporary)
+        if not temporary.stat().st_size:
+            raise RuntimeError("No audio data was written")
+        return _publish_export_path(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Publishing may already have succeeded while an antivirus scanner
+            # briefly retains the temporary hard link.
+            pass
 
 
 def _subprocess_detail(error: subprocess.CalledProcessError) -> str:

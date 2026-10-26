@@ -13,10 +13,12 @@ import {
   OpenOutline,
   PlayOutline,
   SearchOutline,
+  SettingsOutline,
 } from '@vicons/ionicons5'
 import { invoke } from '@tauri-apps/api/core'
 import { storeToRefs } from 'pinia'
 import WorkflowCreateChooser from '@/components/workflow/WorkflowCreateChooser.vue'
+import WorkflowOverviewPreview from '@/components/workflow/WorkflowOverviewPreview.vue'
 import { useModelStore } from '@/stores/model'
 import {
   WorkflowRevisionConflictError,
@@ -30,6 +32,7 @@ import {
   type SimpleWorkflowReasonCode,
 } from '@/utils/workflowSimple'
 import { WorkflowEditorInUseError } from '@/utils/workflowEditorState'
+import { themeIsDark } from '@/utils/theme'
 import { hasInvalidSimpleStructure, isGraphWorkflowDefinition, isSimpleWorkflowDefinition } from '@/workflows/formats'
 import { litegraphToComfy } from '@/litegraph/graphAdapter'
 import { OUTPUT_FORMAT_OPTIONS } from '@/audio/delivery'
@@ -56,6 +59,7 @@ type WorkflowKind = Exclude<WorkflowTypeFilter, 'all'> | 'invalid'
 const typeFilter = ref<WorkflowTypeFilter>('all')
 const importFileInputRef = ref<HTMLInputElement | null>(null)
 const createChooserOpen = ref(false)
+const settingsOpen = ref(false)
 type WorkflowCreateType = 'simple' | 'advanced'
 const contextMenuX = ref(0)
 const contextMenuY = ref(0)
@@ -198,8 +202,7 @@ function isWorkflowBlocked(item: WorkflowEntry) {
   return Boolean(workflowStatusMap.value[item.id])
 }
 
-const workflowMenuOptions = computed<DropdownOption[]>(() => {
-  const current = contextWorkflow.value
+function workflowMenuOptionsFor(current: WorkflowEntry | null): DropdownOption[] {
   if (!current) return []
   const isSimpleDefinition = isSimpleWorkflowDefinition(current.definition)
   const canEditSimple = isSimpleDefinition && analyzeSimpleWorkflow(current.definition).editable
@@ -219,7 +222,11 @@ const workflowMenuOptions = computed<DropdownOption[]>(() => {
     { key: 'delete', label: t('workflows.deleteConfirm'), disabled: locked },
   )
   return options
-})
+}
+
+const workflowMenuOptions = computed(() => workflowMenuOptionsFor(contextWorkflow.value))
+const selectedWorkflowMenuOptions = computed(() => workflowMenuOptionsFor(selectedWorkflow.value))
+const selectedDescriptionPreview = computed(() => selectedWorkflow.value?.description.replace(/\s+/g, ' ').trim() || '')
 
 // ---- Selected workflow overview data (simple-mode details; comfy graphs
 // show a read-only overview since their structure is free-form) ----
@@ -229,20 +236,12 @@ const isSimpleWorkflow = computed(() => isSimpleWorkflowDefinition(selectedWorkf
 const selectedWorkflowKind = computed<WorkflowKind>(() => selectedWorkflow.value
   ? workflowKind(selectedWorkflow.value)
   : 'invalid')
-const selectedComfyToolCount = computed(() => {
-  const overview = selectedComfyOverview.value
-  return overview ? Math.max(0, overview.nodeCount - overview.separateCount - overview.outputCount) : 0
-})
 const selectedDraft = computed(() =>
   isSimpleWorkflowDefinition(selectedWorkflow.value?.definition)
     ? hydrateSimpleWorkflow(selectedWorkflow.value?.definition)
     : null)
 const selectedSummary = computed((): { error: string } | null =>
   selectedWorkflow.value ? { error: workflowDefinitionError(selectedWorkflow.value.definition) } : null)
-const selectedStemCount = computed(() =>
-  selectedDraft.value
-    ? selectedDraft.value.steps.reduce((total, step) => total + step.stems.length, 0) + selectedDraft.value.ensembles.length
-    : 0)
 const selectedModels = computed(() => {
   if (isComfyWorkflow.value) {
     const downloaded = new Set(downloadedModels.value.map(item => item.name))
@@ -262,10 +261,7 @@ const selectedModels = computed(() => {
   return list
 })
 const selectedError = computed(() => selectedSummary.value?.error || '')
-const selectedSaveOutputCount = computed(() => {
-  const def = selectedWorkflow.value?.definition
-  return def ? countWorkflowSaveOutputs(def) : 0
-})
+const missingModelCount = computed(() => selectedModels.value.filter(item => !item.downloaded).length)
 const selectedReady = computed(() => Boolean(selectedWorkflow.value) && !selectedError.value)
 const selectedSimpleAnalysis = computed(() => selectedWorkflow.value
   ? analyzeSimpleWorkflow(selectedWorkflow.value.definition)
@@ -485,12 +481,6 @@ function closeWorkflowContextMenu() {
   contextWorkflow.value = null
 }
 
-function openSelectedContextMenu(event: MouseEvent) {
-  const current = selectedWorkflow.value
-  if (!current) return
-  openWorkflowContextMenu(event, current)
-}
-
 function openWorkflowEditor(item: WorkflowEntry) {
   editWorkflow(item)
   if (isSimpleWorkflowDefinition(item.definition)) {
@@ -511,8 +501,7 @@ function reopenActiveEditor() {
   else void openNodeEditor({ workflowId: editor.workflowId, forceNew: !editor.workflowId })
 }
 
-function handleWorkflowContextMenuSelect(key: string | number) {
-  const current = contextWorkflow.value
+function handleWorkflowMenuSelect(key: string | number, current: WorkflowEntry | null) {
   closeWorkflowContextMenu()
   if (!current) return
 
@@ -718,6 +707,8 @@ async function exportWorkflowEntry(current: WorkflowEntry) {
   await exportWorkflowDefinition(current.name, current.definition)
 }
 
+watch(selectedWorkflowId, () => { settingsOpen.value = false })
+
 const stopEditorCloseSubscription = workflow.$onAction(({ name: action, after }) => {
   if (action !== 'handleEditorClosed') return
   after(() => {
@@ -754,14 +745,15 @@ watch([workflows, selectedWorkflowId], () => {
         <h1>{{ t('workflows.title') }}</h1>
         <p>{{ t('workflows.subtitle') }}</p>
       </div>
-      <div class="workflows-page__header-actions">
+      <div class="workflows-page__header-actions" data-guide="workflow-actions">
         <n-button secondary @click="triggerImportWorkflow">
           <template #icon><n-icon :component="OpenOutline" /></template>
           {{ t('workflows.importWorkflow') }}
         </n-button>
         <n-button
           class="workflow-create-button"
-          type="primary"
+          :type="themeIsDark ? 'default' : 'primary'"
+          :secondary="themeIsDark"
           :disabled="isAnyEditorOpen"
           @click="openWorkflowCreateChooser"
         >
@@ -833,7 +825,7 @@ watch([workflows, selectedWorkflowId], () => {
             <n-icon :component="GitNetworkOutline" />
             <strong>{{ t('workflows.emptyTitle') }}</strong>
             <span>{{ t('workflows.emptyDesc') }}</span>
-            <n-button class="workflow-create-button" type="primary" size="small" @click="openWorkflowCreateChooser">
+            <n-button class="workflow-create-button" :type="themeIsDark ? 'default' : 'primary'" :secondary="themeIsDark" size="small" @click="openWorkflowCreateChooser">
               <span class="workflow-create-button__mark" aria-hidden="true" />
               {{ t('workflows.newWorkflow') }}
             </n-button>
@@ -841,7 +833,7 @@ watch([workflows, selectedWorkflowId], () => {
         </div>
       </aside>
 
-      <main class="console__stage">
+      <main class="console__stage" data-guide="workflow-overview">
         <div v-if="!selectedWorkflow" class="wf-overview-empty">
           <n-icon :component="GitNetworkOutline" />
           <strong>{{ t('workflows.overviewEmptyTitle') }}</strong>
@@ -859,14 +851,7 @@ watch([workflows, selectedWorkflowId], () => {
                 <span class="wf-overview__icon" :class="`wf-overview__icon--${selectedWorkflowKind}`">
                   <n-icon :component="isSimpleWorkflow ? ListOutline : GitNetworkOutline" />
                 </span>
-                <n-input
-                  v-model:value="name"
-                  class="wf-name-input"
-                  :disabled="isNodeEditorOpen"
-                  :placeholder="t('workflows.untitled')"
-                  @blur="saveMeta"
-                  @keydown.enter="(event: KeyboardEvent) => (event.target as HTMLElement)?.blur()"
-                />
+                <h2 class="wf-overview__name" :title="selectedWorkflow.name">{{ selectedWorkflow.name }}</h2>
                 <span class="wf-kind-badge" :class="`wf-kind-badge--${selectedWorkflowKind}`">
                   <n-icon :component="isSimpleWorkflow ? ListOutline : GitNetworkOutline" />
                   {{ selectedWorkflow ? workflowTypeLabel(selectedWorkflow) : '' }}
@@ -879,140 +864,19 @@ watch([workflows, selectedWorkflowId], () => {
                   {{ selectedReady ? t('workflows.statusReady') : t('workflows.workflowValidationTitle') }}
                 </span>
               </div>
-              <n-input
-                v-model:value="description"
-                class="wf-desc-input"
-                type="textarea"
-                :autosize="{ minRows: 1, maxRows: 3 }"
-                :disabled="isNodeEditorOpen"
-                :placeholder="t('workflows.descriptionPlaceholder')"
-                @blur="saveMeta"
-              />
+              <p v-if="selectedDescriptionPreview" class="wf-overview__description" :title="selectedWorkflow.description">{{ selectedDescriptionPreview }}</p>
+              <n-button class="wf-settings-button" secondary :disabled="isNodeEditorOpen" @click="settingsOpen = true">
+                <template #icon><n-icon :component="SettingsOutline" /></template>
+                {{ t('workflows.settingsTitle') }}
+              </n-button>
             </div>
 
-            <div v-if="isComfyWorkflow && selectedComfyOverview" class="wf-metrics">
-              <div class="wf-metric">
-                <strong>{{ selectedComfyOverview.separateCount }}</strong>
-                <span>{{ t('workflows.metricSeparationNodes') }}</span>
-              </div>
-              <div class="wf-metric">
-                <strong>{{ selectedComfyToolCount }}</strong>
-                <span>{{ t('workflows.metricTools') }}</span>
-              </div>
-              <div class="wf-metric">
-                <strong>{{ selectedComfyOverview.outputCount }}</strong>
-                <span>{{ t('workflows.metricSaveNodes') }}</span>
-              </div>
-              <div class="wf-metric">
-                <strong>{{ selectedComfyOverview.linkCount }}</strong>
-                <span>{{ t('workflows.metricLinks') }}</span>
-              </div>
-            </div>
-            <div v-else-if="selectedDraft && selectedSummary" class="wf-metrics">
-              <div class="wf-metric">
-                <strong>{{ selectedDraft.steps.length }}</strong>
-                <span>{{ t('workflows.graphSummarySteps') }}</span>
-              </div>
-              <div class="wf-metric">
-                <strong>{{ selectedDraft.ensembles.length }}</strong>
-                <span>{{ t('workflows.metricEnsembles') }}</span>
-              </div>
-              <div class="wf-metric">
-                <strong>{{ selectedSaveOutputCount }}</strong>
-                <span>{{ t('workflows.graphSummaryOutputs') }}</span>
-              </div>
-              <div class="wf-metric">
-                <strong>{{ selectedStemCount }}</strong>
-                <span>{{ t('workflows.metricStems') }}</span>
-              </div>
-            </div>
+            <WorkflowOverviewPreview :key="selectedWorkflow.id" :definition="selectedWorkflow.definition" />
 
-            <section class="wf-section">
-              <h3>{{ t('workflows.modelsUsed') }}</h3>
-              <div v-if="selectedModels.length" class="wf-chips">
-                <span
-                  v-for="item in selectedModels"
-                  :key="item.name"
-                  class="wf-chip"
-                  :class="{ 'wf-chip--warn': !item.downloaded }"
-                  :title="item.name"
-                >
-                  <n-icon :component="CubeOutline" />
-                  <span class="wf-chip__name">{{ item.name }}</span>
-                  <small v-if="!item.downloaded">{{ t('workflows.modelNotDownloadedShort') }}</small>
-                </span>
-              </div>
-              <p v-else class="wf-muted">{{ t('workflows.noModelsConfigured') }}</p>
-            </section>
-
-            <section v-if="selectedDraft && selectedSimpleAnalysis?.editable" class="wf-section">
-              <h3>{{ t('workflows.runParams') }}</h3>
-              <div class="wf-param-grid">
-                <div class="wf-param">
-                  <span>{{ t('workflows.defaultDevice') }}</span>
-                  <n-select
-                    :value="selectedDraft.defaultDevice"
-                    size="small"
-                    :options="deviceOptions"
-                    :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
-                    :loading="updatingWorkflowDefaults"
-                    @update:value="updateSelectedDefaultDevice"
-                  />
-                </div>
-                <div class="wf-param">
-                  <span>{{ t('workflows.defaultFormat') }}</span>
-                  <n-select
-                    :value="selectedDraft.defaultFormat"
-                    size="small"
-                    :options="formatOptions"
-                    :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
-                    :loading="updatingWorkflowDefaults"
-                    @update:value="updateSelectedDefaultFormat"
-                  />
-                </div>
-                <div v-if="selectedDraft.defaultFormat === 'ogg'" class="wf-param">
-                  <span>{{ t('audio.oggQuality') }}</span>
-                  <n-select
-                    v-model:value="settings.oggQuality"
-                    size="small"
-                    :options="oggQualityOptions"
-                    :disabled="isNodeEditorOpen || settings.oggMinBitrate"
-                  />
-                  <small class="wf-param__hint">{{ t('audio.oggQualityHint') }}</small>
-                </div>
-                <div v-if="selectedDraft.defaultFormat === 'ogg'" class="wf-param wf-param--wide">
-                  <span>{{ t('audio.oggMinBitrate') }}</span>
-                  <n-checkbox v-model:checked="settings.oggMinBitrate" :disabled="isNodeEditorOpen">
-                    {{ t('audio.oggMinBitrateHint') }}
-                  </n-checkbox>
-                </div>
-                <div class="wf-param">
-                  <span>{{ t('workflows.defaultNormalize') }}</span>
-                  <n-select
-                    :value="normalizeMode(selectedDraft.defaultNormalize)"
-                    size="small"
-                    :options="normalizeOptions"
-                    :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
-                    :loading="updatingWorkflowDefaults"
-                    @update:value="updateSelectedDefaultNormalize"
-                  />
-                </div>
-              </div>
-            </section>
-
-            <section v-if="isComfyWorkflow && selectedComfyOverview?.inputSlots?.length" class="wf-section">
-              <h3>{{ t('workflows.inputSlots') }}</h3>
-              <div class="wf-chips">
-                <span v-for="slot in selectedComfyOverview.inputSlots" :key="slot" class="wf-chip" :title="slot">
-                  <n-icon :component="MusicalNotesOutline" />
-                  <span class="wf-chip__name">{{ slot }}</span>
-                </span>
-              </div>
-            </section>
-
-            <section v-if="isComfyWorkflow" class="wf-section">
-              <p class="wf-muted">{{ t('workflows.comfyReadOnlyHint') }}</p>
-            </section>
+            <button v-if="missingModelCount" class="wf-model-warning" type="button" @click="settingsOpen = true">
+              <n-icon :component="AlertCircleOutline" />
+              <span>{{ t('workflows.modelsMissingCount', { count: missingModelCount }) }}</span>
+            </button>
 
             <div v-if="selectedError" class="wf-validation">
               <n-icon :component="AlertCircleOutline" />
@@ -1031,14 +895,17 @@ watch([workflows, selectedWorkflowId], () => {
             <div class="wf-actionbar__primary">
               <n-button v-if="selectedSimpleAnalysis?.editable || isComfyWorkflow" type="primary" size="large" @click="openWorkflowEditor(selectedWorkflow)">
                 <template #icon><n-icon :component="selectedSimpleAnalysis?.editable ? ListOutline : GitNetworkOutline" /></template>
-                {{ selectedSimpleAnalysis?.editable ? t('workflows.editSimpleAction') : t('workflows.editAdvancedAction') }}
+                {{ t('workflows.openEditorAction') }}
               </n-button>
             </div>
             <div class="wf-actionbar__more">
-              <n-button quaternary @click="openSelectedContextMenu">
-                <template #icon><n-icon :component="EllipsisHorizontalOutline" /></template>
-                {{ t('workflows.moreActions') }}
-              </n-button>
+              <n-dropdown :key="selectedWorkflow.id" trigger="click" placement="top-end" to="body"
+                :options="selectedWorkflowMenuOptions" @select="(key: string | number) => handleWorkflowMenuSelect(key, selectedWorkflow)">
+                <n-button quaternary @click="closeWorkflowContextMenu">
+                  <template #icon><n-icon :component="EllipsisHorizontalOutline" /></template>
+                  {{ t('workflows.moreActions') }}
+                </n-button>
+              </n-dropdown>
             </div>
           </footer>
 
@@ -1063,13 +930,83 @@ watch([workflows, selectedWorkflowId], () => {
       :options="workflowMenuOptions"
       :show="contextMenuVisible"
       @clickoutside="closeWorkflowContextMenu"
-      @select="handleWorkflowContextMenuSelect"
+      @select="(key: string | number) => handleWorkflowMenuSelect(key, contextWorkflow)"
     />
 
     <WorkflowCreateChooser
       v-model:show="createChooserOpen"
       @select="selectWorkflowCreateType"
     />
+
+    <n-modal v-model:show="settingsOpen" preset="card" class="wf-settings-modal" :title="t('workflows.settingsTitle')"
+      style="width: min(640px, calc(100vw - 48px)); max-height: calc(100dvh - 112px)"
+      :content-style="{ minHeight: 0, overflow: 'auto' }"
+      :bordered="false" role="dialog" aria-modal="true" :aria-label="t('workflows.settingsTitle')">
+        <div v-if="selectedWorkflow" class="wf-settings">
+          <p class="wf-muted">{{ t('workflows.settingsAutosave') }}</p>
+          <section class="wf-section">
+            <label for="workflow-settings-name">{{ t('workflows.settingsName') }}</label>
+            <n-input :input-props="{ id: 'workflow-settings-name' }" v-model:value="name" :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
+              :placeholder="t('workflows.untitled')" @blur="saveMeta" @keydown.enter="(event: KeyboardEvent) => (event.target as HTMLElement)?.blur()" />
+            <label for="workflow-settings-description">{{ t('workflows.settingsDescription') }}</label>
+            <n-input :input-props="{ id: 'workflow-settings-description' }" v-model:value="description" type="textarea" :autosize="{ minRows: 2, maxRows: 5 }"
+              :disabled="isNodeEditorOpen || updatingWorkflowDefaults" :placeholder="t('workflows.descriptionPlaceholder')" @blur="saveMeta" />
+          </section>
+          <section v-if="selectedDraft && selectedSimpleAnalysis?.editable" class="wf-section">
+            <h3>{{ t('workflows.runParams') }}</h3>
+            <div class="wf-param-grid">
+              <div class="wf-param">
+                <label>{{ t('workflows.defaultDevice') }}</label>
+                <n-select :value="selectedDraft.defaultDevice" :options="deviceOptions" :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
+                  :loading="updatingWorkflowDefaults" :aria-label="t('workflows.defaultDevice')" @update:value="updateSelectedDefaultDevice" />
+              </div>
+              <div class="wf-param">
+                <label>{{ t('workflows.defaultFormat') }}</label>
+                <n-select :value="selectedDraft.defaultFormat" :options="formatOptions" :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
+                  :loading="updatingWorkflowDefaults" :aria-label="t('workflows.defaultFormat')" @update:value="updateSelectedDefaultFormat" />
+              </div>
+              <div v-if="selectedDraft.defaultFormat === 'ogg'" class="wf-param">
+                <label>{{ t('audio.oggQuality') }}</label>
+                <n-select v-model:value="settings.oggQuality" :options="oggQualityOptions" :disabled="isNodeEditorOpen || settings.oggMinBitrate"
+                  :aria-label="t('audio.oggQuality')" />
+                <small class="wf-param__hint">{{ t('audio.oggQualityHint') }}</small>
+              </div>
+              <div v-if="selectedDraft.defaultFormat === 'ogg'" class="wf-param wf-param--wide">
+                <label>{{ t('audio.oggMinBitrate') }}</label>
+                <n-checkbox v-model:checked="settings.oggMinBitrate" :disabled="isNodeEditorOpen">
+                  {{ t('audio.oggMinBitrateHint') }}
+                </n-checkbox>
+              </div>
+              <div class="wf-param">
+                <label>{{ t('workflows.defaultNormalize') }}</label>
+                <n-select :value="normalizeMode(selectedDraft.defaultNormalize)" :options="normalizeOptions" :disabled="isNodeEditorOpen || updatingWorkflowDefaults"
+                  :loading="updatingWorkflowDefaults" :aria-label="t('workflows.defaultNormalize')" @update:value="updateSelectedDefaultNormalize" />
+              </div>
+            </div>
+          </section>
+          <p v-else-if="isComfyWorkflow" class="wf-muted">{{ t('workflows.comfyReadOnlyHint') }}</p>
+          <section class="wf-section">
+            <h3>{{ t('workflows.modelsUsed') }}</h3>
+            <div v-if="selectedModels.length" class="wf-chips">
+              <span v-for="item in selectedModels" :key="item.name" class="wf-chip" :class="{ 'wf-chip--warn': !item.downloaded }" :title="item.name">
+                <n-icon :component="CubeOutline" />
+                <span class="wf-chip__name">{{ item.name }}</span>
+                <small v-if="!item.downloaded">{{ t('workflows.modelNotDownloadedShort') }}</small>
+              </span>
+            </div>
+            <p v-else class="wf-muted">{{ t('workflows.noModelsConfigured') }}</p>
+          </section>
+          <section v-if="isComfyWorkflow && selectedComfyOverview?.inputSlots?.length" class="wf-section">
+            <h3>{{ t('workflows.inputSlots') }}</h3>
+            <div class="wf-chips">
+              <span v-for="slot in selectedComfyOverview.inputSlots" :key="slot" class="wf-chip" :title="slot">
+                <n-icon :component="MusicalNotesOutline" />
+                <span class="wf-chip__name">{{ slot }}</span>
+              </span>
+            </div>
+          </section>
+        </div>
+    </n-modal>
 
   </div>
 </template>
@@ -1113,6 +1050,12 @@ watch([workflows, selectedWorkflowId], () => {
 .workflow-create-button:active {
   transform: translateY(1px) scale(0.985);
   box-shadow: 0 3px 9px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.dark-theme .workflow-create-button,
+.dark-theme .workflow-create-button:hover,
+.dark-theme .workflow-create-button:active {
+  box-shadow: none;
 }
 
 .workflow-create-button__mark {
@@ -1457,6 +1400,12 @@ watch([workflows, selectedWorkflowId], () => {
   overflow: hidden;
 }
 
+.dark-theme .console__rail,
+.dark-theme .console__stage {
+  background: var(--surface-1);
+  box-shadow: inset 0 0 0 1px var(--outline);
+}
+
 .wf-overview-empty {
   flex: 1;
   display: grid;
@@ -1488,23 +1437,68 @@ watch([workflows, selectedWorkflowId], () => {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
-  display: grid;
-  align-content: start;
+  display: flex;
+  flex-direction: column;
   gap: 18px;
-  padding: 20px 22px;
+  padding: 22px;
 }
 
 /* --- heading + meta edit --- */
 .wf-overview__top {
+  flex: 0 0 auto;
   display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
 }
 
+.wf-overview__name {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.4;
+  letter-spacing: -0.02em;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  max-height: 2.8em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.wf-overview__description {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  margin: 0;
+  color: var(--on-surface-muted);
+  font-size: 13px;
+  line-height: 1.65;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  max-height: 3.3em;
+  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.wf-settings-button { grid-column: 2; grid-row: 1; align-self: start; margin-top: 3px; }
+.wf-settings-modal .wf-param-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.wf-settings-modal .wf-param:last-child { grid-column: 1 / -1; }
+.wf-settings { display: grid; gap: 28px; }
+.wf-settings .wf-section > label, .wf-settings .wf-param > label { color: var(--on-surface-muted); font-size: 12px; font-weight: 550; }
+.wf-model-warning { display: flex; align-items: center; gap: 7px; flex-shrink: 0; border: 0; padding: 0; background: transparent; color: var(--warning); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.wf-model-warning:hover { text-decoration: underline; }
+.wf-model-warning:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+
 .wf-overview__heading {
+  grid-column: 1;
+  grid-row: 1;
   display: flex;
   align-items: center;
   gap: 12px;
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .wf-overview__icon {
@@ -1557,52 +1551,6 @@ watch([workflows, selectedWorkflowId], () => {
   background: color-mix(in srgb, var(--warning) 12%, transparent);
 }
 
-.wf-name-input {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.wf-name-input :deep(.n-input__border),
-.wf-name-input :deep(.n-input__state-border),
-.wf-desc-input :deep(.n-input__border),
-.wf-desc-input :deep(.n-input__state-border) {
-  display: none;
-}
-
-.wf-name-input :deep(.n-input) {
-  --n-color: transparent;
-  --n-color-focus: color-mix(in srgb, var(--surface-2) 60%, transparent);
-  background: transparent;
-  border-radius: 10px;
-}
-
-.wf-name-input :deep(.n-input:hover) {
-  background: color-mix(in srgb, var(--surface-2) 44%, transparent);
-}
-
-.wf-name-input :deep(.n-input__input-el) {
-  font-size: 21px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  color: var(--on-surface);
-}
-
-.wf-desc-input :deep(.n-input) {
-  --n-color: transparent;
-  --n-color-focus: color-mix(in srgb, var(--surface-2) 50%, transparent);
-  background: transparent;
-}
-
-.wf-desc-input :deep(.n-input:hover) {
-  background: color-mix(in srgb, var(--surface-2) 38%, transparent);
-}
-
-.wf-desc-input :deep(.n-input__textarea-el) {
-  color: var(--on-surface-muted);
-  font-size: 13px;
-  line-height: 1.55;
-}
-
 .wf-status {
   flex: 0 0 auto;
   display: inline-flex;
@@ -1627,36 +1575,6 @@ watch([workflows, selectedWorkflowId], () => {
 .wf-status--warn {
   color: color-mix(in srgb, var(--warning) 84%, white 6%);
   background: color-mix(in srgb, var(--warning) 15%, transparent);
-}
-
-/* --- metrics --- */
-.wf-metrics {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.wf-metric {
-  display: grid;
-  gap: 3px;
-  padding: 14px 12px;
-  border-radius: 14px;
-  background: color-mix(in srgb, var(--surface-2) 46%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--outline) 66%, transparent);
-}
-
-.wf-metric strong {
-  font-size: 24px;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-  line-height: 1.1;
-  font-variant-numeric: tabular-nums;
-}
-
-.wf-metric span {
-  color: var(--on-surface-muted);
-  font-size: 11px;
-  font-weight: 600;
 }
 
 /* --- sections --- */
@@ -1731,16 +1649,13 @@ watch([workflows, selectedWorkflowId], () => {
 
 .wf-param-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-columns: 1fr;
+  gap: 18px;
 }
 
 .wf-param {
   display: grid;
-  gap: 4px;
-  padding: 10px 12px;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--surface-2) 42%, transparent);
+  gap: 8px;
 }
 
 .wf-param span {
@@ -1900,17 +1815,31 @@ watch([workflows, selectedWorkflowId], () => {
 }
 
 /* ============ Responsive ============ */
+@media (max-width: 1100px) {
+  .console { grid-template-columns: minmax(240px, 280px) minmax(0, 1fr); }
+}
+
 @media (max-width: 960px) {
   .console {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(230px, 30%) minmax(0, 1fr);
   }
-
-  .wf-metrics {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+  .wf-overview__top { padding-right: 0; }
+  .wf-settings-button { position: static; justify-self: start; }
+  .wf-overview { padding: 18px; }
+  .wf-overview__name { font-size: 19px; }
 
   .wf-param-grid {
     grid-template-columns: 1fr;
   }
+}
+@media (max-width: 680px) {
+  .console { display: flex; flex-direction: column; overflow: auto; }
+  .console__rail { flex: 0 0 230px; }
+  .console__stage { flex: 0 0 560px; }
+  .workflows-page__header-actions { gap: 6px; flex-wrap: wrap; }
+}
+
+@media (max-width: 520px) {
+  .wf-settings-modal .wf-param-grid { grid-template-columns: 1fr; }
 }
 </style>

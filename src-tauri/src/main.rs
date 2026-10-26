@@ -1,24 +1,56 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod commands;
+#[cfg(any(target_os = "macos", test))]
+mod app_quit;
+mod automatic_report;
+mod diagnostic_context;
+mod diagnostic_report;
 mod error;
+mod log_record;
 mod model_dir_migration;
+mod plugin_views;
+#[cfg(any(target_os = "macos", test))]
+mod macos_update;
+#[cfg(any(target_os = "linux", test))]
+mod linux_update;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod update_startup;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+mod update_stream;
 mod python;
+mod rba;
 mod session_log;
 mod single_instance;
 mod state;
 mod storage;
 mod terminal;
 mod update_manager;
+mod update_sources;
 mod workflow_editors;
 
 use state::AppState;
 use tauri::{Emitter, Manager};
 
+
 fn main() {
+    if let Some(code) = commands::plugin_host::run_capabilities_cli() {
+        std::process::exit(code);
+    }
+    #[cfg(feature = "native-plugins")]
+    if let Some(code) = pymss_audio_host::run_cli() {
+        std::process::exit(code);
+    }
+    commands::plugin_host::configure_lab_environment();
+    terminal::attach_parent();
+    if session_log::configure_startup_logging(std::env::args_os().skip(1)) {
+        session_log::early("DEBUG", "app.debug", "Verbose logging enabled by --debug");
+    }
+    #[cfg(not(feature = "vst-lab"))]
     if let Some(code) = update_manager::run_helper_from_args() {
         std::process::exit(code);
     }
+    #[cfg(not(feature = "vst-lab"))]
     if let Some(code) = update_manager::recover_interrupted_update_from_startup() {
         std::process::exit(code);
     }
@@ -32,13 +64,15 @@ fn main() {
             // A mutex failure is rare (for example, a restricted user
             // session). Keep the application usable, while making the loss
             // of single-instance enforcement visible in diagnostics.
-            eprintln!("Unable to create the single-instance mutex: {error}");
+            crate::session_log::early("WARN", "app.diagnostic", &format!("Unable to create the single-instance mutex: {error}"));
             None
         }
     };
-    terminal::attach_parent();
 
     let builder = tauri::Builder::default()
+        .register_uri_scheme_protocol("pymss-plugin", |ctx, request| {
+            plugin_views::serve_view(ctx.app_handle(), &request)
+        })
         .on_page_load(|webview, _payload| {
             let window = webview.window();
             if !cfg!(target_os = "macos") {
@@ -65,19 +99,40 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .manage(commands::plugin_host::PluginHostState::default())
         .manage(AppState::new())
         .manage(workflow_editors::WorkflowEditors::default());
 
-    #[cfg(desktop)]
+    #[cfg(all(desktop, not(feature = "vst-lab")))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(app_quit::menu)
+        .on_menu_event(app_quit::on_menu_event);
 
     builder
         .setup(|app| {
             let _ = session_log::init_session_log(app.handle());
+            python::worker::recover_audio_output_temps(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::plugin_host::plugin_host_capabilities,
+            commands::plugin_host::plugin_host_scan,
+            commands::plugin_host::plugin_host_scan_report,
+            commands::plugin_host::plugin_host_cached_scan_report,
+            commands::plugin_host::plugin_host_scan_status,
+            commands::plugin_host::plugin_host_skip_scan,
+            commands::plugin_host::plugin_host_cancel_scan,
+            commands::plugin_host::plugin_host_scan_blacklist,
+            commands::plugin_host::plugin_host_remove_scan_blacklist,
+            commands::plugin_host::plugin_host_request,
+            commands::plugin_host::plugin_host_render,
+            commands::plugin_host::plugin_host_cancel_render,
+            commands::plugin_host::plugin_host_cleanup_render,
             commands::app_cmd::cancel_task,
+            commands::app_cmd::write_frontend_log,
             commands::app_cmd::close_current_window,
             commands::app_cmd::minimize_current_window,
             commands::app_cmd::toggle_maximize_current_window,
@@ -99,6 +154,14 @@ fn main() {
             commands::app_cmd::start_editor_mix_export,
             commands::app_cmd::cancel_editor_mix_export,
             commands::app_cmd::start_audio_tool,
+            commands::tempo_key::start_tempo_key_analysis,
+            commands::app_cmd::start_operation_task,
+            commands::app_cmd::list_operations,
+            commands::app_cmd::list_nodes,
+            commands::app_cmd::plugin_marketplace,
+            commands::app_cmd::manage_plugin,
+            commands::app_cmd::set_plugin_view_root,
+            commands::app_cmd::describe_operation,
             commands::app_cmd::get_app_paths,
             commands::app_cmd::get_env_info,
             commands::app_cmd::generate_waveform_peaks,
@@ -122,9 +185,13 @@ fn main() {
             commands::app_cmd::debug_log_clear,
             commands::app_cmd::debug_log_create_report,
             commands::app_cmd::debug_log_info,
+            commands::app_cmd::debug_editor_playback,
+            commands::app_cmd::editor_preview_chunk,
             commands::app_cmd::debug_log_read,
             commands::app_cmd::check_managed_update,
             commands::app_cmd::start_managed_update,
+            commands::app_cmd::confirm_managed_update_startup,
+            commands::app_cmd::get_managed_update_state,
             commands::app_cmd::debug_runtime_override_active,
             commands::app_cmd::debug_runtime_pointers,
             commands::app_cmd::debug_runtime_restore_file,
@@ -184,6 +251,12 @@ fn main() {
             commands::app_cmd::delete_runtime,
             commands::app_cmd::worker_health,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Pymss Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building Pymss Studio")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<commands::plugin_host::PluginHostState>().shutdown();
+                session_log::finish_automatic_reports(app);
+            }
+        });
 }

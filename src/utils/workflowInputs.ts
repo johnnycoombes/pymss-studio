@@ -7,6 +7,9 @@
  * a declared-but-unprovided name is an error; no positional fallback).
  */
 
+import { detectWorkflowFormat } from '../workflows/formats.ts'
+import { workflowInputNodes } from '../workflows/workbench.ts'
+
 export interface WorkflowInputSlot {
   /** slot name from the node's input_name widget */
   name: string
@@ -78,4 +81,13 @@ export function analyzeWorkflowInputs(definition: Record<string, unknown> | null
     }
   }
   return { slots, unresolved, selfContained }
+}
+
+export function getSeparateWorkflowInputIssue(
+  definition: Record<string, unknown>,
+): { code: 'no-input' | 'multiple-inputs'; count: number } | null {
+  if (detectWorkflowFormat(definition) !== 'graph') return null
+  const count = workflowInputNodes(definition).length
+  if (count === 1) return null
+  return { code: count === 0 ? 'no-input' : 'multiple-inputs', count }
 }

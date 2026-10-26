@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+import { isTutorialFrame } from '@/features/onboarding/demoContext'
+
 import { computed, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -40,6 +43,8 @@ import ModelProgressBlock from '@/components/ModelProgressBlock.vue'
 import DownloadDetailModal from '@/components/DownloadDetailModal.vue'
 import CustomModelImportDialog from '@/components/CustomModelImportDialog.vue'
 import AlignedInferenceInputNumber from '@/components/AlignedInferenceInputNumber.vue'
+
+const studioLog = createLogger('ui.views.ModelsView')
 
 const { t, locale } = useI18n()
 const message = useMessage()
@@ -168,6 +173,10 @@ function modelNote(modelOrName: ModelEntry | string | null | undefined) {
 function modelUseCount(modelOrName: ModelEntry | string | null | undefined) {
   const name = typeof modelOrName === 'string' ? modelOrName : modelOrName?.name
   return name ? modelStore.getModelUseCount(name) : 0
+}
+
+function modelNameParts(name: string) {
+  return name.split(/(?<=[_-])/u)
 }
 
 function toggleFavorite(model: ModelEntry, event?: MouseEvent) {
@@ -570,7 +579,7 @@ async function saveInferenceDefaults() {
     closeInferenceEditor()
     message.success(t('models.inferenceDefaultsSaved'))
   } catch (error) {
-    console.error('Failed to persist model inference defaults', error)
+    studioLog.error('Failed to persist model inference defaults', error)
     message.error(t('models.inferenceDefaultsSaveFailed'))
   }
 }
@@ -603,7 +612,7 @@ async function resetInferenceDefaults() {
     }
     message.success(t('models.inferenceDefaultsReset'))
   } catch (error) {
-    console.error('Failed to restore model inference defaults', error)
+    studioLog.error('Failed to restore model inference defaults', error)
     message.error(t('models.inferenceDefaultsResetFailed'))
   }
 }
@@ -1005,7 +1014,7 @@ onMounted(() => {
         </div>
         <p>{{ t('models.subtitle') }}</p>
       </div>
-      <div class="header-actions">
+      <div class="header-actions" data-guide="model-management">
         <n-tooltip v-if="!customModelsSupported" trigger="hover">
           <template #trigger>
             <n-button secondary disabled>
@@ -1023,7 +1032,7 @@ onMounted(() => {
           <template #icon><n-icon :component="ServerOutline" /></template>
           {{ t('models.storageManage') }}
         </n-button>
-        <n-button secondary :loading="isLoading" @click="loadModels">
+        <n-button secondary :loading="isLoading" data-guide="model-library-fallback" @click="loadModels">
           <template #icon><n-icon :component="RefreshOutline" /></template>
           {{ t('models.load') }}
         </n-button>
@@ -1031,7 +1040,7 @@ onMounted(() => {
     </div>
 
     <!-- Filter Toolbar -->
-    <div class="toolbar">
+    <div class="toolbar" data-guide="model-filters">
       <div class="toolbar-row">
         <n-input
           v-model:value="search"
@@ -1129,6 +1138,7 @@ onMounted(() => {
           <div
             v-for="model in pagedModels"
             :key="model.name"
+            :data-guide="model.supported ? 'model-library' : undefined"
             :class="['model-card', {
               'model-card--selected': selectedModel === model.name,
               'model-card--unsupported': !model.supported,
@@ -1145,56 +1155,56 @@ onMounted(() => {
           <!-- Card Header -->
           <div class="mc-header">
             <div class="mc-title">
-              <div class="mc-name-row">
-                <span class="mc-name" :title="model.name">{{ model.name }}</span>
-                <n-button
-                  quaternary
-                  circle
-                  size="tiny"
-                  :type="isFavoriteModel(model) ? 'warning' : 'default'"
-                  :title="isFavoriteModel(model) ? t('models.unfavorite') : t('models.favorite')"
-                  class="mc-favorite"
-                  @click.stop="toggleFavorite(model, $event)"
-                >
-                  <template #icon>
-                    <n-icon :component="isFavoriteModel(model) ? Star : StarOutline" />
-                  </template>
-                </n-button>
-                <n-button
-                  quaternary
-                  circle
-                  size="tiny"
-                  class="mc-more"
-                  :title="t('models.moreActions')"
-                  :aria-label="t('models.moreActions')"
-                  @click.stop="openModelContextMenu($event, model)"
-                >
-                  <template #icon><n-icon :component="EllipsisHorizontalOutline" /></template>
-                </n-button>
-              </div>
+              <span class="mc-name" :title="model.name"><template v-for="(part, index) in modelNameParts(model.name)" :key="index">{{ part }}<wbr /></template></span>
               <span v-if="modelNote(model)" class="mc-note" :title="modelNote(model)">{{ modelNote(model) }}</span>
+            </div>
+            <div class="mc-controls">
+              <n-button
+                quaternary
+                circle
+                size="tiny"
+                :type="isFavoriteModel(model) ? 'warning' : 'default'"
+                :title="isFavoriteModel(model) ? t('models.unfavorite') : t('models.favorite')"
+                :aria-label="isFavoriteModel(model) ? t('models.unfavorite') : t('models.favorite')"
+                class="mc-favorite"
+                @click.stop="toggleFavorite(model, $event)"
+              >
+                <template #icon>
+                  <n-icon :component="isFavoriteModel(model) ? Star : StarOutline" />
+                </template>
+              </n-button>
+              <n-button
+                quaternary
+                circle
+                size="tiny"
+                class="mc-more"
+                :title="t('models.moreActions')"
+                :aria-label="t('models.moreActions')"
+                @click.stop="openModelContextMenu($event, model)"
+              >
+                <template #icon><n-icon :component="EllipsisHorizontalOutline" /></template>
+              </n-button>
             </div>
           </div>
           <!-- Meta Tags -->
           <div class="mc-tags">
-            <n-tag v-if="model.architecture" :bordered="false" size="tiny" type="info" round>
+            <n-tag v-if="model.architecture" :bordered="false" size="tiny" type="info" round :title="model.architecture">
               {{ model.architecture }}
             </n-tag>
-            <n-tag v-if="showModelTypeTag(model)" :bordered="false" size="tiny" round>
+            <n-tag v-if="showModelTypeTag(model)" :bordered="false" size="tiny" round :title="model.modelType || undefined">
               {{ model.modelType }}
             </n-tag>
           </div>
 
-          <!-- Key info: values read fine without their labels shouting, so both sit on
-               one wrapping line rather than as a label/value table. -->
+          <!-- Stable field positions keep models comparable across each card row. -->
           <div class="mc-meta">
-            <div class="mc-meta-item">
+            <div class="mc-meta-item mc-meta-item--target">
               <span class="mc-label">{{ t('models.targetStem') }}</span>
-              <span class="mc-value">{{ targetStemLabel(model) || '—' }}</span>
+              <span class="mc-value" :title="targetStemLabel(model)">{{ targetStemLabel(model) || '—' }}</span>
             </div>
-            <div class="mc-meta-item">
+            <div class="mc-meta-item mc-meta-item--category">
               <span class="mc-label">{{ t('models.category') }}</span>
-              <span class="mc-value">{{ categoryLabel(model) || '—' }}</span>
+              <span class="mc-value" :title="categoryLabel(model) || undefined">{{ categoryLabel(model) || '—' }}</span>
             </div>
             <div class="mc-meta-item mc-meta-item--usage">
               <span class="mc-label">{{ t('models.useCountLabel') }}</span>
@@ -1586,7 +1596,7 @@ onMounted(() => {
       </n-card>
     </n-modal>
 
-    <n-drawer v-model:show="showStorage" :width="760" placement="right">
+    <n-drawer v-model:show="showStorage" :width="760" placement="right" :z-index="isTutorialFrame() ? 3500 : undefined" :trap-focus="!isTutorialFrame()">
       <n-drawer-content :title="t('models.storageTitle')" closable>
         <div class="storage-panel">
           <div class="storage-summary">
@@ -1761,14 +1771,14 @@ onMounted(() => {
   display: grid;
   /* One column per control: search | category | source | sort | actions. A missing column would
      push the last control into an implicit one and squeeze the switch label onto two lines. */
-  grid-template-columns: minmax(180px, 0.92fr) 220px 160px 180px auto;
+  grid-template-columns: minmax(240px, 1fr) minmax(150px, 200px) minmax(110px, 150px) minmax(130px, 170px) auto;
   align-items: center;
   gap: 10px;
 }
 
 .search-input {
   max-width: none;
-  min-width: 180px;
+  min-width: 0;
 }
 
 .toolbar-actions {
@@ -1780,7 +1790,8 @@ onMounted(() => {
 
 /* ===== Category Select ===== */
 .category-select {
-  width: 220px;
+  width: 100%;
+  min-width: 0;
   flex-shrink: 0;
 }
 
@@ -1819,12 +1830,14 @@ onMounted(() => {
 }
 
 .source-select {
-  width: 150px;
+  width: 100%;
+  min-width: 0;
   flex-shrink: 0;
 }
 
 .sort-select {
-  width: 170px;
+  width: 100%;
+  min-width: 0;
   flex-shrink: 0;
 }
 
@@ -1832,6 +1845,7 @@ onMounted(() => {
 .models-body {
   display: flex;
   flex-direction: column;
+  container: model-library / inline-size;
 }
 
 .model-grid {
@@ -1847,11 +1861,8 @@ onMounted(() => {
 
 /* Columns are added as the window allows rather than at fixed breakpoints. */
 .model-grid--card {
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  /* Each card is as tall as its own content. Equal row heights line the bottom bars up, but one
-     card downloading is much taller than the rest, and every neighbour then stretches to match
-     it — a large void in each is a worse trade than a ragged bottom edge. */
-  align-items: start;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 270px), 1fr));
+  align-items: stretch;
   gap: 12px;
 }
 
@@ -1886,9 +1897,6 @@ onMounted(() => {
     linear-gradient(180deg, rgba(255,255,255,0.018), transparent 54%),
     color-mix(in srgb, var(--surface-1) 64%, transparent);
   transition: box-shadow 0.15s ease, border-color 0.15s ease, background 0.15s ease;
-  /* Layout comes from the card's own width, not the window's: in card mode the two are
-     unrelated, since a 300px card can sit on a 2560px screen. */
-  container-type: inline-size;
   position: relative;
   overflow: hidden;
 }
@@ -1905,45 +1913,78 @@ onMounted(() => {
 
 .model-grid--card .mc-bottom {
   margin-top: auto;
+  min-height: 43px;
   padding-top: 10px;
   border-top: 1px solid color-mix(in srgb, var(--outline) 38%, transparent);
 }
+
+@supports (grid-template-rows: subgrid) {
+  .model-grid--card .model-card {
+    display: grid;
+    grid-template-rows: subgrid;
+    grid-row: span 4;
+  }
+}
+.model-grid--card .mc-tags { min-height: 20px; flex-wrap: nowrap; }
+.model-grid--card .mc-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "target target" "category usage";
+  gap: 6px 12px;
+}
+.model-grid--card .mc-meta-item--target { grid-area: target; }
+.model-grid--card .mc-meta-item--category { grid-area: category; }
+.model-grid--card .mc-meta-item--usage { grid-area: usage; }
+.model-grid--card .mc-meta-item:not(.mc-meta-item--usage) {
+  display: grid;
+  grid-template-columns: minmax(4em, max-content) minmax(0, 1fr);
+}
+.mc-meta-item--usage { color: var(--on-surface-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* ---- List: the original two-line row — the name over its details, with tags and actions
    riding on the right. Spreading the same content across one flex line left large gaps between
    the pieces and made long lists harder to scan. ---- */
 .model-grid--list .model-card {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(112px, 160px) minmax(230px, 280px);
+  grid-template-columns: minmax(0, 1fr) minmax(112px, 160px) minmax(230px, 280px) auto;
   grid-template-areas:
-    "header tags bottom"
-    "meta   tags bottom";
+    "header tags bottom controls"
+    "meta   tags bottom controls";
   align-items: center;
   gap: 8px 14px;
   padding: 14px 16px 17px;
 }
 
-.model-grid--list .mc-header { grid-area: header; min-width: 0; }
+.model-grid--list .mc-header { display: contents; }
+.model-grid--list .mc-title { grid-area: header; }
+.model-grid--list .mc-controls { grid-area: controls; }
 .model-grid--list .mc-meta { grid-area: meta; min-width: 0; }
 .model-grid--list .mc-tags { grid-area: tags; }
 .model-grid--list .mc-bottom { grid-area: bottom; justify-content: flex-end; gap: 12px; }
 
-/* A narrow window cannot hold three columns; stack rather than crush them. */
-@container (max-width: 620px) {
+/* Stack metadata in narrow windows while keeping controls beside the title. */
+@container model-library (max-width: 760px) {
   .model-grid--list .model-card {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
-      "header"
-      "tags"
-      "meta"
-      "bottom";
+      "header controls"
+      "tags tags"
+      "meta meta"
+      "bottom bottom";
   }
+
+  .model-grid--list .mc-controls { align-self: start; }
 
   .model-grid--list .mc-bottom {
     justify-content: space-between;
     padding-top: 10px;
     border-top: 1px solid color-mix(in srgb, var(--outline) 38%, transparent);
   }
+}
+
+@container (max-width: 350px) {
+  .model-grid--card .mc-speed { display: none; }
+  .model-grid--card .model-card--busy .mc-size { display: none; }
 }
 
 /* A running download is the one thing on the page that changes by itself; a tinted edge makes
@@ -1958,10 +1999,11 @@ onMounted(() => {
 /* ---- Action row: one line, identical height in every state ---- */
 .mc-bottom {
   display: flex;
+  container-type: inline-size;
   align-items: center;
   gap: 10px;
   min-width: 0;
-  min-height: 26px;
+  min-height: 30px;
 }
 
 .mc-size {
@@ -2117,10 +2159,30 @@ onMounted(() => {
   opacity: 0.55;
 }
 
+.dark-theme .model-card {
+  background: var(--surface-1);
+  border-color: var(--outline);
+}
+.dark-theme .model-card:hover {
+  background: color-mix(in srgb, var(--surface-2) 50%, var(--surface-1));
+  border-color: var(--outline-strong);
+  box-shadow: none;
+}
+.dark-theme .model-card--selected {
+  border-color: var(--primary-border) !important;
+  background: color-mix(in srgb, var(--primary-soft) 45%, var(--surface-1));
+}
+.dark-theme .model-card--busy {
+  border-color: var(--primary-border);
+  background: color-mix(in srgb, var(--primary-softer) 45%, var(--surface-1));
+}
+.dark-theme .mc-name { color: var(--on-surface-heading); }
+
 /* Card header */
 .mc-header {
   display: flex;
   align-items: flex-start;
+  gap: 4px;
   min-width: 0;
 }
 
@@ -2131,21 +2193,20 @@ onMounted(() => {
   min-width: 0;
 }
 
-.mc-name-row {
+.mc-controls {
   display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
 .mc-name {
   display: -webkit-box;
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
-  flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
-  line-height: 1.45;
+  line-height: 1.5;
   overflow: hidden;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
@@ -2168,13 +2229,11 @@ onMounted(() => {
 
 .mc-favorite {
   flex: 0 0 auto;
-  margin-top: -4px;
   opacity: 0.62;
 }
 
 .mc-more {
   flex: 0 0 auto;
-  margin-top: -4px;
   opacity: 0.62;
 }
 
@@ -2197,6 +2256,8 @@ onMounted(() => {
 
 .mc-tags :deep(.n-tag) {
   max-width: 100%;
+  min-width: 0;
+  flex-shrink: 1;
 }
 
 .mc-tags :deep(.n-tag__content) {
@@ -2233,6 +2294,7 @@ onMounted(() => {
 .mc-label {
   color: var(--on-surface-muted);
   flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .mc-value {
@@ -2362,9 +2424,9 @@ onMounted(() => {
 
 
 .model-detail-modal {
-  width: min(600px, calc(100vw - 48px));
-  height: min(620px, calc(100vh - 96px));
-  max-height: calc(100vh - 96px);
+  width: var(--modal-width-sm);
+  height: min(620px, var(--modal-max-height));
+  max-height: var(--modal-max-height);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -2648,7 +2710,12 @@ onMounted(() => {
 }
 
 /* ===== Responsive ===== */
-@media (max-width: 900px) {
+@media (max-width: 1180px) {
+  .toolbar-row { grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 0.9fr) auto; }
+  .search-input { grid-column: 1 / -1; }
+}
+
+@media (max-width: 760px) {
   .search-input {
     max-width: 100%;
   }
@@ -2691,6 +2758,10 @@ onMounted(() => {
     flex-wrap: wrap;
   }
 }
+@media (max-width: 560px) {
+  .sort-select, .toolbar-actions { grid-column: 1 / -1; }
+}
+
 @media (max-width: 720px) {
   .inference-editor-grid {
     grid-template-columns: 1fr;
@@ -2701,9 +2772,9 @@ onMounted(() => {
   }
 
   .model-detail-modal {
-    width: calc(100vw - 28px);
-    height: calc(100vh - 40px);
-    max-height: calc(100vh - 40px);
+    width: var(--modal-width-sm);
+    height: min(620px, var(--modal-max-height));
+    max-height: var(--modal-max-height);
   }
 
   .model-detail-modal .drawer-footer {

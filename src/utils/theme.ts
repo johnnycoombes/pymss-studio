@@ -49,22 +49,20 @@ const RIPPLE_TRANSITION_DURATION = 700
 const RIPPLE_TRANSITION_EASING = 'cubic-bezier(0.2, 0, 0, 1)'
 
 const DARK_SURFACE: SurfacePalette = {
-  // A cool graphite stack gives the workstation a visible canvas, panel and control hierarchy
-  // without falling back to pure black. The small hue shift keeps large dense pages calm.
-  surface: '#0f1117',
-  surface1: '#161922',
-  surface2: '#1e232e',
-  surface3: '#2a313f',
-  onSurfaceHeading: '#eef1f7',
-  onSurface: '#cdd2dc',
-  onSurfaceMuted: '#969eae',
-  outline: 'rgba(190, 201, 222, 0.115)',
-  outlineStrong: 'rgba(205, 214, 232, 0.19)',
+  surface: '#111317',
+  surface1: '#191c21',
+  surface2: '#23272e',
+  surface3: '#303640',
+  onSurfaceHeading: '#e5e7eb',
+  onSurface: '#c9cdd4',
+  onSurfaceMuted: '#969da8',
+  outline: 'rgba(229, 231, 235, 0.08)',
+  outlineStrong: 'rgba(229, 231, 235, 0.14)',
   success: '#7fb59a',
   warning: '#d0ab70',
   danger: '#d7808f',
-  shadowPanel: '0 18px 46px rgba(3, 5, 12, 0.18)',
-  shadowSoft: '0 18px 54px rgba(3, 5, 12, 0.36)',
+  shadowPanel: '0 6px 18px rgba(0, 0, 0, 0.12)',
+  shadowSoft: '0 14px 40px rgba(0, 0, 0, 0.32)',
 }
 
 const LIGHT_SURFACE: SurfacePalette = {
@@ -87,15 +85,15 @@ const LIGHT_SURFACE: SurfacePalette = {
 const THEME_PALETTES: Record<ThemeAccent, { light: ThemePalette; dark: ThemePalette }> = {
   blue: {
     dark: {
-      primary: '#7299d7',
-      primaryStrong: '#b5caf0',
-      primarySoft: 'rgba(114, 153, 215, 0.18)',
-      primarySofter: 'rgba(114, 153, 215, 0.085)',
-      primaryBorder: 'rgba(114, 153, 215, 0.36)',
-      primaryGlow: 'rgba(114, 153, 215, 0.14)',
-      primaryHover: '#86abe3',
-      primaryPressed: '#5e81bd',
-      preview: ['#7299d7', '#b5caf0'],
+      primary: '#7c9ed9',
+      primaryStrong: '#b7ccee',
+      primarySoft: 'rgba(124, 158, 217, 0.15)',
+      primarySofter: 'rgba(124, 158, 217, 0.075)',
+      primaryBorder: 'rgba(124, 158, 217, 0.30)',
+      primaryGlow: 'rgba(124, 158, 217, 0.08)',
+      primaryHover: '#90aee4',
+      primaryPressed: '#6a8bc3',
+      preview: ['#7c9ed9', '#b7ccee'],
     },
     light: {
       primary: '#3f70d4',
@@ -274,9 +272,7 @@ export function getThemeOverrides(
   accent: ThemeAccent = currentAccent,
 ): GlobalThemeOverrides {
   const tokens = getResolvedThemeTokens(mode, accent)
-  // Naive UI's dark theme otherwise retains a pure-black base. Components that derive their
-  // surface from baseColor (checkboxes, tags, dialogs, etc.) then look detached from our navy
-  // shell. Use the same base as the app only in dark mode to preserve light-mode behaviour.
+  // Keep component surfaces and solid primary-button labels on the same dark base.
   const darkBase = tokens.isDark ? {
     baseColor: tokens.surface,
     textColorBase: tokens.onSurface,
@@ -294,8 +290,8 @@ export function getThemeOverrides(
       hoverColor: tokens.surface2,
       dividerColor: tokens.outline,
       borderColor: tokens.outline,
-      textColor1: tokens.onSurface,
-      textColor2: tokens.onSurfaceMuted,
+      textColor1: tokens.onSurfaceHeading,
+      textColor2: tokens.isDark ? tokens.onSurface : tokens.onSurfaceMuted,
       textColor3: tokens.onSurfaceMuted,
       primaryColor: tokens.primary,
       primaryColorHover: tokens.primaryHover,
@@ -321,6 +317,21 @@ export function getThemeOverrides(
       borderColor: tokens.outline,
       colorHover: tokens.surface3,
       textColorHover: tokens.onSurface,
+      ...(tokens.isDark ? {
+        textColor: tokens.onSurfaceHeading,
+        textColorHover: tokens.onSurfaceHeading,
+        textColorPressed: tokens.onSurfaceHeading,
+        textColorFocus: tokens.onSurfaceHeading,
+        colorSecondary: tokens.surface2,
+        colorSecondaryHover: tokens.surface3,
+        colorSecondaryPressed: tokens.surface2,
+        colorDisabled: tokens.surface2,
+        colorDisabledPrimary: tokens.surface2,
+        textColorDisabled: tokens.onSurfaceMuted,
+        textColorDisabledPrimary: tokens.onSurfaceMuted,
+        borderDisabledPrimary: `1px solid ${tokens.outline}`,
+        opacityDisabled: '0.55',
+      } : {}),
     },
     Input: {
       borderRadius: '11px',

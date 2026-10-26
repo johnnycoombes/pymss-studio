@@ -17,26 +17,26 @@
 /* ===== Theme Variables ===== */
 /* Mirrors DARK_SURFACE in utils/theme.ts — used before the runtime token injection kicks in. */
 :root {
-  --surface: #0f1117;
-  --surface-1: #161922;
-  --surface-2: #1e232e;
-  --surface-3: #2a313f;
-  --on-surface-heading: #eef1f7;
-  --on-surface: #cdd2dc;
-  --on-surface-muted: #969eae;
-  --outline: rgba(190, 201, 222, 0.115);
-  --outline-strong: rgba(205, 214, 232, 0.19);
-  --primary: #7299d7;
-  --primary-strong: #b5caf0;
-  --primary-soft: rgba(114, 153, 215, 0.18);
-  --primary-softer: rgba(114, 153, 215, 0.085);
-  --primary-border: rgba(114, 153, 215, 0.36);
-  --primary-glow: rgba(114, 153, 215, 0.14);
+  --surface: #111317;
+  --surface-1: #191c21;
+  --surface-2: #23272e;
+  --surface-3: #303640;
+  --on-surface-heading: #e5e7eb;
+  --on-surface: #c9cdd4;
+  --on-surface-muted: #969da8;
+  --outline: rgba(229, 231, 235, 0.08);
+  --outline-strong: rgba(229, 231, 235, 0.14);
+  --primary: #7c9ed9;
+  --primary-strong: #b7ccee;
+  --primary-soft: rgba(124, 158, 217, 0.15);
+  --primary-softer: rgba(124, 158, 217, 0.075);
+  --primary-border: rgba(124, 158, 217, 0.30);
+  --primary-glow: rgba(124, 158, 217, 0.08);
   --success: #7fb59a;
   --warning: #d0ab70;
   --danger: #d7808f;
-  --shadow-panel: 0 18px 46px rgba(3, 5, 12, 0.18);
-  --shadow-soft: 0 18px 54px rgba(3, 5, 12, 0.36);
+  --shadow-panel: 0 6px 18px rgba(0, 0, 0, 0.12);
+  --shadow-soft: 0 14px 40px rgba(0, 0, 0, 0.32);
 }
 
 /* ===== Reset & Base ===== */
@@ -67,6 +67,7 @@ body {
 }
 
 button, input, select, textarea { font: inherit; }
+code { font-family: inherit; }
 a { color: inherit; text-decoration: none; }
 
 /* MiSans Semibold blooms on a dark canvas and makes every label compete for attention. Keep
@@ -92,26 +93,6 @@ a { color: inherit; text-decoration: none; }
   .audio-tools-nav section > strong
 ) {
   font-weight: 500 !important;
-}
-
-/* Main page titles stay bright. Secondary titles use the same cool gray as the model detail
-   heading, so hierarchy no longer depends on multiple blocks of bright white text. */
-.dark-theme .app-shell :is(
-  h2,
-  h3,
-  h4,
-  h5,
-  h6,
-  .rail-card__label strong,
-  .target-row__name,
-  .mc-name,
-  .wf-row__main strong,
-  .wf-name-input .n-input__input-el,
-  .result-row__body strong,
-  .audio-tool-header h2,
-  .audio-tool-card--side > h3
-) {
-  color: color-mix(in srgb, var(--on-surface-muted) 84%, var(--on-surface)) !important;
 }
 
 .page-header-compact h1,
@@ -141,28 +122,24 @@ a { color: inherit; text-decoration: none; }
     linear-gradient(115deg, color-mix(in srgb, var(--surface-2) 16%, transparent), transparent 42%);
 }
 
-/* A restrained ambient wash separates the canvas from elevated work surfaces. */
+.dark-theme .app-shell { background: var(--surface); }
+
 .dark-theme .app-backdrop {
-  background:
-    radial-gradient(ellipse 70% 48% at 76% -14%, color-mix(in srgb, var(--primary-glow) 48%, transparent), transparent 66%),
-    radial-gradient(ellipse 44% 34% at 9% 2%, rgba(255, 255, 255, 0.035), transparent 68%),
-    linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 18%, transparent), transparent 46%);
+  background: none;
 }
 
-/* Dark chrome stays translucent enough to inherit the canvas light while remaining distinct. */
 .dark-theme .title-bar {
-  border-bottom-color: color-mix(in srgb, var(--outline-strong) 62%, transparent);
-  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
-  box-shadow: 0 8px 28px rgba(3, 5, 12, 0.16);
-  backdrop-filter: blur(24px) saturate(1.12);
+  border-bottom-color: var(--outline);
+  background: var(--surface-1);
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .dark-theme .side-nav {
-  border-right-color: color-mix(in srgb, var(--outline-strong) 56%, transparent);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 94%, transparent), color-mix(in srgb, var(--surface) 94%, transparent));
-  box-shadow: 10px 0 34px rgba(3, 5, 12, 0.12);
-  backdrop-filter: blur(24px) saturate(1.08);
+  border-right-color: var(--outline);
+  background: var(--surface);
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .app-body {
@@ -214,6 +191,44 @@ a { color: inherit; text-decoration: none; }
 .app-content::-webkit-scrollbar-thumb {
   background: var(--surface-3);
   border-radius: 999px;
+}
+
+.console-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #73839c transparent;
+}
+
+@supports selector(::-webkit-scrollbar) {
+  .console-scrollbar {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
+}
+
+.console-scrollbar::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+.console-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.console-scrollbar::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgb(148 163 184 / 45%) padding-box;
+}
+
+.console-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgb(148 163 184 / 65%) padding-box;
+}
+
+.console-scrollbar::-webkit-scrollbar-button,
+.console-scrollbar::-webkit-scrollbar-corner {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 /* ===== Title Bar ===== */
@@ -425,10 +440,8 @@ a { color: inherit; text-decoration: none; }
 }
 
 .dark-theme .nav-item.active {
-  box-shadow:
-    inset 0 0 0 1px color-mix(in srgb, var(--primary-border) 68%, transparent),
-    inset 0 1px 0 rgba(255,255,255,0.06),
-    0 10px 24px rgba(3, 5, 12, 0.18);
+  background: var(--primary-softer);
+  box-shadow: inset 0 0 0 1px var(--primary-border);
   transform: none;
 }
 
@@ -479,6 +492,11 @@ a { color: inherit; text-decoration: none; }
   --page-max-width: 1800px;
   /* Forms and descriptions, where a long line is harder to read rather than more informative. */
   --page-max-width-reading: 1180px;
+  --modal-gutter: clamp(16px, 3vmin, 32px);
+  --modal-max-height: min(84dvh, 840px);
+  --modal-width-sm: min(calc(100vw - 2 * var(--modal-gutter)), clamp(480px, 44vw, 600px));
+  --modal-width-md: min(calc(100vw - 2 * var(--modal-gutter)), clamp(560px, 52vw, 720px));
+  --modal-width-lg: min(calc(100vw - 2 * var(--modal-gutter)), clamp(720px, 72vw, 1040px));
 }
 
 .page {
@@ -524,14 +542,51 @@ a { color: inherit; text-decoration: none; }
 }
 
 /* ===== Naive UI Overrides ===== */
+.n-card.n-modal {
+  max-width: calc(100vw - 2 * var(--modal-gutter));
+  max-height: var(--modal-max-height);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.n-card.n-modal > .n-card-header,
+.n-card.n-modal > .n-card__footer,
+.n-card.n-modal > .n-card__action {
+  flex: 0 0 auto;
+}
+
+.n-card.n-modal > .n-card-content,
+.n-card.n-modal > .n-card__content {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.n-card.n-modal > .n-card-content:has(> .log-console:only-child),
+.n-card.n-modal > .n-card__content:has(> .log-console:only-child) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.n-card.n-modal > .n-card-content > .log-console:only-child,
+.n-card.n-modal > .n-card__content > .log-console:only-child {
+  min-height: 0;
+}
+
+.n-dialog.n-modal {
+  max-width: calc(100vw - 2 * var(--modal-gutter));
+  max-height: var(--modal-max-height);
+  overflow-y: auto;
+}
+
 .dark-theme .n-card {
   --n-border: 1px solid var(--outline);
   --n-color: var(--surface-1);
   --n-color-embedded: var(--surface-1);
   --n-text-color: var(--on-surface);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.025),
-    0 14px 40px rgba(3, 5, 12, 0.14);
+  box-shadow: none;
 }
 .light-theme .n-card {
   --n-border: 1px solid var(--outline);
@@ -555,9 +610,7 @@ a { color: inherit; text-decoration: none; }
 
 .dark-theme .app-shell:not(.app-shell--editor) .n-card:hover {
   border-color: var(--outline-strong);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.035),
-    0 18px 46px rgba(3, 5, 12, 0.2);
+  box-shadow: none;
 }
 
 .n-button {

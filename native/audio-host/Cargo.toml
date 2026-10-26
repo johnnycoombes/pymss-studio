@@ -1,0 +1,27 @@
+[package]
+name = "pymss-audio-host"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+soundcraft-vst3-host.workspace = true
+soundcraft-au-host.workspace = true
+pymss-vst2-host.workspace = true
+pymss-aax-probe = { path = "../aax-probe" }
+soundcraft-dsp.workspace = true
+serde.workspace = true
+serde_json = "1"
+base64 = "0.22"
+cpal = "0.18"
+crossbeam-channel = "0.5"
+rtrb = "0.3"
+hound = "3.5"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
+[dev-dependencies]
+tempfile = "3"

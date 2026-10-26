@@ -22,20 +22,30 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Install Inno Setup
-      shell: pwsh
-      run: choco install innosetup --no-progress -y
-    - name: Install Inno Setup Chinese language file
+    - name: Install Inno Setup 7 x64
       shell: pwsh
       run: |
-        $languages = "C:\Program Files (x86)\Inno Setup 6\Languages"
-        New-Item -ItemType Directory -Force -Path $languages | Out-Null
-        Invoke-WebRequest `
-          -Uri "https://raw.githubusercontent.com/kira-96/Inno-Setup-Chinese-Simplified-Translation/master/ChineseSimplified.isl" `
-          -OutFile (Join-Path $languages "ChineseSimplified.isl")
-        if (!(Test-Path (Join-Path $languages "ChineseSimplified.isl"))) {
-          throw "ChineseSimplified.isl was not installed"
+        $innoVersion = "7.1.0"
+        $innoTag = "is-" + $innoVersion.Replace(".", "_")
+        $innoDir = Join-Path $env:RUNNER_TEMP "inno-setup-$innoVersion-x64"
+        $installer = Join-Path $env:RUNNER_TEMP "innosetup-$innoVersion-x64.exe"
+        Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/releases/download/$innoTag/innosetup-$innoVersion-x64.exe" -OutFile $installer
+        $expectedHash = "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f"
+        if ((Get-FileHash -Path $installer -Algorithm SHA256).Hash -ne $expectedHash) {
+          throw "Inno Setup installer SHA256 verification failed"
         }
+        $process = Start-Process -FilePath $installer -ArgumentList @(
+          "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CURRENTUSER", "/DIR=`"$innoDir`""
+        ) -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed with exit code $($process.ExitCode)" }
+        $iscc = Join-Path $innoDir "ISCC.exe"
+        if (!(Test-Path $iscc)) { throw "Inno Setup compiler was not installed" }
+        if (!(Test-Path (Join-Path $innoDir "Languages\ChineseSimplified.isl"))) {
+          throw "Inno Setup bundled Chinese language file was not installed"
+        }
+        & $iscc --version
+        if ($LASTEXITCODE -ne 0) { throw "Inno Setup compiler version check failed" }
+        "PYMSS_ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
     - name: Download staged package
       uses: actions/download-artifact@v4
       with:
@@ -55,7 +65,7 @@ runs:
         try {
           $env:PYMSS_PORTABLE_DIR = $drive
           $env:PYMSS_INSTALLER_OUTPUT = $releaseFull
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\pymss-studio.iss"
+          & $env:PYMSS_ISCC "installer\pymss-studio.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
         } finally {
           subst $drive /D | Out-Null

@@ -4,9 +4,10 @@ import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
 import { ChevronDownOutline, CopyOutline, ExpandOutline } from '@vicons/ionicons5'
 import TaskLogConsole from '@/components/TaskLogConsole.vue'
+import { formatLogRecord, normalizeLogEntries, type LogEntry } from '@/utils/logRecord'
 import { WORKFLOW_NODE_STATUS_KEYS, type WorkflowNodeState } from '@/workflows/workbench'
 
-const props = withDefaults(defineProps<{ nodeId: string; nodeLabel?: string; state?: WorkflowNodeState; logs?: readonly string[]; pending?: boolean; compact?: boolean }>(), { compact: true })
+const props = withDefaults(defineProps<{ nodeId: string; nodeLabel?: string; state?: WorkflowNodeState; logs?: readonly LogEntry[]; pending?: boolean; compact?: boolean }>(), { compact: true })
 const { t } = useI18n()
 const message = useMessage()
 const expanded = ref(false)
@@ -15,7 +16,7 @@ async function copyLogs() {
   if (copying.value || !props.logs?.length) return
   copying.value = true
   try {
-    await navigator.clipboard.writeText(props.logs.join('\n'))
+    await navigator.clipboard.writeText(normalizeLogEntries(props.logs).map(formatLogRecord).join('\n'))
     message.success(t('workbench.logsCopied'))
   } catch {
     message.error(t('workbench.logsCopyFailed'))

@@ -40,6 +40,7 @@ import sys
 
 manifest = json.loads(open(sys.argv[1], encoding="utf-8").read())
 backend = manifest.get("backends", {}).get(sys.argv[2], {})
+backend.update(backend.get("platformOverrides", {}).get(sys.platform, {}))
 kind = sys.argv[3]
 if kind == "bootstrap":
     for requirement in manifest.get("bootstrap", {}).values():
@@ -62,8 +63,17 @@ elif kind == "torch-index-url":
 PY
 }
 
+runtime_python() {
+  if [[ "$OSTYPE" == darwin* ]]; then
+    PYTHONHOME="$RUNTIME_HOME" "$PY" "$@"
+  else
+    env -u PYTHONHOME "$PY" "$@"
+  fi
+}
+
 verify_bootstrap_runtime() {
-  PYTHONHOME="$RUNTIME_HOME" "$PY" - <<'PY'
+  PYTHONDONTWRITEBYTECODE=1 runtime_python - <<'PY'
+import xmlrpc.client
 import requests
 import socks
 from pip._vendor.packaging.requirements import Requirement
@@ -72,6 +82,8 @@ from pip._vendor.packaging.version import Version
 assert Requirement("pymss>=2.1").name == "pymss"
 assert Version("2.1.5") > Version("2.1.4")
 PY
+  # Version queries do not load pip's installation dependencies.
+  PYTHONDONTWRITEBYTECODE=1 runtime_python -m pip install --help > /dev/null
 }
 
 MANIFEST_BOOTSTRAP_REQUIREMENTS=()
@@ -108,55 +120,71 @@ if [[ "$TORCH_INDEX_URL_WAS_SET" != "x" ]]; then
   TORCH_INDEX_URL="$MANIFEST_TORCH_INDEX_URL"
 fi
 
-if [[ "$OSTYPE" == darwin* ]]; then
-  ARCHIVE="cpython-${PBS_PYTHON_VERSION}+${PBS_TAG}-aarch64-apple-darwin-install_only_stripped.tar.gz"
+if [[ "$OSTYPE" == darwin* || "$OSTYPE" == linux* ]]; then
+  if [[ "$OSTYPE" == darwin* ]]; then
+    PBS_TARGET="aarch64-apple-darwin"
+  else
+    if [[ "$(uname -m)" != "x86_64" ]]; then
+      echo "Linux runtime packaging currently requires x86_64" >&2
+      exit 1
+    fi
+    PBS_TARGET="x86_64-unknown-linux-gnu"
+  fi
+  ARCHIVE="cpython-${PBS_PYTHON_VERSION}+${PBS_TAG}-${PBS_TARGET}-install_only_stripped.tar.gz"
   URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_TAG}/${ARCHIVE//+/%2B}"
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "$TMP_DIR"' EXIT
   curl -L --fail --retry 3 --retry-delay 2 -o "$TMP_DIR/pbs.tar.gz" "$URL"
+  if [[ "$OSTYPE" == linux* ]]; then
+    PBS_SHA256="${PBS_SHA256:-191b5188b42886fb8a14968d714571e8f3d1cef92ac7ad4c7e24cc4d0929b194}"
+    printf '%s  %s\n' "$PBS_SHA256" "$TMP_DIR/pbs.tar.gz" | sha256sum --check --status
+  fi
   tar -xzf "$TMP_DIR/pbs.tar.gz" -C "$TMP_DIR"
   mv "$TMP_DIR/python" "$RUNTIME_DIR"
   PY="$RUNTIME_DIR/bin/python3"
   if [[ ! -x "$PY" ]]; then
-    echo "Bundled macOS standalone python executable not found in $RUNTIME_DIR/bin/python3" >&2
+    echo "Standalone Python executable not found in $RUNTIME_DIR/bin/python3" >&2
     exit 1
+  fi
+  if [[ "$OSTYPE" == linux* ]]; then
+    printf 'pbs-%s-%s-%s-%s\n' "$PBS_TAG" "$PBS_PYTHON_VERSION" "$PBS_TARGET" "${PBS_SHA256:0:12}" > "$RUNTIME_DIR/bootstrap-id"
   fi
 else
   "$PYTHON_BIN" -m venv "$RUNTIME_DIR"
   PY="$RUNTIME_DIR/bin/python"
 fi
 
-if [[ "$OSTYPE" == darwin* && -z "$INITIAL_BACKEND" && "$VARIANT" != "mlx" && "$VARIANT" != "mps" ]]; then
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m ensurepip --upgrade
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --upgrade pip setuptools wheel
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir "${MANIFEST_BOOTSTRAP_REQUIREMENTS[@]}"
+if [[ "$VARIANT" == "minimal" || ( "$OSTYPE" == darwin* && -z "$INITIAL_BACKEND" && "$VARIANT" != "mlx" && "$VARIANT" != "mps" ) ]]; then
+  runtime_python -m ensurepip --upgrade
+  runtime_python -m pip install --upgrade pip setuptools wheel
+  runtime_python -m pip install --no-cache-dir "${MANIFEST_BOOTSTRAP_REQUIREMENTS[@]}"
   bash "$(dirname "$0")/prune-python-runtime.sh" "$RUNTIME_DIR" --keep-venv
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip --version
+  runtime_python -m pip --version
   verify_bootstrap_runtime
   exit 0
 fi
 
-PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --upgrade pip setuptools wheel
-PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir "${MANIFEST_BOOTSTRAP_REQUIREMENTS[@]}"
+runtime_python -m pip install --upgrade pip setuptools wheel
+runtime_python -m pip install --no-cache-dir "${MANIFEST_BOOTSTRAP_REQUIREMENTS[@]}"
 
 if [[ -z "$TORCH_INDEX_URL" ]]; then
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir "$TORCH_REQUIREMENT"
+  runtime_python -m pip install --no-cache-dir "$TORCH_REQUIREMENT"
 else
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir "$TORCH_REQUIREMENT" --index-url "$TORCH_INDEX_URL"
+  runtime_python -m pip install --no-cache-dir "$TORCH_REQUIREMENT" --index-url "$TORCH_INDEX_URL"
 fi
-PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir --only-binary=:all: --prefer-binary "${MANIFEST_COMMON_REQUIREMENTS[@]}"
+runtime_python -m pip install --no-cache-dir --only-binary=:all: --prefer-binary "${MANIFEST_COMMON_REQUIREMENTS[@]}"
 if [[ "${#MANIFEST_BACKEND_EXTRAS[@]}" -gt 0 ]]; then
-  PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir "${MANIFEST_BACKEND_EXTRAS[@]}"
+  runtime_python -m pip install --no-cache-dir "${MANIFEST_BACKEND_EXTRAS[@]}"
 fi
-PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip install --no-cache-dir --upgrade "$MANIFEST_PYMSS_REQUIREMENT" "$MANIFEST_PYMSS_CORE_REQUIREMENT"
+runtime_python -m pip install --no-cache-dir --upgrade "$MANIFEST_PYMSS_REQUIREMENT" "$MANIFEST_PYMSS_CORE_REQUIREMENT"
 
 bash "$(dirname "$0")/prune-python-runtime.sh" "$RUNTIME_DIR" --keep-venv
-PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip --version
+runtime_python -m pip --version
 verify_bootstrap_runtime
 
 if [[ "$OSTYPE" == darwin* && "$VARIANT" == "mlx" ]]; then
   mkdir -p "$RUNTIME_ENVS_DIR"
-  PYTHONHOME="$RUNTIME_HOME" "$PY" - "$RUNTIME_ENVS_DIR" "$(dirname "$0")/../python/runtime-manifest.json" <<'PY'
+  runtime_python - "$RUNTIME_ENVS_DIR" "$(dirname "$0")/../python/runtime-manifest.json" <<'PY'
 import json
 import importlib.util
 import platform
@@ -169,7 +197,7 @@ envs = Path(sys.argv[1])
 manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 package_versions = {}
 packages = {}
-for name in (*manifest["common"], "mlx"):
+for name in (*manifest["common"], "torch", "mlx"):
     try:
         package_versions[name] = metadata.version(name)
         packages[name] = True
@@ -201,7 +229,7 @@ state = {
 )
 PY
 fi
-PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RUNTIME_HOME" "$PY" - <<'PY'
+PYTHONDONTWRITEBYTECODE=1 runtime_python - <<'PY'
 import importlib.util
 import pymss, pymss.graph, torch, librosa, av, yaml, tqdm
 print('pymss', getattr(pymss, '__version__', 'unknown'), pymss.__file__)
@@ -210,6 +238,7 @@ print('librosa', librosa.__version__)
 print('av', av.__version__)
 print('mlx', importlib.util.find_spec('mlx') is not None)
 PY
-PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RUNTIME_HOME" "$PY" "$(dirname "$0")/../python/runtime_audio_probe.py"
+PYTHONDONTWRITEBYTECODE=1 runtime_python "$(dirname "$0")/../python/runtime_audio_probe.py" --check-core
 bash "$(dirname "$0")/prune-python-runtime.sh" "$RUNTIME_DIR" --keep-venv
-PYTHONHOME="$RUNTIME_HOME" "$PY" -m pip --version
+runtime_python -m pip --version
+verify_bootstrap_runtime

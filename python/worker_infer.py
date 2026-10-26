@@ -4,10 +4,11 @@ import os
 import re
 import traceback
 from collections import deque
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from worker_audio import _apply_stereo_pan, _equal_power_fade, _read_audio, _resample_audio
@@ -19,7 +20,7 @@ from worker_models import (
     is_user_model_entry,
     model_path_for,
 )
-from worker_protocol import _as_bool, _as_float, _as_int, emit, emit_error
+from worker_protocol import ProtocolLogHandler, _as_bool, _as_float, _as_int, current_log_task_id, emit, emit_error, task_logging
 from worker_inference_constraints import InferenceParameterError, validate_chunk_size
 from worker_paths import normalize_output_dir as _normalize_output_dir
 
@@ -32,39 +33,75 @@ class ModelDownloadError(RuntimeError):
     pass
 
 
-class JsonLogHandler:
-    def __init__(self, task_id: str, node_id_provider: Any = None, level_provider: Any = None):
-        import logging
-        self.task_id = task_id
-        self.level = logging.INFO
-        self.node_id_provider = node_id_provider
-        self.level_provider = level_provider
+class JsonLogHandler(ProtocolLogHandler):
+    def __init__(
+        self,
+        task_id: str,
+        node_id_provider: Any = None,
+        level_provider: Any = None,
+        task_id_provider: Any = None,
+    ) -> None:
+        super().__init__(
+            event_type="task_log",
+            task_id=task_id,
+            task_id_provider=task_id_provider,
+            node_id_provider=node_id_provider,
+            level_provider=level_provider,
+            source="pymss",
+            emitter=lambda *args, **kwargs: emit(*args, **kwargs),
+        )
 
-    @property
-    def level(self) -> int:
-        return self.level_provider() if self.level_provider is not None else self._level
 
-    @level.setter
-    def level(self, value: int) -> None:
-        self._level = value
+@contextmanager
+def separation_logging(
+    task_id: str,
+    *,
+    node_id_provider: Any = None,
+    task_id_provider: Any = None,
+) -> Iterator[Any]:
+    """Use one bridge for individual files, batches and native workflows."""
+    import logging
 
-    def setLevel(self, level: int) -> None:
-        self.level = level
+    try:
+        from pymss import get_separation_logger
+        logger = get_separation_logger()
+    except Exception:
+        yield None
+        return
+    console = getattr(logger, "console_handler", None)
+    handler = JsonLogHandler(
+        task_id,
+        node_id_provider=node_id_provider,
+        task_id_provider=task_id_provider,
+        level_provider=(lambda: console.level) if console is not None else None,
+    )
+    console_handlers = [
+        item for item in getattr(logger, "handlers", [])
+        if isinstance(item, logging.StreamHandler) and not isinstance(item, logging.FileHandler)
+    ]
+    previous_propagate = getattr(logger, "propagate", False)
 
-    def handle(self, record: Any) -> bool:
-        if record.levelno < self.level:
-            return False
-        payload = {"level": record.levelname.lower(), "message": record.getMessage()}
-        node_id = self.node_id_provider() if self.node_id_provider else None
-        if node_id is not None:
-            payload["nodeId"] = str(node_id)
-        if record.exc_info:
-            import logging
-            payload["detail"] = logging.Formatter().formatException(record.exc_info)
-        elif getattr(record, "stack_info", None):
-            payload["detail"] = record.stack_info
-        emit("task_log", payload, task_id=self.task_id)
-        return True
+    def suppress_console(_record: Any) -> bool:
+        return False
+
+    for item in console_handlers:
+        item.addFilter(suppress_console)
+    logger.addHandler(handler)
+    # SDK formatters may mutate the shared LogRecord. Capture its original fields
+    # before any preserved SDK file handler formats it.
+    logger.handlers = [handler, *[item for item in getattr(logger, "handlers", []) if item is not handler]]
+    logger.propagate = False
+    try:
+        yield logger
+    finally:
+        try:
+            logger.removeHandler(handler)
+        except Exception:
+            logger.handlers = [item for item in logger.handlers if item is not handler]
+        handler.close()
+        logger.propagate = previous_propagate
+        for item in console_handlers:
+            item.removeFilter(suppress_console)
 
 
 def _normalize_output_naming(value: Any) -> dict[str, Any]:
@@ -182,6 +219,7 @@ def _studio_separator_type() -> type[Any]:
 
         def __init__(self, *args: Any, output_naming: Any = None, output_model: str = "", **kwargs: Any) -> None:
             from stem_delivery import resolve_ogg_quality
+            from worker_rocm import configure_rocm_runtime
 
             dj_output = bool(kwargs.pop("dj_output", False))
             requested_format = str(kwargs.get("output_format") or "wav").strip().lower() or "wav"
@@ -192,6 +230,7 @@ def _studio_separator_type() -> type[Any]:
             # Keep its writer on float WAV and finish OGG or the DJ residual here.
             if dj_output or requested_format == "ogg":
                 kwargs["output_format"] = "wav"
+            configure_rocm_runtime(kwargs.get("device", "auto"), kwargs.get("device_ids"), kwargs.get("logger"))
             super().__init__(*args, **kwargs)
             self._studio_naming = _normalize_output_naming(output_naming)
             self._studio_dj_output = dj_output
@@ -221,6 +260,14 @@ def _studio_separator_type() -> type[Any]:
                 str(stem).strip().lower(): index
                 for index, stem in enumerate(ordered_stems)
             }
+
+        def separate(self, *args: Any, **kwargs: Any) -> Any:
+            from worker_rocm import run_rocm_inference
+            separate = super().separate
+            return run_rocm_inference(
+                lambda: separate(*args, **kwargs), getattr(self, "device", "auto"),
+                getattr(self, "device_ids", None), getattr(self, "logger", None),
+            )
 
         def _calculate_expected_output_count(self) -> int:
             try:
@@ -903,8 +950,7 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
             "inputIndex": int(item.get("inputIndex") or index + 1),
         })
 
-    logger = None
-    log_handler = None
+    cleanup = ExitStack()
     separator = None
     active_task_id: str | None = None
     terminal_task_ids: set[str] = set()
@@ -947,13 +993,10 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
             task_output = resolve_pymss_output_dir(output_root, [], item["input"], save_as_folder)
             emit("task_started", {"model": payload.get("model"), "input": item["input"], "output": task_output}, task_id=item["taskId"])
             emit("task_stage", {"stage": "validating_input", "message": "Validating input"}, task_id=item["taskId"])
-        try:
-            from pymss import get_separation_logger  # type: ignore
-            logger = get_separation_logger()
-            log_handler = JsonLogHandler(root_task_id)
-            logger.addHandler(log_handler)
-        except Exception:
-            logger = None
+        logger = cleanup.enter_context(separation_logging(
+            root_task_id,
+            task_id_provider=current_log_task_id,
+        ))
         separator = _prepare_separator(
             payload={**payload, "output": output_root, "saveAsFolder": save_as_folder},
             task_id=root_task_id,
@@ -963,24 +1006,25 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
         for item in batch_tasks:
             task_id = item["taskId"]
             active_task_id = task_id
-            emit("task_stage", {"stage": "separating", "message": "Separating"}, task_id=task_id)
-            success_files = separator.process_folder(item["input"], int(item.get("inputIndex") or 1))
-            if Path(item["input"]).name not in {Path(name).name for name in success_files}:
-                emit_error("INFERENCE_FAILED", f"Batch separation did not produce outputs for {Path(item['input']).name}", task_id=task_id)
+            with task_logging(task_id):
+                emit("task_stage", {"stage": "separating", "message": "Separating"}, task_id=task_id)
+                success_files = separator.process_folder(item["input"], int(item.get("inputIndex") or 1))
+                if Path(item["input"]).name not in {Path(name).name for name in success_files}:
+                    emit_error("INFERENCE_FAILED", f"Batch separation did not produce outputs for {Path(item['input']).name}", task_id=task_id)
+                    terminal_task_ids.add(task_id)
+                    failed = True
+                    continue
+                task_output = resolve_pymss_output_dir(output_root, success_files, item["input"], save_as_folder)
+                emit("task_stage", {"stage": "writing_output", "message": "Collecting outputs"}, task_id=task_id)
+                outputs = separator.studio_outputs()
+                emit("task_done", {
+                    "files": [output["path"] for output in outputs],
+                    "outputs": outputs,
+                    "outputDir": str(Path(task_output).resolve()),
+                    "outputRoot": output_root,
+                    "outputFormat": output_format,
+                }, task_id=task_id)
                 terminal_task_ids.add(task_id)
-                failed = True
-                continue
-            task_output = resolve_pymss_output_dir(output_root, success_files, item["input"], save_as_folder)
-            emit("task_stage", {"stage": "writing_output", "message": "Collecting outputs"}, task_id=task_id)
-            outputs = separator.studio_outputs()
-            emit("task_done", {
-                "files": [output["path"] for output in outputs],
-                "outputs": outputs,
-                "outputDir": str(Path(task_output).resolve()),
-                "outputRoot": output_root,
-                "outputFormat": output_format,
-            }, task_id=task_id)
-            terminal_task_ids.add(task_id)
         active_task_id = None
         return 1 if failed else 0
     except Exception as exc:
@@ -989,12 +1033,8 @@ def cmd_infer_batch(payload: dict[str, Any]) -> int:
                 _emit_inference_error(exc, item["taskId"])
         return 1
     finally:
-        if logger is not None and log_handler is not None:
-            try:
-                logger.removeHandler(log_handler)
-            except Exception:
-                pass
         _close_separator(separator)
+        cleanup.close()
 
 
 def cmd_infer(payload: dict[str, Any]) -> int:
@@ -1050,20 +1090,13 @@ def cmd_infer(payload: dict[str, Any]) -> int:
         }, task_id=task_id)
 
     separator = None
-    logger = None
-    log_handler = None
+    cleanup = ExitStack()
     try:
         emit("task_started", {"model": model_name, "input": input_path, "output": task_output}, task_id=task_id)
         emit("task_stage", {"stage": "validating_input", "message": "Validating input"}, task_id=task_id)
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-        try:
-            from pymss import get_separation_logger  # type: ignore
-            logger = get_separation_logger()
-            log_handler = JsonLogHandler(task_id)
-            logger.addHandler(log_handler)
-        except Exception:
-            logger = None
+        logger = cleanup.enter_context(separation_logging(task_id))
 
         separator = _prepare_separator(
             payload={
@@ -1091,9 +1124,5 @@ def cmd_infer(payload: dict[str, Any]) -> int:
     except Exception as exc:
         return _emit_inference_error(exc, task_id)
     finally:
-        if logger is not None and log_handler is not None:
-            try:
-                logger.removeHandler(log_handler)
-            except Exception:
-                pass
         _close_separator(separator)
+        cleanup.close()

@@ -47,3 +47,39 @@ export function createRuntimeQueryQueue(options: RuntimeQueryQueueOptions = {}) 
     return current
   }
 }
+
+/** Reuse read snapshots on page visits; explicit refreshes and mutations stay fresh. */
+export function createRuntimeReadCache<T>(maxAgeMs: number, now = () => Date.now()) {
+  let generation = 0
+  let sequence = 0
+  let snapshot: { value: T; checkedAt: number } | undefined
+  let pending: Promise<T> | undefined
+
+  function invalidate() {
+    generation += 1
+    snapshot = undefined
+    pending = undefined
+  }
+
+  function read(load: () => Promise<T>, fresh = false): Promise<T> {
+    if (!fresh) {
+      if (pending) return pending
+      if (snapshot && now() - snapshot.checkedAt < maxAgeMs) return Promise.resolve(snapshot.value)
+    }
+    const revision = generation
+    const request = ++sequence
+    const result = load().then(value => {
+      if (revision === generation && request === sequence) snapshot = { value, checkedAt: now() }
+      return value
+    }, error => {
+      if (revision === generation && request === sequence) snapshot = undefined
+      throw error
+    }).finally(() => {
+      if (pending === result) pending = undefined
+    })
+    pending = result
+    return result
+  }
+
+  return { read, invalidate }
+}
