@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Pymss Studio VST Lab",
+  "identifier": "studio.pymss.desktop.vstlab",
+  "build": {
+    "devUrl": "http://localhost:1421",
+    "beforeDevCommand": "pnpm dev --port 1421 --strictPort"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Pymss Studio VST Lab",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 980,
+        "minHeight": 680,
+        "decorations": true,
+        "transparent": false,
+        "visible": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": false,
+    "macOS": {
+      "hardenedRuntime": true,
+      "entitlements": "entitlements.vstlab.plist"
+    }
+  }
+}

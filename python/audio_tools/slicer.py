@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from worker_protocol import emit
-from .common import _available_path, _ffmpeg_path, _require_directory, _require_file, _run_ffmpeg
+from .common import _available_path, _ffmpeg_path, _render_output, _require_directory, _require_file, _run_ffmpeg
 from .slicer_core import Slicer
 
 OUTPUT_FORMATS = {"wav", "flac", "mp3"}
@@ -125,7 +125,7 @@ def _slice_audio(payload: dict[str, Any]) -> dict[str, Any]:
             })
             name = f"{input_path.stem}_{index:04d}_{round(start * 1000):08d}-{round(end * 1000):08d}.{output_format}"
             output_path = _available_path(output_dir / name)
-            _render_segment(input_path, output_path, start, end, output_format)
+            output_path = _render_output(output_path, lambda temporary: _render_segment(input_path, temporary, start, end, output_format))
             written += 1
             output_paths.append(str(output_path))
             segments.append({"sourcePath": str(input_path), "outputPath": str(output_path), "start": start, "end": end, "duration": end - start})

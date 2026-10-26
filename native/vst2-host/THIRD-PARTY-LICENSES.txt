@@ -1,0 +1,47 @@
+ABI reference: RustAudio/vst-rs
+https://github.com/RustAudio/vst-rs
+https://github.com/RustAudio/vst-rs/blob/master/LICENSE
+
+The VST2 ABI declarations were checked against the published RustAudio definitions.
+No Steinberg SDK headers or deprecated vst-rs host implementation are bundled.
+
+Linux editor ABI references (protocol facts only; no source copied):
+https://github.com/juce-framework/JUCE/blob/master/modules/juce_audio_processors/format_types/juce_VSTPluginFormat.cpp
+https://github.com/juce-framework/JUCE/blob/master/modules/juce_audio_plugin_client/juce_audio_plugin_client_VST2.cpp
+https://github.com/DISTRHO/DPF/blob/main/distrho/src/DistrhoPluginVST2.cpp
+https://github.com/Ardour/ardour/blob/master/gtk2_ardour/linux_vst_gui_support.cc
+
+The modern JUCE/DPF ABI uses effEditOpen.ptr = numeric X11 Window ID and value = 0.
+Ardour's older shared Display*/_XEventProc extension is outside this host's supported ABI.
+
+Shell/container ABI references (protocol facts only; no source copied):
+https://github.com/RustAudio/vst-rs/blob/master/src/host.rs
+https://github.com/RustAudio/vst-rs/blob/master/src/plugin.rs
+https://github.com/juce-framework/JUCE/blob/master/modules/juce_audio_processors_headless/format_types/juce_VSTPluginFormatHeadless.cpp
+https://github.com/juce-framework/JUCE/blob/master/modules/juce_audio_processors_headless/format_types/juce_VSTPluginFormatImpl.h
+
+effShellGetNextPlugin (70) enumerates child IDs/names, terminating with ID zero.
+audioMasterCurrentId (2) selects the child before VSTPluginMain returns. This host scopes
+that selection to the current instance/native call instead of a process-wide global.
+
+The MIT License (MIT)
+
+Copyright (c) 2015 Marko Mijalkovic
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

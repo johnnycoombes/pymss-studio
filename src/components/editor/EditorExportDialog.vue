@@ -11,6 +11,7 @@ const props = defineProps<{
   exporting: boolean
   exportCancelling: boolean
   exportProgress: number
+  exportProgressIndeterminate?: boolean
   exportProgressText: string
   format: EditorExportFormat
   wavBitDepth: string
@@ -65,8 +66,6 @@ const sampleRateSummary = computed(() => props.sampleRate === 'auto'
   ? t('editor.exportSampleRateStrategyValue')
   : `${props.sampleRate} Hz`)
 
-const peakProtectionRequired = computed(() => props.format !== 'wav' || props.wavBitDepth !== 'FLOAT')
-
 const exportSummaryRows = computed(() => [
   { label: t('editor.totalDuration'), value: props.duration ? `${Math.round(props.duration * 10) / 10}s` : '0s' },
   { label: t('editor.tracks'), value: String(props.trackCount) },
@@ -86,7 +85,7 @@ const exportSummaryRows = computed(() => [
     :mask-closable="!exporting"
     :close-on-esc="!exporting"
     :closable="!exporting"
-    style="width: min(640px, calc(100vw - 32px));"
+    style="width: var(--modal-width-sm)"
     @update:show="(value: boolean) => emit('update:show', value)"
   >
     <div class="export-dialog">
@@ -98,9 +97,11 @@ const exportSummaryRows = computed(() => [
       <div v-if="exporting" class="export-dialog__progress">
         <div class="export-dialog__progress-copy">
           <span>{{ exportProgressText || t('editor.exporting') }}</span>
-          <strong>{{ exportProgress }}%</strong>
+          <strong v-if="!exportProgressIndeterminate">{{ exportProgress }}%</strong>
+          <n-spin v-else :size="14" :aria-label="t('editor.exporting')" />
         </div>
-        <n-progress type="line" :percentage="exportProgress" :show-indicator="false" status="info" />
+        <n-progress v-if="!exportProgressIndeterminate" type="line" :percentage="exportProgress" :show-indicator="false" status="info" />
+        <n-skeleton v-else :height="8" :sharp="false" />
       </div>
 
       <div class="export-dialog__grid">
@@ -152,13 +153,12 @@ const exportSummaryRows = computed(() => [
             </label>
 
             <label class="export-dialog__field export-dialog__field--switch">
-              <span>
+              <span :title="t('editor.exportPeakProtectionHint')">
                 {{ t('editor.exportPeakProtection') }}
-                <small v-if="peakProtectionRequired">{{ t('editor.exportPeakProtectionRequired') }}</small>
               </span>
               <n-switch
-                :value="peakProtectionRequired || peakProtection"
-                :disabled="exporting || peakProtectionRequired"
+                :value="peakProtection"
+                :disabled="exporting"
                 @update:value="(value: boolean) => emit('update:peak-protection', value)"
               />
             </label>
@@ -230,8 +230,6 @@ const exportSummaryRows = computed(() => [
 
 <style scoped>
 .editor-export-modal :deep(.n-card) {
-  width: min(640px, calc(100vw - 32px)) !important;
-  max-width: min(640px, calc(100vw - 32px)) !important;
   background: linear-gradient(180deg, color-mix(in srgb, var(--surface-1) 96%, transparent), var(--surface));
 }
 
@@ -335,7 +333,7 @@ const exportSummaryRows = computed(() => [
 
 .export-summary {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
 }
 
@@ -347,8 +345,8 @@ const exportSummaryRows = computed(() => [
   background: color-mix(in srgb, var(--surface-1) 80%, transparent);
 }
 
-.export-summary__item--wide {
-  grid-column: auto;
+.export-summary__item:nth-child(n + 3) {
+  grid-column: 1 / -1;
 }
 
 .export-summary__item span {

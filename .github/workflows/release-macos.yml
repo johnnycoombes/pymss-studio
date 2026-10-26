@@ -50,6 +50,9 @@ jobs:
           cargo.write_text(text, encoding="utf-8")
           PY
 
+      - name: Resolve latest stable release cores
+        run: python3 scripts/resolve-release-core.py python/runtime-manifest.json
+
       - name: Prepare bootstrap and MLX runtime environment
         working-directory: .
         env:
@@ -65,7 +68,9 @@ jobs:
             otool -L python-runtime/bin/python3
             exit 1
           fi
-          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 -c "import importlib.util, sys, ssl, venv, pip, pymss, pymss_core, torch; assert importlib.util.find_spec('mlx') is not None; assert torch.version.cuda is None; print(sys.prefix); print('bundled MLX runtime ok')"
+          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 -c "import importlib.util, sys, ssl, venv, xmlrpc.client, pip, pymss, pymss_core, torch; assert importlib.util.find_spec('mlx') is not None; assert torch.version.cuda is None; print(sys.prefix); print('bundled MLX runtime ok')"
+          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 -m pip install --help > /dev/null
+          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$PWD/python-runtime" python-runtime/bin/python3 scripts/resolve-release-core.py python/runtime-manifest.json --verify
 
       - name: Install aria2 runtime libraries
         run: brew install --formula zlib expat sqlite c-ares
@@ -109,6 +114,7 @@ jobs:
           PYMSS_BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
           PYMSS_BUILD_REPOSITORY: ${{ github.repository }}
           PYMSS_BUILD_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PYMSS_BUILD_UPDATE_SUPPORTED: 'true'
           PYMSS_BUILD_TARGET: macos-arm64
           PYMSS_BUILD_VARIANT: macos-arm64-mlx
           PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
@@ -125,11 +131,12 @@ jobs:
                       str((root / "src-tauri" / "resources" / "python").resolve()): "python",
                       str((root / "src-tauri" / "resources" / "python-runtime").resolve()): "python-runtime",
                       str((root / "src-tauri" / "resources" / "bin").resolve()): "bin",
+                      str((root / "src-tauri" / "resources" / "plugin-sdk").resolve()): "resources/plugin-sdk",
                   }
               }
           }))
           PY
-          pnpm tauri build --bundles app --config src-tauri/tauri.bundle.resources.json
+          pnpm plugins:build --bundles app --config src-tauri/tauri.bundle.resources.json
 
       - name: Re-sign bundled macOS app after embedding runtime
         run: |
@@ -166,6 +173,8 @@ jobs:
           RESOURCE_ROOT="$RES"
           if [ ! -f "$RESOURCE_ROOT/python-runtime/runtime-envs/active-runtime.json" ]; then RESOURCE_ROOT="$RES/resources"; fi
           test -f "$RES/python/worker.py" || test -f "$RES/resources/python/worker.py"
+          test -s "$RES/resources/plugin-sdk/pymss-sdk.js"
+          test -s "$RES/resources/plugin-sdk/pymss-sdk.css"
           test -d "$RESOURCE_ROOT/python-runtime"
           test -f "$RESOURCE_ROOT/python-runtime/runtime-envs/active-runtime.json"
           test -x "$RES/bin/ffmpeg" || test -x "$RES/resources/bin/ffmpeg"
@@ -236,13 +245,33 @@ jobs:
             otool -L "$PY"
             exit 1
           fi
-          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -c "import importlib.util, sys, ssl, venv, pip, pymss, pymss_core, pymss.graph, torch; assert importlib.util.find_spec('mlx') is not None; assert torch.version.cuda is None; print(sys.prefix); print('bundled MLX runtime ok')"
+          PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -c "import importlib.util, sys, ssl, venv, xmlrpc.client, pip, pymss, pymss_core, pymss.graph, torch; assert importlib.util.find_spec('mlx') is not None; assert torch.version.cuda is None; print(sys.prefix); print('bundled MLX runtime ok')"
+          PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -m pip install --help > /dev/null
+          PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" scripts/resolve-release-core.py "$(dirname "$WORKER")/runtime-manifest.json" --verify
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$PY" -c "from pathlib import Path; import shutil; expected=Path('$BIN'); assert Path(shutil.which('ffmpeg')).resolve().parent == expected.resolve(); assert Path(shutil.which('aria2c')).resolve().parent == expected.resolve(); print('bundled tools ok')"
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" -c "from pathlib import Path; from pymss.model_download import ARIA2C_PATH; assert ARIA2C_PATH and Path(ARIA2C_PATH).resolve() == Path('$BIN/aria2c').resolve(), 'pymss did not select the bundled aria2c'; print('aria2 resolver ok:', ARIA2C_PATH)"
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" "$WORKER" env_info
           PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" "$WORKER" list_models --payload "{}"
-          PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" "$(dirname "$WORKER")/runtime_audio_probe.py"
+          PATH="$ISOLATED_PATH" PYTHONDONTWRITEBYTECODE=1 PYTHONHOME="$RESOURCE_ROOT/python-runtime" "$ENV_PY" "$(dirname "$WORKER")/runtime_audio_probe.py" --check-core
           codesign --verify --deep --strict --verbose=4 "$APP"
+          python3 scripts/verify-native-plugins.py "$APP" --platform macos
+
+      - name: Verify core overlays survive signed bundle replacement and rollback
+        run: |
+          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name 'Pymss Studio.app' | head -n 1)
+          python3 scripts/check-macos-core-update.py "$APP"
+
+      - name: Build managed macOS update archive from final signed app
+        run: |
+          VERSION="${PYMSS_VERSION#v}"
+          APP=$(find src-tauri/target/release/bundle/macos -maxdepth 1 -name 'Pymss Studio.app' | head -n 1)
+          codesign --verify --deep --strict "$APP"
+          python3 scripts/build-macos-update.py "$APP" "release/Pymss-Studio-${VERSION}-macos-arm64-update.app.tar.gz"
+
+      - name: Verify macOS update logic
+        run: |
+          python3 -m unittest discover -s tests/python -t tests -p 'test_macos_update_release.py'
+          cargo test --manifest-path src-tauri/Cargo.toml macos_update
 
       - name: Build DMG with hdiutil
         run: |
@@ -269,4 +298,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Pymss-Studio-${{ env.PYMSS_VERSION }}-macos-${{ matrix.arch }}-mlx
-          path: release/Pymss-Studio-${{ env.PYMSS_VERSION }}-macos-${{ matrix.arch }}-mlx.dmg
+          path: |
+            release/*.dmg
+            release/*-macos-arm64-update.app.tar.gz*

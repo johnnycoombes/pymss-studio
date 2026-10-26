@@ -1,6 +1,9 @@
 import { computed, onBeforeUnmount, ref, watch, type Ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import i18n from '@/i18n'
+import { hasEditorPlugins } from '@/utils/editorPlugins'
+import { pluginHostCapabilities } from '@/utils/pluginHost'
+import type { EditorSession } from '@/types/editor'
 import type { useEditorStore } from '@/stores/editor'
 import { useEditorPlaybackStore } from '@/stores/editorPlayback'
 import { registerWindowCloseGuard } from '@/utils/windowCloseGuards'
@@ -33,6 +36,7 @@ class RecordingStartCancelled extends Error {}
 
 const DEVICE_STORAGE_KEY = 'pymss-editor-recording-device'
 const PCM_FLUSH_BYTES = 32 * 1024
+const MAX_QUEUED_PCM_BYTES = 8 * 1024 * 1024
 
 function bytesToBase64(bytes: Uint8Array) {
   let binary = ''
@@ -86,6 +90,12 @@ export function useEditorRecording(options: RecordingOptions) {
   let allocationPromise: Promise<RecordingHandle> | null = null
   let stopTask: Promise<RecordingResult | null> | null = null
   let cancelTask: Promise<void> | null = null
+  let recordingSession: EditorSession | null = null
+  let nativeRecording = false
+  let previousLoop = false
+  let capturedFrames = 0
+  let ownsRecordingTransport = false
+  let queuedBytes = 0
 
   function message(key: string) {
     return String(i18n.global.t(key))
@@ -153,23 +163,37 @@ export function useEditorRecording(options: RecordingOptions) {
     const payload = mergePendingChunks()
     const projectId = recordingProjectId
     const activeRecordingId = recordingId
+    if (queuedBytes + payload.length > MAX_QUEUED_PCM_BYTES) {
+      failCapture(new Error(message('editor.recordingWriteBacklog')))
+      return
+    }
+    queuedBytes += payload.length
     appendChain = appendChain.then(async () => {
-      if (appendError) return
       try {
+        if (appendError) return
         await invoke('append_editor_recording_chunk', {
           projectId,
           recordingId: activeRecordingId,
           dataBase64: bytesToBase64(payload),
         })
       } catch (cause) {
-        appendError = cause
+        failCapture(cause)
+      } finally {
+        queuedBytes -= payload.length
       }
     })
   }
 
+  function failCapture(cause: unknown) {
+    appendError ||= new Error(recordingFailureMessage(cause))
+    error.value = recordingFailureMessage(appendError)
+    if (state.value === 'recording') void stopRecording()
+  }
+
   function updateRecordingTimer() {
     if (state.value !== 'recording') return
-    elapsed.value = Math.max(0, performance.now() / 1000 - recordingStartedAt)
+    elapsed.value = nativeRecording ? capturedFrames / recordingSampleRate
+      : Math.max(0, performance.now() / 1000 - recordingStartedAt)
     playback.setCurrentTime(startTime.value + elapsed.value)
     followPlayhead?.()
     timerRaf = requestAnimationFrame(updateRecordingTimer)
@@ -213,6 +237,7 @@ export function useEditorRecording(options: RecordingOptions) {
       generation !== lifecycleGeneration
       || state.value !== 'preparing'
       || editor.session?.id !== projectId
+      || editor.session !== recordingSession
     ) {
       throw new RecordingStartCancelled()
     }
@@ -223,6 +248,16 @@ export function useEditorRecording(options: RecordingOptions) {
     if (mediaStream === stream) mediaStream = null
     if (audioContext === context) audioContext = null
     if (context && context.state !== 'closed') void context.close().catch(() => undefined)
+  }
+
+  function releaseRecordingTransport() {
+    if (ownsRecordingTransport && playback.recordingProjectId === recordingProjectId) {
+      playback.setRecordingProjectId(null)
+      playback.setLoop(previousLoop)
+    }
+    ownsRecordingTransport = false
+    nativeRecording = false
+    recordingSession = null
   }
 
   async function startRecording() {
@@ -240,12 +275,25 @@ export function useEditorRecording(options: RecordingOptions) {
     pendingBytes = 0
     const generation = ++lifecycleGeneration
     const projectId = editor.session.id
+    recordingSession = editor.session
+    nativeRecording = hasEditorPlugins(editor.session)
+    previousLoop = playback.loop
+    capturedFrames = 0
+    queuedBytes = 0
+    ownsRecordingTransport = false
     let acquiredStream: MediaStream | null = null
     let acquiredContext: AudioContext | null = null
     let allocatedRecordingId = ''
     recordingProjectId = projectId
     startTime.value = Math.max(0, currentTime.value)
     try {
+      if (nativeRecording) {
+        const capabilities = await pluginHostCapabilities()
+        assertStartCurrent(generation, projectId)
+        if (!capabilities.enabled || capabilities.recording !== true) {
+          throw new Error(message('editor.plugins.recordingBlocked'))
+        }
+      }
       const constraints: MediaTrackConstraints = {
         channelCount: { ideal: 1 },
         echoCancellation: false,
@@ -289,36 +337,59 @@ export function useEditorRecording(options: RecordingOptions) {
       processor.connect(silentGain)
       silentGain.connect(audioContext.destination)
       processor.onaudioprocess = (event) => {
-        if (state.value !== 'recording') return
+        if (state.value !== 'recording' || generation !== lifecycleGeneration || editor.session !== recordingSession) return
         const input = event.inputBuffer.getChannelData(0)
         let sum = 0
         for (let index = 0; index < input.length; index += 1) sum += input[index] * input[index]
         inputLevel.value = Math.min(1, Math.pow(Math.sqrt(sum / Math.max(1, input.length)) * 3.2, 0.72))
         const pcm = floatToPcm16(input)
+        capturedFrames += input.length
         pendingChunks.push(pcm)
         pendingBytes += pcm.length
         if (pendingBytes >= PCM_FLUSH_BYTES) queueFlush()
       }
 
+      if (hasEditorPlugins(editor.session) !== nativeRecording) {
+        throw new Error(message('editor.recordingPlaybackChanged'))
+      }
+      if (nativeRecording) {
+        playback.setRecordingProjectId(projectId)
+        ownsRecordingTransport = true
+        playback.setLoop(false)
+        pausePlayback()
+        const started = await requestPlayback(startTime.value)
+        assertStartCurrent(generation, projectId)
+        if (hasEditorPlugins(editor.session) !== nativeRecording) {
+          throw new Error(message('editor.recordingPlaybackChanged'))
+        }
+        if (!started) throw new Error(playback.error || message('editor.recordingPlaybackFailed'))
+      }
       state.value = 'recording'
       recordingStartedAt = performance.now() / 1000
       elapsed.value = 0
       timerRaf = requestAnimationFrame(updateRecordingTimer)
-      pausePlayback()
-      void requestPlayback(startTime.value)
+      if (!nativeRecording) {
+        pausePlayback()
+        void requestPlayback(startTime.value)
+      }
       return true
     } catch (cause) {
-      allocationPromise = null
+      if (generation === lifecycleGeneration) allocationPromise = null
       const cancelled = cause instanceof RecordingStartCancelled
         || generation !== lifecycleGeneration
         || state.value !== 'preparing'
       if (cancelled) {
         const ownsLifecycle = generation === lifecycleGeneration
+        if (ownsLifecycle) {
+          stopCaptureGraph()
+          if (ownsRecordingTransport) pausePlayback()
+        }
         releasePreparingResources(acquiredStream, acquiredContext)
         await cleanupPartial(projectId, allocatedRecordingId)
-        if (ownsLifecycle) {
+        if (ownsLifecycle && generation === lifecycleGeneration) {
           lifecycleGeneration += 1
           playback.setSuppressedTrackIds([])
+          releaseRecordingTransport()
           state.value = 'idle'
           recordingId = ''
           recordingProjectId = ''
@@ -327,8 +398,11 @@ export function useEditorRecording(options: RecordingOptions) {
         return false
       }
       stopCaptureGraph()
+      if (ownsRecordingTransport) pausePlayback()
       playback.setSuppressedTrackIds([])
+      releaseRecordingTransport()
       await cleanupPartial(projectId, allocatedRecordingId || recordingId)
+      if (generation !== lifecycleGeneration) return false
       error.value = recordingFailureMessage(cause)
       state.value = 'idle'
       recordingId = ''
@@ -353,7 +427,7 @@ export function useEditorRecording(options: RecordingOptions) {
     try {
       if (appendError) throw appendError
       const targetId = targetTrackId.value
-      const targetStillExists = editor.session?.id === projectId
+      const targetStillExists = editor.session === recordingSession && editor.session?.id === projectId
         && editor.session.tracks.some((track) => track.id === targetId)
       if (!targetId || !targetStillExists) throw new Error(message('editor.recordingTargetMissing'))
       const result = await invoke<RecordingResult>('finish_editor_recording', {
@@ -363,7 +437,7 @@ export function useEditorRecording(options: RecordingOptions) {
         channels: 1,
       })
       finalized = true
-      const targetStillCurrent = editor.session?.id === projectId
+      const targetStillCurrent = editor.session === recordingSession && editor.session?.id === projectId
         && editor.session.tracks.some((track) => track.id === targetId)
       if (!targetStillCurrent) throw new Error(message('editor.recordingTargetMissing'))
       await editor.addRecordingClip(targetId, result, startTime.value)
@@ -378,6 +452,7 @@ export function useEditorRecording(options: RecordingOptions) {
       error.value = cause instanceof Error ? cause.message : String(cause)
       return null
     } finally {
+      releaseRecordingTransport()
       state.value = 'idle'
       recordingId = ''
       recordingProjectId = ''
@@ -405,7 +480,7 @@ export function useEditorRecording(options: RecordingOptions) {
     allocationPromise = null
     state.value = 'stopping'
     stopCaptureGraph()
-    pausePlayback()
+    if (!nativeRecording || ownsRecordingTransport) pausePlayback()
     pendingChunks = []
     pendingBytes = 0
     const allocatedHandle = pendingAllocation
@@ -413,6 +488,7 @@ export function useEditorRecording(options: RecordingOptions) {
       : null
     await appendChain
     playback.setSuppressedTrackIds([])
+    releaseRecordingTransport()
     await cleanupPartial(projectId, activeRecordingId)
     if (allocatedHandle?.recordingId && allocatedHandle.recordingId !== activeRecordingId) {
       await cleanupPartial(projectId, allocatedHandle.recordingId)
@@ -462,10 +538,10 @@ export function useEditorRecording(options: RecordingOptions) {
     await settleRecording(true)
   }, 100)
 
-  watch(() => editor.session?.id || '', (nextProjectId, previousProjectId) => {
+  watch(() => editor.session, (nextProject, previousProject) => {
     if (
-      previousProjectId
-      && nextProjectId !== previousProjectId
+      previousProject
+      && nextProject !== previousProject
       && (state.value === 'recording' || state.value === 'preparing')
     ) {
       void cancelRecording()

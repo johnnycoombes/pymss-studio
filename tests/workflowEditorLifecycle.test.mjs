@@ -459,7 +459,7 @@ test('a failed close refresh preserves the list and details and does not report 
   assert.equal(page.state.editingId, 'original')
   assert.equal(page.state.name, 'original')
   assert.deepEqual(env.writes, [])
-  assert.equal(warnings.mock.calls.some(call => call.arguments.includes(failure)), true)
+  assert.equal(warnings.mock.calls.some(call => call.arguments.some(value => String(value).includes(failure.message))), true)
 })
 
 test('closing an existing editor refreshes metadata without changing saved definitions or timestamps', async () => {

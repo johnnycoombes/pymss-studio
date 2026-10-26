@@ -242,7 +242,7 @@ function hasSectionContent(type: 'local' | 'external') {
 
       <div v-if="!hasSectionContent('local') && !hasSectionContent('external')" class="editor-assets__empty">
         <strong>{{ search.trim() ? t('editor.assetSearchEmptyTitle') : t('editor.importEmpty') }}</strong>
-        <span>{{ search.trim() ? t('editor.assetSearchEmptyHint') : t('editor.emptyTimelineHint') }}</span>
+        <span>{{ search.trim() ? t('editor.assetSearchEmptyHint') : t('editor.assetEmptyHint') }}</span>
       </div>
     </div>
 

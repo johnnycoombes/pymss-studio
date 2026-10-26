@@ -4,7 +4,8 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from worker_infer import JsonLogHandler
+from worker_infer import separation_logging
+from worker_protocol import current_log_task_id, task_logging
 
 
 class WorkflowLogScope:
@@ -36,33 +37,15 @@ class WorkflowLogScope:
 
 
 @contextmanager
-def workflow_logging(task_id: str) -> Iterator[WorkflowLogScope]:
+def workflow_logging(task_id: str, *, batch: bool = False) -> Iterator[WorkflowLogScope]:
     scope = WorkflowLogScope()
-    try:
-        from pymss import get_separation_logger
-    except ImportError:
-        yield scope
-        return
-    logger = get_separation_logger()
-    scope.logger = logger
-    console = getattr(logger, "console_handler", None)
-    handler = JsonLogHandler(
+    with task_logging(task_id), separation_logging(
         task_id,
         node_id_provider=scope.current_node_id,
-        level_provider=(lambda: console.level) if console is not None else None,
-    )
-    # These records are forwarded through the JSON protocol. Keep file handlers
-    # intact and prevent a second, asynchronously attributed stderr copy.
-    def suppress_console(_record: Any) -> bool:
-        return False
-
-    logger.addHandler(handler)
-    if console is not None:
-        console.addFilter(suppress_console)
-    try:
-        yield scope
-    finally:
-        scope.local.node_id = None
-        logger.removeHandler(handler)
-        if console is not None:
-            console.removeFilter(suppress_console)
+        task_id_provider=lambda: current_log_task_id() or (None if batch else task_id),
+    ) as logger:
+        scope.logger = logger
+        try:
+            yield scope
+        finally:
+            scope.local.node_id = None

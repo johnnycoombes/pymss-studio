@@ -1,6 +1,7 @@
 import builtins
 import copy
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -181,6 +182,22 @@ class RuntimeProbeReuseTests(unittest.TestCase):
                 path.is_symlink.return_value = True
             self.assertIs(worker_bootstrap._make_posix_venv_relocatable(env), False)
             replace.assert_not_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable symlink fixture")
+    def test_posix_link_repair_resolves_an_aliased_environment_parent(self):
+        actual = self.root / "real" / "deep" / "actual"
+        actual.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        environment = alias / "environments" / "cpu"
+        (environment / "bin").mkdir(parents=True)
+        bootstrap = self.root / "bootstrap" / "bin" / "python3"
+        bootstrap.parent.mkdir(parents=True)
+        bootstrap.write_bytes(b"interpreter")
+        with mock.patch.object(worker_bootstrap, "_bootstrap_python_path", return_value=bootstrap):
+            self.assertTrue(worker_bootstrap._make_posix_venv_relocatable(environment))
+            self.assertEqual((environment / "bin" / "python").resolve(strict=True), bootstrap.resolve())
+            self.assertFalse(worker_bootstrap._make_posix_venv_relocatable(environment))
 
     def test_version_reuse_requires_matching_paths_and_both_core_keys(self):
         self.probe.return_value["packageVersions"].pop("pymss-core")

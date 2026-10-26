@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -73,7 +74,8 @@ def _write_sidecar(models: dict[str, Any]) -> None:
 
 
 def sidecar_entry(name: str) -> dict[str, Any]:
-    return _read_sidecar().get(str(name), {})
+    entry = _read_sidecar().get(str(name), {})
+    return entry if isinstance(entry, dict) else {}
 
 
 def _remember_import(name: str, import_mode: str, managed_dir: Path | None) -> None:
@@ -329,6 +331,27 @@ def managed_root(model_dir: str | None = None) -> Path:
     return root / "custom"
 
 
+def safe_model_name(name: str) -> bool:
+    return bool(name) and name not in {".", ".."} and not (
+        any(ch.isspace() or ord(ch) < 32 or ch in '/\\<>:"|?*' for ch in name)
+        or name.endswith('.')
+        or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", name, re.IGNORECASE)
+    )
+
+
+def _managed_dir_for_name(model_dir: str | None, name: str) -> Path:
+    if not safe_model_name(name):
+        raise ValueError("Model name must be a valid directory name without paths or reserved characters")
+    root = managed_root(model_dir).parent.resolve() / "custom"
+    target = root / name
+    for path in (root, target):
+        if path.is_symlink() or getattr(path, 'is_junction', lambda: False)():
+            raise ValueError("Managed model directories must not be symbolic links or junctions")
+        if path.exists() and not path.is_dir():
+            raise ValueError("The managed model path is not a directory")
+    return target
+
+
 def _copy_with_progress(source: Path, target: Path, task_id: str | None, label: str) -> None:
     """Copy one file, reporting progress.
 
@@ -399,13 +422,10 @@ def _replace_managed_dir(staging_dir: Path, managed_dir: Path) -> Path | None:
 
 
 def _restore_managed_dir(managed_dir: Path, backup_dir: Path | None) -> None:
-    try:
-        if managed_dir.exists():
-            shutil.rmtree(managed_dir, ignore_errors=True)
-        if backup_dir is not None and backup_dir.exists():
-            backup_dir.replace(managed_dir)
-    except Exception:
-        pass
+    if managed_dir.exists():
+        shutil.rmtree(managed_dir)
+    if backup_dir is not None:
+        backup_dir.replace(managed_dir)
 
 
 def _verify_model_loads(model_type: str, model_path: Path, config_path: Path | None, task_id: str | None) -> None:
@@ -464,6 +484,8 @@ def cmd_import_custom_model(payload: dict[str, Any]) -> int:
         return emit_error("CUSTOM_MODEL_INVALID", "Missing model name", task_id=task_id)
     if any(ch.isspace() for ch in name):
         return emit_error("CUSTOM_MODEL_INVALID", f"Model name must not contain whitespace: {name!r}", task_id=task_id)
+    if not safe_model_name(name):
+        return emit_error("CUSTOM_MODEL_INVALID", "Model name must not contain paths or reserved characters", task_id=task_id)
     if not model_type:
         return emit_error("CUSTOM_MODEL_INVALID", "Missing model type", task_id=task_id)
     if not model_path_value:
@@ -489,7 +511,7 @@ def cmd_import_custom_model(payload: dict[str, Any]) -> int:
     config_path = source_config
     try:
         if import_mode == "copy":
-            managed_dir = managed_root(str(payload.get("modelDir") or "").strip() or None) / name
+            managed_dir = _managed_dir_for_name(str(payload.get("modelDir") or "").strip() or None, name)
             staging_dir = _unique_sibling_dir(managed_dir, ".importing")
             model_path = staging_dir / source_model.name
             _copy_with_progress(source_model, model_path, task_id, source_model.name)
@@ -531,11 +553,18 @@ def cmd_import_custom_model(payload: dict[str, Any]) -> int:
                 force=force,
                 require_exists=True,
             )
-        except Exception:
+        except Exception as registration_error:
             if managed_dir is not None:
-                _restore_managed_dir(managed_dir, backup_dir)
+                try:
+                    _restore_managed_dir(managed_dir, backup_dir)
+                except Exception as restore_error:
+                    recovery = f" Previous model files are preserved at {backup_dir}." if backup_dir is not None and backup_dir.exists() else ""
+                    raise RuntimeError(
+                        f"Model registration failed: {registration_error}. "
+                        f"Unable to restore the model directory: {restore_error}.{recovery}"
+                    ) from restore_error
             raise
-        finally:
+        else:
             if backup_dir is not None:
                 shutil.rmtree(backup_dir, ignore_errors=True)
 
@@ -566,7 +595,15 @@ def cmd_unregister_custom_model(payload: dict[str, Any]) -> int:
     managed_dir_value = meta.get("managedDir")
     # Only a directory this app created may be deleted. A referenced model's weights are the
     # user's own file, frequently outside the app, and deleting it would be unrecoverable.
-    is_managed = str(meta.get("importMode") or "") == "copy" and bool(managed_dir_value)
+    managed_dir = None
+    if str(meta.get("importMode") or "") == "copy" and managed_dir_value:
+        try:
+            expected = _managed_dir_for_name(str(payload.get("modelDir") or "").strip() or None, name)
+            if Path(str(managed_dir_value)).expanduser().resolve() == expected:
+                managed_dir = expected
+        except (ValueError, OSError, RuntimeError):
+            pass
+    is_managed = managed_dir is not None
 
     try:
         from pymss.model_registry import unregister_model  # type: ignore
@@ -579,7 +616,6 @@ def cmd_unregister_custom_model(payload: dict[str, Any]) -> int:
     deleted: list[str] = []
     errors: list[str] = []
     if delete_files and is_managed:
-        managed_dir = Path(str(managed_dir_value))
         try:
             if managed_dir.is_dir():
                 shutil.rmtree(managed_dir)

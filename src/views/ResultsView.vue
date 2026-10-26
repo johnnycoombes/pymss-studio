@@ -151,10 +151,6 @@ async function openInEditor(item: SeparationTask) {
 }
 
 // 删除结果时回收当前结果对应的输出文件；分层输出的结果目录仅在已空时清理。
-function trashTargets(item: SeparationTask) {
-  return task.resultTrashTargets(item)
-}
-
 function trashEmptyDirs(item: SeparationTask) {
   return task.resultTrashEmptyDirs(item)
 }
@@ -275,12 +271,7 @@ function handleCleanupOrphanedEditorProjects() {
 }
 
 function trashTargetsForItems(items: SeparationTask[]) {
-  const seen = new Set<string>()
-  return items.flatMap((item) => trashTargets(item)).filter((path) => {
-    if (seen.has(path)) return false
-    seen.add(path)
-    return true
-  })
+  return task.resultTrashTargetsForTasks(items)
 }
 
 function trashEmptyDirsForItems(items: SeparationTask[]) {
@@ -348,10 +339,11 @@ function handleRemoveResult(group: ResultGroup) {
       }
       if (!await ensureLinkedEditorProjectsClosed(items)) return false
 
-      const targets = trashTargetsForItems(items)
+      const { paths: targets, retained } = trashTargetsForItems(items)
       if (!targets.length) {
         if (!await finishRemove()) return false
-        message.warning(t('results.removeNoFilesSingle'))
+        if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+        else message.warning(t('results.removeNoFilesSingle'))
         return
       }
 
@@ -359,7 +351,8 @@ function handleRemoveResult(group: ResultGroup) {
         const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(items))
         if (!result.failed.length) {
           if (!await finishRemove()) return false
-          message.success(t('results.removeFilesSuccessSingle'))
+          if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+          else message.success(t('results.removeFilesSuccessSingle'))
           return
         }
 
@@ -372,7 +365,7 @@ function handleRemoveResult(group: ResultGroup) {
         if (result.failed.length === targets.length) {
           message.warning(t('results.removeFilesAllFailedListOnly'))
         } else {
-          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length }))
+          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length + retained }))
         }
       } catch (error) {
         const removeListOnly = await confirmRemoveListOnly(targets.length, targets.length, 'single')
@@ -424,10 +417,11 @@ function handleRemoveSelected() {
       }
       if (!await ensureLinkedEditorProjectsClosed(items)) return false
 
-      const targets = trashTargetsForItems(items)
+      const { paths: targets, retained } = trashTargetsForItems(items)
       if (!targets.length) {
         if (!await finishRemove(true)) return false
-        message.warning(t('results.removeNoFilesMultiple'))
+        if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+        else message.warning(t('results.removeNoFilesMultiple'))
         return
       }
 
@@ -435,7 +429,8 @@ function handleRemoveSelected() {
         const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(items))
         if (!result.failed.length) {
           if (!await finishRemove(true)) return false
-          message.success(t('results.removeFilesSuccessMultiple'))
+          if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+          else message.success(t('results.removeFilesSuccessMultiple'))
           return
         }
 
@@ -448,7 +443,7 @@ function handleRemoveSelected() {
         if (result.failed.length === targets.length) {
           message.warning(t('results.removeFilesAllFailedListOnly'))
         } else {
-          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length }))
+          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length + retained }))
         }
       } catch (error) {
         const removeListOnly = await confirmRemoveListOnly(targets.length, targets.length, 'multiple')
@@ -498,10 +493,11 @@ function handleClearResults() {
       }
       if (!await ensureLinkedEditorProjectsClosed(items)) return false
 
-      const targets = trashTargetsForItems(items)
+      const { paths: targets, retained } = trashTargetsForItems(items)
       if (!targets.length) {
         if (!await finishClear(true)) return false
-        message.warning(t('results.removeNoFilesMultiple'))
+        if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+        else message.warning(t('results.removeNoFilesMultiple'))
         return
       }
 
@@ -509,7 +505,8 @@ function handleClearResults() {
         const result = await task.trashResultPaths(targets, trashEmptyDirsForItems(items))
         if (!result.failed.length) {
           if (!await finishClear(true)) return false
-          message.success(t('results.removeFilesSuccessMultiple'))
+          if (retained) message.success(t('results.removeFilesRetained', { count: retained }))
+          else message.success(t('results.removeFilesSuccessMultiple'))
           return
         }
 
@@ -522,7 +519,7 @@ function handleClearResults() {
         if (result.failed.length === targets.length) {
           message.warning(t('results.removeFilesAllFailedListOnly'))
         } else {
-          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length }))
+          message.warning(t('results.removeFilesPartialListOnly', { count: result.failed.length + retained }))
         }
       } catch (error) {
         const removeListOnly = await confirmRemoveListOnly(targets.length, targets.length, 'multiple')
@@ -645,6 +642,15 @@ function ensureExpanded(id: string) {
 function shortenPath(value: string) {
   if (value.length <= 92) return value
   return `${value.slice(0, 34)}…${value.slice(-44)}`
+}
+
+async function copyNodeValue(value: string) {
+  try {
+    await navigator.clipboard.writeText(value)
+    message.success(t('common.copied'))
+  } catch {
+    message.error(t('common.copyFailed'))
+  }
 }
 
 function outputFileName(value: string) {
@@ -792,13 +798,13 @@ function formatDurationMs(value: number | undefined) {
       <span class="results-toolbar__count">{{ filteredResults.length }} / {{ resultGroups.length }}</span>
     </div>
 
-    <div v-if="!task.resultTasks.length" class="results-empty">
+    <div v-if="!task.resultTasks.length" class="results-empty" data-guide="results-empty">
       <n-icon :component="FolderOutline" size="46" />
       <strong>{{ t('results.empty') }}</strong>
       <span>{{ t('results.emptyHint') }}</span>
     </div>
 
-    <div v-else-if="!filteredResults.length" class="results-empty">
+    <div v-else-if="!filteredResults.length" class="results-empty" data-guide="results-empty">
       <n-icon :component="SearchOutline" size="42" />
       <strong>{{ t('results.noMatchTitle') }}</strong>
       <span>{{ t('results.noMatchHint') }}</span>
@@ -809,7 +815,7 @@ function formatDurationMs(value: number | undefined) {
         v-for="item in pagedResults"
         :id="resultCardId(item)"
         :key="item.id"
-        class="result-row"
+        class="result-row" data-guide="result-item"
         :class="{ 'result-row--selected': selectedResultSet.has(item.id) }"
       >
         <button
@@ -857,7 +863,7 @@ function formatDurationMs(value: number | undefined) {
           </span>
         </button>
 
-        <div v-if="!selecting" class="result-row__actions">
+        <div v-if="!selecting" class="result-row__actions" data-guide="result-actions">
           <n-button v-if="item.inputCount === 1" size="small" type="primary" @click.stop="openInEditor(item.primary)">
             <template #icon><n-icon :component="ColorWandOutline" /></template>
             {{ t('results.openInEditor') }}
@@ -899,6 +905,20 @@ function formatDurationMs(value: number | undefined) {
                 <div v-for="output in result.outputs" :key="output.path" class="stem-line" :title="output.path">
                   <span class="stem-line__stem">{{ output.stem }}</span>
                   <span class="stem-line__path">{{ outputFileName(output.path) }}</span>
+                </div>
+              </div>
+              <div v-if="result.nodeValues?.length" class="result-detail-card__node-values">
+                <div class="node-value-line__header">{{ t('results.nodeValues') }}</div>
+                <div
+                  v-for="(entry, index) in result.nodeValues"
+                  :key="`${entry.nodeId}-${entry.slot}-${index}`"
+                  class="node-value-line"
+                >
+                  <span class="node-value-line__label">{{ entry.nodeType }}</span>
+                  <span class="node-value-line__value">{{ entry.value }}</span>
+                  <n-button size="tiny" tertiary @click.stop="copyNodeValue(entry.value)">
+                    {{ t('common.copy') }}
+                  </n-button>
                 </div>
               </div>
             </section>
@@ -1235,6 +1255,30 @@ function formatDurationMs(value: number | undefined) {
   white-space: nowrap;
   color: var(--primary-strong);
   font-weight: 700;
+}
+
+.node-value-line__header {
+  color: var(--text-muted, #969eae);
+  font-size: 12px;
+  margin: 4px 0 2px;
+}
+
+.node-value-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 13px;
+}
+
+.node-value-line__label {
+  color: var(--text-muted, #969eae);
+  min-width: 120px;
+}
+
+.node-value-line__value {
+  flex: 1;
+  word-break: break-all;
 }
 
 .stem-line__path {

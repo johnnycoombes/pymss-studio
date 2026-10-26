@@ -1,6 +1,7 @@
 import io
 import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -16,6 +17,13 @@ import worker_custom_models as ccm
 
 # mock.patch.dict needs the mapping object itself; the module reads os.environ directly.
 os_environ_target = ccm.os.environ
+
+
+def link_directory(link: Path, target: Path) -> None:
+    if ccm.os.name == 'nt':
+        subprocess.run(['cmd.exe', '/c', 'mklink', '/J', str(link), str(target)], check=True, capture_output=True)
+    else:
+        link.symlink_to(target, target_is_directory=True)
 
 
 class FakeRegisteredEntry:
@@ -356,7 +364,7 @@ class ImportPipelineTests(unittest.TestCase):
     def test_copy_import_places_files_under_app_management(self):
         code, events, _ = self._run(self._base_payload(importMode="copy"))
         self.assertEqual(code, 0)
-        managed = self.models_dir / "custom" / "my_model"
+        managed = (self.models_dir / "custom" / "my_model").resolve()
         self.assertTrue((managed / "my_model.ckpt").is_file())
         self.assertTrue((managed / "my_model.yaml").is_file())
         self.assertEqual(self.registered[0]["model_path"], str(managed / "my_model.ckpt"))
@@ -451,6 +459,56 @@ class ImportPipelineTests(unittest.TestCase):
         self.assertEqual(events[-1]["payload"]["code"], "CUSTOM_MODEL_IMPORT_FAILED")
         self.assertEqual(old_weights.read_bytes(), b"old")
 
+    def test_failed_registration_keeps_backup_when_new_files_cannot_be_removed(self):
+        managed = (self.models_dir / "custom" / "my_model").resolve()
+        managed.mkdir(parents=True)
+        (managed / "my_model.ckpt").write_bytes(b"old")
+        original_rmtree = shutil.rmtree
+
+        def remove_tree(path, *args, **kwargs):
+            if Path(path) == managed:
+                raise PermissionError("model file is in use")
+            return original_rmtree(path, *args, **kwargs)
+
+        with mock.patch.object(ccm.shutil, "rmtree", side_effect=remove_tree):
+            code, events, _ = self._run(
+                self._base_payload(importMode="copy", force=True),
+                register_error=ValueError("name conflict"),
+            )
+
+        self.assertEqual(code, 1)
+        backups = list(managed.parent.glob(".my_model.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "my_model.ckpt").read_bytes(), b"old")
+        message = events[-1]["payload"]["message"]
+        self.assertIn(str(backups[0]), message)
+        self.assertIn("name conflict", message)
+        self.assertIn("model file is in use", message)
+
+    def test_failed_registration_keeps_backup_when_restoring_it_fails(self):
+        managed = (self.models_dir / "custom" / "my_model").resolve()
+        managed.mkdir(parents=True)
+        (managed / "my_model.ckpt").write_bytes(b"old")
+        original_replace = Path.replace
+
+        def replace(path, target):
+            if path.name.startswith(".my_model.backup-"):
+                raise PermissionError("restore denied")
+            return original_replace(path, target)
+
+        with mock.patch.object(Path, "replace", replace):
+            code, events, _ = self._run(
+                self._base_payload(importMode="copy", force=True),
+                register_error=ValueError("name conflict"),
+            )
+
+        self.assertEqual(code, 1)
+        backups = list(managed.parent.glob(".my_model.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual((backups[0] / "my_model.ckpt").read_bytes(), b"old")
+        self.assertIn(str(backups[0]), events[-1]["payload"]["message"])
+        self.assertIn("restore denied", events[-1]["payload"]["message"])
+
     def test_verification_runs_before_registration(self):
         # Ordering is the whole guarantee; assert it rather than trusting the call sites.
         order = []
@@ -496,6 +554,48 @@ class ImportPipelineTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(events[-1]["payload"]["code"], "CUSTOM_MODEL_FILE_MISSING")
 
+    def test_paths_and_reserved_names_are_rejected_without_changing_existing_files(self):
+        sibling = self.models_dir / 'sibling'
+        sibling.mkdir()
+        marker = sibling / 'keep.bin'
+        marker.write_bytes(b'keep')
+        for name in ['.', '..', '../sibling', str(self.root / 'outside'), r'C:\outside', r'a\b', 'a/b', 'a:b', 'a.', 'CON', 'con.ckpt', 'LPT9', 'a\x00b']:
+            with self.subTest(name=name):
+                code, events, verify = self._run(self._base_payload(name=name, importMode='copy'))
+                self.assertEqual(code, 1)
+                self.assertEqual(events[-1]['payload']['code'], 'CUSTOM_MODEL_INVALID')
+                verify.assert_not_called()
+                self.assertEqual(marker.read_bytes(), b'keep')
+                self.assertFalse((self.models_dir / 'custom').exists())
+        self.assertEqual(self.registered, [])
+
+    def test_managed_directory_link_is_rejected_before_copy(self):
+        target = self.models_dir / 'custom' / 'my_model'
+        target.parent.mkdir()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep.bin'
+        marker.write_bytes(b'keep')
+        try:
+            link_directory(target, outside)
+        except OSError:
+            self.skipTest('Directory symbolic links are unavailable')
+        code, _, verify = self._run(self._base_payload(importMode='copy'))
+        self.assertEqual(code, 1)
+        verify.assert_not_called()
+        self.assertEqual(list(outside.iterdir()), [marker])
+
+    def test_custom_root_link_is_rejected_before_copy(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep.bin'
+        marker.write_bytes(b'keep')
+        link_directory(self.models_dir / 'custom', outside)
+        code, _, verify = self._run(self._base_payload(importMode='copy'))
+        self.assertEqual(code, 1)
+        verify.assert_not_called()
+        self.assertEqual(list(outside.iterdir()), [marker])
+
     def test_the_import_mode_is_remembered_for_later_removal(self):
         self._run(self._base_payload(importMode="copy"))
         with mock.patch.dict(os_environ_target, {"PYMSS_STUDIO_CUSTOM_MODEL_META": str(self.sidecar)}, clear=False):
@@ -522,7 +622,7 @@ class UnregisterTests(unittest.TestCase):
             self.unregistered.append(name)
             return FakeRegisteredEntry(name, "mel_band_roformer", "")
 
-        with mock.patch.dict(os_environ_target, {"PYMSS_STUDIO_CUSTOM_MODEL_META": str(self.sidecar)}, clear=False), \
+        with mock.patch.dict(os_environ_target, {"PYMSS_STUDIO_CUSTOM_MODEL_META": str(self.sidecar), "PYMSS_MODEL_DIR": str(self.root)}, clear=False), \
              mock.patch.dict("sys.modules", {
                  "pymss": mock.Mock(),
                  "pymss.model_registry": mock.Mock(unregister_model=unregister_model),
@@ -597,6 +697,47 @@ class UnregisterTests(unittest.TestCase):
             json.loads(self.stdout.getvalue().strip().splitlines()[-1])["payload"]["code"],
             "CUSTOM_MODEL_INVALID",
         )
+
+    def test_polluted_sidecar_cannot_delete_outside_the_current_managed_root(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep.bin'
+        marker.write_bytes(b'keep')
+        for name in ['my_model', '../outside', str(outside)]:
+            with self.subTest(name=name):
+                self._sidecar({name: {'importMode': 'copy', 'managedDir': str(outside)}})
+                code, payload = self._run({'name': name, 'deleteFiles': True})
+                self.assertEqual(code, 0)
+                self.assertFalse(payload['deletedFiles'])
+                self.assertFalse(payload['fileDeletionSupported'])
+                self.assertEqual(marker.read_bytes(), b'keep')
+
+    def test_deletion_uses_the_requested_model_directory(self):
+        configured = self.root / 'configured'
+        managed = configured / 'custom' / 'my_model'
+        managed.mkdir(parents=True)
+        (managed / 'weights.ckpt').write_bytes(b'copy')
+        self._sidecar({'my_model': {'importMode': 'copy', 'managedDir': str(managed)}})
+        code, payload = self._run({'name': 'my_model', 'modelDir': str(configured), 'deleteFiles': True})
+        self.assertEqual(code, 0)
+        self.assertTrue(payload['deletedFiles'])
+        self.assertFalse(managed.exists())
+
+    def test_linked_managed_directory_is_never_deleted(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        marker = outside / 'keep.bin'
+        marker.write_bytes(b'keep')
+        linked = self.root / 'custom' / 'my_model'
+        linked.parent.mkdir()
+        try:
+            link_directory(linked, outside)
+        except OSError:
+            self.skipTest('Directory symbolic links are unavailable')
+        self._sidecar({'my_model': {'importMode': 'copy', 'managedDir': str(linked)}})
+        _, payload = self._run({'name': 'my_model', 'deleteFiles': True})
+        self.assertFalse(payload['deletedFiles'])
+        self.assertTrue(marker.exists())
 
 
 class RelinkTests(unittest.TestCase):

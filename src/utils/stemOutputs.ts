@@ -1,11 +1,11 @@
 export type StemOutput = { stem: string; path: string; nodeId?: string }
 
-function fileName(path: string) {
-  return String(path || '').split(/[/\\]/).pop() || ''
+function fileName(path: string, windows: boolean) {
+  return String(path || '').split(windows ? /[/\\]/ : /[/]/).pop() || ''
 }
 
 function stripExtension(value: string) {
-  return value.replace(/\.[^/.\\]+$/, '')
+  return value.replace(/\.[^/.]+$/, '')
 }
 
 /**
@@ -15,9 +15,9 @@ function stripExtension(value: string) {
  * include the input basename (for example `song_vocals.wav`). Strip that
  * stable prefix when it is present while preserving custom workflow names.
  */
-export function stemFromOutputPath(path: string, inputPath?: string) {
-  let stem = stripExtension(fileName(path)).trim()
-  const inputStem = stripExtension(fileName(inputPath || '')).trim()
+export function stemFromOutputPath(path: string, inputPath?: string, windows = /^[A-Za-z]:|^\\\\/.test(path) || /^[A-Za-z]:|^\\\\/.test(inputPath || '')) {
+  let stem = stripExtension(fileName(path, windows)).trim()
+  const inputStem = stripExtension(fileName(inputPath || '', windows)).trim()
   const prefix = inputStem ? `${inputStem}_` : ''
   if (prefix && stem.toLowerCase().startsWith(prefix.toLowerCase())) {
     stem = stem.slice(prefix.length).trim()
@@ -30,17 +30,17 @@ export function stemFromOutputPath(path: string, inputPath?: string) {
  * workers returned `{ path, name }` without the `stem` field used by the
  * single-separation result contract.
  */
-export function normalizeStemOutputs(value: unknown, inputPath?: string): StemOutput[] {
+export function normalizeStemOutputs(value: unknown, inputPath?: string, windows?: boolean): StemOutput[] {
   if (!Array.isArray(value)) return []
   return value.flatMap((item) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return []
     const raw = item as Record<string, unknown>
-    const path = String(raw.path || '').trim()
+    const path = String(raw.path || '')
     if (!path) return []
     const explicitStem = String(raw.stem || '').trim()
     const nameHint = String(raw.name || '').trim()
     return [{
-      stem: explicitStem || stemFromOutputPath(nameHint || path, inputPath),
+      stem: explicitStem || stemFromOutputPath(nameHint || path, inputPath, windows ?? (/^[A-Za-z]:|^\\\\/.test(path) || /^[A-Za-z]:|^\\\\/.test(inputPath || ''))),
       path,
       ...(typeof raw.nodeId === 'string' ? { nodeId: raw.nodeId } : {}),
     }]

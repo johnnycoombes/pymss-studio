@@ -10,6 +10,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  runtime-safety:
+    name: Runtime safety (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify runtime plans, activation recovery, and offline package updates
+        run: python -m unittest discover -s tests/python -t tests -p "test_runtime_core_*.py"
+      - name: Verify runtime pruning and preparation probes
+        run: |
+          python -m unittest discover -s tests/python -t tests -p "test_runtime_pruning.py"
+          python -m unittest discover -s tests/python -t tests -p "test_prepare_runtime_probe.py"
+          python -m unittest discover -s tests/python -t tests -p "test_release_core_resolution.py"
+      - name: Verify optional components preserve the fixed runtime
+        run: python -m unittest discover -s tests/python -t tests -p "test_worker_optional_packages.py"
+
+  linux-native:
+    name: Linux native runtime and backend
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config \
+            libasound2-dev libwebkit2gtk-4.1-dev libssl-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify Linux release and environment contracts
+        run: python -m unittest discover -s tests/python -t tests -p 'test_linux_*.py'
+      - name: Check backend and bootstrap relocation
+        run: |
+          cargo check --manifest-path src-tauri/Cargo.toml
+          cargo test --manifest-path src-tauri/Cargo.toml bootstrap_cache
+          cargo test --manifest-path src-tauri/Cargo.toml linux_update
+          cargo test --manifest-path src-tauri/Cargo.toml update_startup
+          cargo test --manifest-path src-tauri/Cargo.toml trusted_digest_is_bound_to_the_same_bytes_as_the_signature
+          cargo test --manifest-path src-tauri/Cargo.toml update_sources
+          cargo test --manifest-path src-tauri/Cargo.toml single_instance
+
+  macos-updater:
+    name: macOS updater
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify archive generation and platform-specific installation
+        run: |
+          python -m unittest discover -s tests/python -t tests -p 'test_macos_update_release.py'
+          cargo test --manifest-path src-tauri/Cargo.toml macos_update
+          cargo test --manifest-path src-tauri/Cargo.toml update_startup
+          cargo test --manifest-path src-tauri/Cargo.toml single_instance
+          cargo test --manifest-path src-tauri/Cargo.toml bundled_bootstrap_uses_user_overlay_without_changing_bundle
+      - name: Verify plugin resources and native protocol paths
+        run: |
+          python -m pip install --disable-pip-version-check --prefer-binary "numpy>=1.26,<3"
+          python -m unittest discover -s tests/python -t tests -p 'test_plugin_sdk_bundle.py'
+          python -m unittest discover -s tests/python -t tests -p 'test_audio_tool_output_safety.py'
+          cargo test --manifest-path src-tauri/Cargo.toml plugin_views
+          cargo test --manifest-path src-tauri/Cargo.toml python::worker
+
   validate:
     runs-on: windows-latest
     timeout-minutes: 30

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
+from pathlib import Path
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -11,6 +14,62 @@ else:
     import _bootstrap as _worker_test_bootstrap  # noqa: F401
 
 import worker_workflows
+
+
+class WorkflowInvocationTests(unittest.TestCase):
+    def run_graph(self, run_dag):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = root / "workflow.json"
+            definition.write_text('{"nodes": []}', encoding="utf-8")
+            graph = types.SimpleNamespace(
+                EXECUTION_EVENT_VERSION=1,
+                load_comfy_file=lambda _: types.SimpleNamespace(nodes=[]),
+                run_dag=run_dag,
+            )
+            with patch.object(worker_workflows, "_workflow_graph", return_value=graph), \
+                 patch.object(worker_workflows, "_write_workflow_file", return_value=(definition, "comfy")), \
+                 patch("worker_plugins.operation_runtime"), \
+                 patch("worker_workflow_logs.workflow_logging", return_value=nullcontext(types.SimpleNamespace(logger=None))):
+                return worker_workflows._run_pymss(
+                    {"workflow": {"nodes": []}}, "invocation", None, None,
+                    str(root / "out"), "flat", separator_cache=object(),
+                )
+
+    def test_legacy_signature_runs_once_without_node_results(self):
+        calls = []
+
+        def legacy(dag, *, output_dir, input_path, inputs, execution_event_callback,
+                   logger, device, model_dir, download, source, output_format,
+                   audio_params, debug, strict, separator_cache):
+            calls.append(dag)
+            return []
+
+        self.run_graph(legacy)
+        self.assertEqual(len(calls), 1)
+
+    def test_native_signature_receives_intermediate_result_collector(self):
+        collectors = []
+
+        def native(dag, *, node_results, **kwargs):
+            collectors.append(node_results)
+            return []
+
+        self.run_graph(native)
+        self.assertEqual(collectors, [{}])
+
+    def test_execution_type_error_is_not_retried(self):
+        effects = []
+        failure = TypeError("node failed after writing output")
+
+        def failing(dag, *, node_results=None, **kwargs):
+            effects.append("output written")
+            raise failure
+
+        with self.assertRaises(TypeError) as caught:
+            self.run_graph(failing)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(effects, ["output written"])
 
 
 class WorkflowProgressTests(unittest.TestCase):

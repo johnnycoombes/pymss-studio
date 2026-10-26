@@ -16,6 +16,7 @@ Contract (payload fields, sent by stores/task.ts via start_workflow_inference):
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -28,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from worker_protocol import emit, emit_error
+from worker_protocol import emit, emit_error, task_logging
 from worker_paths import normalize_output_dir as _normalize_output_dir
 
 
@@ -1173,6 +1174,17 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
                *, separator_cache: Any = None) -> dict[str, Any]:
     graph = _workflow_graph()
 
+    # Activate marketplace plugins so plugin-contributed graph node types are
+    # registered (graph node registry and plugin nodes share one pool). Readers
+    # only take the shared lock for recovery; writers stay unblocked.
+    try:
+        from worker_plugins import operation_runtime
+
+        operation_runtime()
+    except Exception as exc:  # noqa: BLE001 — missing plugins never block built-in graphs
+        import sys
+        print(f"[workflow] plugin nodes unavailable: {exc}", file=sys.stderr)
+
     workbench = payload.get("workbench") is True
     output_targets = _normalize_inputs(payload.get("workbenchOutputs")) if workbench else {}
     if workbench:
@@ -1288,9 +1300,12 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             graph_output_dir = Path(cleanup.enter_context(tempfile.TemporaryDirectory(
                 prefix=".pymss-ensemble-", dir=task_output_dir,
             )))
+        node_results: dict[int, Any] = {}
         from worker_workflow_logs import workflow_logging
 
-        log_scope = cleanup.enter_context(workflow_logging(task_id))
+        log_scope = cleanup.enter_context(workflow_logging(
+            task_id, batch=isinstance(payload.get("tasks"), list) and bool(payload["tasks"]),
+        ))
         if separator_cache is None:
             separator_cache = cleanup.enter_context(graph.SeparatorCache(factory=_workflow_separator_factory))
         # Negotiate the optional kernel protocol once. Published runtimes retain
@@ -1299,11 +1314,18 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             if fmt != "yaml" and getattr(graph, "EXECUTION_EVENT_VERSION", 0) >= 1 \
             else {"progress_event_callback": _emit_progress(task_id, log_scope)}
         reported_format = "ogg" if ogg_plan is not None and ogg_plan.run_wants_ogg else output_format
+        run_kwargs = {}
+        parameters = inspect.signature(graph.run_dag).parameters
+        if "node_results" in parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        ):
+            run_kwargs["node_results"] = node_results
         saved = graph.run_dag(
             dag,
             output_dir=graph_output_dir,
             input_path=input_path,
             inputs=runtime_inputs or None,
+            **run_kwargs,
             **callbacks,
             logger=log_scope.logger,
             device=_resolve_device(payload),
@@ -1366,13 +1388,37 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             item["sampleRate"] = rec.sample_rate
         outputs.append(item)
 
-    return {
+    # Non-output leaf nodes (plugin STRING producers: ASR text, measurements,
+    # MIDI paths) surface as nodeValues so the task result carries their work.
+    node_values: list[dict[str, Any]] = []
+    try:
+        from pymss.graph.core import StringArtifact
+
+        for node in dag.nodes:
+            result = node_results.get(node.id)
+            if result is None or not getattr(result, "outputs", None):
+                continue
+            for slot, artifact in result.outputs.items():
+                if isinstance(artifact, StringArtifact):
+                    node_values.append({
+                        "nodeId": node.id,
+                        "nodeType": str(node.type),
+                        "slot": slot,
+                        "value": str(artifact.value),
+                    })
+    except Exception:
+        pass
+
+    result_payload = {
         "files": saved_paths,
         "outputs": outputs,
         "outputDir": str(Path(saved_paths[0]).parent.resolve()) if workbench and saved_paths else str(task_output_dir.resolve()),
         **({"outputDirectories": sorted({str(Path(path).parent.resolve()) for path in saved_paths})} if workbench else {}),
         "outputFormat": reported_format,
     }
+    if node_values:
+        result_payload["nodeValues"] = node_values
+    return result_payload
 
 
 def cmd_infer_workflow(payload: dict[str, Any]) -> int:
@@ -1460,15 +1506,16 @@ def _cmd_infer_workflow_batch(payload: dict[str, Any], raw_tasks: list[Any]) -> 
             }, task_id=task_id)
             emit("task_stage", {"stage": "validating_input", "message": "Validating workflow input", "progress": 12}, task_id=task_id)
             try:
-                result = _run_pymss({**payload, "taskId": task_id, "inputIndex": item.get("inputIndex", input_index),
-                                    **({"workbenchOutputs": item.get("workbenchOutputs", payload.get("workbenchOutputs"))}
-                                       if payload.get("workbench") is True else {})}, task_id,
-                                    input_path=input_path or None,
-                                    inputs=item_inputs or None,
-                                    output_dir=output_dir, output_layout=output_layout,
-                                    **({"separator_cache": separator_cache} if separator_cache is not None else {}))
-                emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
-                emit("task_done", {**result, "outputRoot": output_dir}, task_id=task_id)
+                with task_logging(task_id):
+                    result = _run_pymss({**payload, "taskId": task_id, "inputIndex": item.get("inputIndex", input_index),
+                                        **({"workbenchOutputs": item.get("workbenchOutputs", payload.get("workbenchOutputs"))}
+                                           if payload.get("workbench") is True else {})}, task_id,
+                                        input_path=input_path or None,
+                                        inputs=item_inputs or None,
+                                        output_dir=output_dir, output_layout=output_layout,
+                                        **({"separator_cache": separator_cache} if separator_cache is not None else {}))
+                    emit("task_stage", {"stage": "writing_output", "message": "Collecting workflow outputs", "progress": 92}, task_id=task_id)
+                    emit("task_done", {**result, "outputRoot": output_dir}, task_id=task_id)
             except Exception as exc:
                 failed = True
                 _emit_workflow_failure(task_id, exc)

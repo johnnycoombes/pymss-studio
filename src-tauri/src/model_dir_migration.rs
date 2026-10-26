@@ -804,6 +804,7 @@ pub fn start_model_dir_migration(
     state: State<'_, AppState>,
     request: StartModelDirMigrationRequest,
 ) -> AppResult<Value> {
+    let application_access = crate::python::worker::acquire_application_operation()?;
     let task_id = request
         .task_id
         .clone()
@@ -820,6 +821,7 @@ pub fn start_model_dir_migration(
     let failed_source_dir = request.current_model_dir.clone();
     let failed_target_dir = request.target_model_dir.clone();
     std::thread::spawn(move || {
+        let _application_access = application_access;
         let result = run_model_dir_migration(app.clone(), task_id.clone(), session, request);
         if let Err(error) = result {
             let msg = error.to_string();

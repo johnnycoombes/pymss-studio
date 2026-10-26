@@ -1,8 +1,11 @@
 <script setup lang="ts">
+import TaskLogConsole from '@/components/TaskLogConsole.vue'
+import InferenceParameterHelp from '@/components/InferenceParameterHelp.vue'
+import { useBeginnerGuideStore } from '@/stores/beginnerGuide'
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-shell'
@@ -10,7 +13,7 @@ import packageMeta from '../../package.json'
 import appLogo from '@/assets/app-logo-symbol-canvas.png'
 import { SYSTEM_LOCALE, setLocale, type LocaleSetting } from '@/i18n'
 import { useSettingsStore } from '@/stores/settings'
-import { useAppStore, type InstalledRuntime, type RuntimeBackend } from '@/stores/app'
+import { useAppStore, type InstalledRuntime, type RuntimeBackend, type RuntimeCoreMode } from '@/stores/app'
 import { useUpdateStore } from '@/stores/update'
 import {
   detectRuntimePlatform,
@@ -60,13 +63,19 @@ import {
   HardwareChipOutline,
   CloudDownloadOutline,
   RefreshOutline,
+  ChevronForwardOutline,
+  CompassOutline,
+  OptionsOutline,
 } from '@vicons/ionicons5'
 
 const { t, locale: currentLocale } = useI18n()
 const message = useMessage()
 const dialog = useDialog()
 const route = useRoute()
+const router = useRouter()
 const settings = useSettingsStore()
+const beginnerGuide = useBeginnerGuideStore()
+const showParameterHelp = ref(false)
 const app = useAppStore()
 const updates = useUpdateStore()
 const modelStore = useModelStore()
@@ -88,6 +97,18 @@ type BuildInfo = {
   official: boolean
 }
 const activeSection = ref<SettingsSection>('appearance')
+watch(() => route.query.section, (section) => {
+  if (typeof section === 'string' && ['about', 'appearance', 'runtime', 'paths', 'defaults'].includes(section)) {
+    if (beginnerGuide.phase === 'running' && beginnerGuide.currentStep.section && beginnerGuide.currentStep.section !== section) beginnerGuide.pause()
+    activeSection.value = section as SettingsSection
+  }
+}, { immediate: true })
+function selectSettingsSection(section: SettingsSection) {
+  if (activeSection.value === section) return
+  beginnerGuide.pause()
+  activeSection.value = section
+  if (typeof route.query.section === 'string') void router.replace({ query: { ...route.query, section } })
+}
 const buildInfo = ref<BuildInfo | null>(null)
 const updateChecking = ref(false)
 const updateInstalling = ref(false)
@@ -123,6 +144,7 @@ const {
   proxyUrl,
   proxyBypass,
   updateChannel,
+  updateSource,
 } = storeToRefs(settings)
 const { downloadTasks } = storeToRefs(modelStore)
 const { activeWorkerTasks } = storeToRefs(task)
@@ -147,14 +169,17 @@ const proxyTestSuggestion = ref('')
 const proxyTestElapsed = ref(0)
 const proxyTestLoading = computed(() => proxyTestStatus.value === 'testing')
 const runtimeMirror = ref('auto')
-const runtimeDetecting = ref(false)
+const runtimeManualChecking = ref(false)
+const runtimeDetecting = computed(() => app.runtimeInfoLoading || runtimeManualChecking.value)
 const runtimeDeleting = ref<string | null>(null)
 const runtimeActivating = ref<string | null>(null)
 const runtimeLogDialogVisible = ref(false)
-const runtimeLogPre = ref<HTMLPreElement | null>(null)
+const runtimeLogPre = ref<HTMLElement | null>(null)
 
-watch(() => app.runtimeInstallLogs.length, () => {
+watch(() => app.runtimeInstallLogs.at(-1), () => {
   if (runtimeLogDialogVisible.value && runtimeLogPre.value) {
+    const target = runtimeLogPre.value
+    if (target.scrollHeight - target.scrollTop - target.clientHeight > 48) return
     nextTick(() => {
       if (runtimeLogPre.value) {
         runtimeLogPre.value.scrollTop = runtimeLogPre.value.scrollHeight
@@ -163,9 +188,10 @@ watch(() => app.runtimeInstallLogs.length, () => {
   }
 })
 const runtimeInstalling = computed(() => app.runtimeInstallStatus === 'installing')
-const runtimeCoreUpdating = computed(() => app.runtimeCoreUpdateStatus === 'updating')
+const runtimeCoreActionPending = ref(false)
+const runtimeCoreUpdating = computed(() => app.runtimeCoreUpdateStatus === 'updating' || app.runtimeCoreUpdateStatus === 'preparing')
 // Runtime detection and install/switch/delete all access the runtime state, so only one may run at a time.
-const runtimeBusy = computed(() => runtimeDetecting.value || runtimeInstalling.value || runtimeCoreUpdating.value || runtimeActivating.value !== null || runtimeDeleting.value !== null)
+const runtimeBusy = computed(() => runtimeDetecting.value || runtimeInstalling.value || runtimeCoreUpdating.value || runtimeCoreActionPending.value || runtimeActivating.value !== null || runtimeDeleting.value !== null)
 const runtimeCurrentError = computed(() => {
   const error = runtimeLoadError(app.runtimeInfo, app.envInfo)
   return error.toLowerCase().includes('winerror 1455') ? t('settings.runtimePageFileError') : error
@@ -228,6 +254,7 @@ const RUNTIME_BACKEND_DESC_KEYS: Record<RuntimeBackend, string> = {
 }
 
 function runtimeBackendDescription(backend: RuntimeBackend | string) {
+  if (backend === 'rocm' && app.runtimeInfo?.platform === 'linux') return t('onboarding.runtimeRocmLinux')
   const key = RUNTIME_BACKEND_DESC_KEYS[backend as RuntimeBackend]
   return key ? t(key) : ''
 }
@@ -235,10 +262,9 @@ function runtimeBackendDescription(backend: RuntimeBackend | string) {
 type BackendCardBase = { backend: RuntimeBackend; label: string; description: string; offCatalog: boolean }
 
 const runtimeBackendCatalog = computed<BackendCardBase[]>(() => {
-  const { isMac, isAppleSilicon } = runtimePlatform.value
-  const backends: RuntimeBackend[] = ['cpu']
+  const { isMac } = runtimePlatform.value
+  const backends: RuntimeBackend[] = isMac ? ['mlx'] : ['cpu']
   if (!isMac) backends.push('cuda', 'rocm')
-  if (isAppleSilicon) backends.push('mlx')
   return backends.map((backend) => ({
     backend,
     label: runtimeBackendName(backend),
@@ -285,9 +311,8 @@ const runtimeBackendCards = computed(() => {
       // older app even when PyPI already reports the same pymss/core versions.
       // Offer the no-Torch-reinstall core sync so the environment metadata and
       // any manifest-declared pymss extras are brought up to date.
-      const coreUpdateAvailable = isActive && env?.coreUpdateSupported !== false && (
-        runtimeCoreUpdateAvailable(env, latestPymssVersion.value, latestPymssCoreVersion.value, app.runtimeInfo?.manifestVersion)
-        || runtimeCoreSyncAvailable(env, app.runtimeInfo?.manifestVersion)
+      const coreUpdateAvailable = app.runtimeCoreUpdateSupported && isActive && env?.coreUpdateSupported !== false && (
+        runtimeCoreUpdateAvailable(env, app.runtimeCoreVersions, app.runtimeInfo?.manifestVersion)
       )
       const gpuBackend = item.backend === 'cuda' || item.backend === 'rocm' || item.backend === 'mlx'
       // A cancelled or failed install leaves its venv behind without an install state, so the
@@ -342,6 +367,24 @@ function runtimeBackendLabel(value: RuntimeBackend | string | null | undefined) 
   return value ? runtimeBackendName(value) : t('settings.envNotChecked')
 }
 
+let locatedRuntimeBackend = ''
+function locateRuntimeBackend() {
+  const backend = route.query.backend
+  if (activeSection.value !== 'runtime' || app.runtimeInfoLoading || typeof backend !== 'string' || backend === locatedRuntimeBackend) return
+  if (!runtimeBackendCatalog.value.some(item => item.backend === backend)) return
+  const card = Array.from(document.querySelectorAll<HTMLElement>('[data-runtime-backend]'))
+    .find(element => element.dataset.runtimeBackend === backend)
+  if (card) {
+    card.scrollIntoView({ block: 'nearest' })
+    locatedRuntimeBackend = backend
+  }
+}
+
+watch([() => route.query.backend, activeSection, () => app.runtimeInfoLoading], async () => {
+  await nextTick()
+  locateRuntimeBackend()
+}, { immediate: true, flush: 'post' })
+
 function confirmRuntimeAction(title: string, content: string, positiveText: string) {
   return new Promise<boolean>((resolve) => {
     dialog.warning({
@@ -352,12 +395,14 @@ function confirmRuntimeAction(title: string, content: string, positiveText: stri
       onPositiveClick: () => resolve(true),
       onNegativeClick: () => resolve(false),
       onClose: () => resolve(false),
+      onMaskClick: () => resolve(false),
+      onEsc: () => resolve(false),
     })
   })
 }
 
 async function installBackend(backend: RuntimeBackend) {
-  if (runtimeBusy.value) return
+  if (!app.runtimeManagementSupported || runtimeBusy.value) return
   const target = runtimeBackendLabel(backend)
   const sizeHint = t('settings.runtimeInstallSizeHint', { size: runtimeSizeHint(backend) })
   const reinstall = installedRuntimes.value.some((entry) => entry.backend === backend)
@@ -398,27 +443,35 @@ watch(() => app.runtimeInstallStatus, (status, previous) => {
 })
 
 async function refreshRuntimeStatus(showSuccess = false) {
-  runtimeDetecting.value = true
+  if (showSuccess) runtimeManualChecking.value = true
+  const info = showSuccess ? app.checkRuntimeInfo() : app.ensureRuntimeInfo()
+  // Startup owns the detailed device probe. Page visits only refresh the overview;
+  // explicit detection still checks the active interpreter and all its devices.
+  const env = showSuccess ? app.checkEnv() : Promise.resolve()
+  // Disk usage updates separately and does not hold the detection button open.
+  void (showSuccess ? app.loadRuntimeEnvSizes() : app.ensureRuntimeEnvSizes())
   try {
-    await Promise.all([app.checkRuntimeInfo(), app.checkEnv(), app.loadRuntimeEnvSizes()])
+    const results = await Promise.allSettled([info, env])
+    const failed = results.find(result => result.status === 'rejected')
+    if (failed?.status === 'rejected') throw failed.reason
     if (showSuccess) message.success(t('settings.runtimeDetectSuccess'))
   } catch (error) {
     if (showSuccess) message.error(error instanceof Error ? error.message : String(error))
   } finally {
-    runtimeDetecting.value = false
+    if (showSuccess) runtimeManualChecking.value = false
   }
 }
 
-async function refreshRuntimeCoreVersions() {
+async function refreshRuntimeCoreVersions(fresh = false) {
+  if (!app.runtimeCoreUpdateSupported) return
   try {
-    await app.loadRuntimeCoreVersions()
+    await (fresh ? app.loadRuntimeCoreVersions() : app.ensureRuntimeCoreVersions())
   } catch {
     // Network availability is optional for the settings page; the installed version still shows.
   }
 }
 
-// Measuring disk usage walks every file in each venv, so only refresh the full runtime section
-// when it is visible.
+// Reuse recent or in-flight reads when returning to this section.
 watch(activeSection, (section) => {
   if (section === 'runtime') {
     void refreshRuntimeStatus(false)
@@ -445,8 +498,7 @@ const runtimeDiskTotalLabel = computed(() => {
 
 // Walking several multi-GB venvs takes visible time on a slow disk; say so rather than
 // leaving the section silently size-less.
-const runtimeDiskMeasuring = computed(() =>
-  app.runtimeEnvSizesLoading && !Object.keys(app.runtimeEnvSizes).length)
+const runtimeDiskMeasuring = computed(() => app.runtimeEnvSizesLoading)
 
 async function cancelRuntimeInstall() {
   try {
@@ -457,7 +509,7 @@ async function cancelRuntimeInstall() {
 }
 
 async function deleteRuntime(card: { backend: RuntimeBackend; env?: InstalledRuntime }) {
-  if (runtimeBusy.value) return
+  if (!app.runtimeManagementSupported || runtimeBusy.value) return
   const backend = card.backend
   const active = runtimeEnvironmentForBackend(app.runtimeInfo, backend)
   if (card.env && active === card.env && runtimeCurrentBackend.value === backend) {
@@ -490,6 +542,7 @@ async function deleteRuntime(card: { backend: RuntimeBackend; env?: InstalledRun
 }
 
 async function activateInstalledRuntime(card: { backend: RuntimeBackend; env?: InstalledRuntime }) {
+  if (!app.runtimeManagementSupported) return
   const backend = card.backend
   const active = runtimeEnvironmentForBackend(app.runtimeInfo, backend)
   if (runtimeBusy.value || (runtimeCurrentBackend.value === backend && active === card.env)) return
@@ -517,63 +570,69 @@ async function activateInstalledRuntime(card: { backend: RuntimeBackend; env?: I
 }
 
 async function detectRuntime() {
+  if (runtimeBusy.value) return
+  void refreshRuntimeCoreVersions(true)
   await refreshRuntimeStatus(true)
 }
 
-async function updateRuntimeCore(card: { backend: RuntimeBackend; env?: InstalledRuntime }) {
-  if (runtimeBusy.value) return
-  const runtime = card.env || installedRuntimes.value.find((entry) => entry.backend === card.backend) || null
-  const versionUpdateAvailable = runtimeCoreUpdateAvailable(
-    runtime || undefined,
-    latestPymssVersion.value,
-    latestPymssCoreVersion.value,
-    app.runtimeInfo?.manifestVersion,
-  )
-  if (!versionUpdateAvailable && !runtimeCoreSyncAvailable(runtime || undefined, app.runtimeInfo?.manifestVersion)) return
-  const confirmed = await confirmRuntimeAction(
-    t('settings.runtimeCoreUpdateTitle'),
-    t(versionUpdateAvailable ? 'settings.runtimeCoreUpdateContent' : 'settings.runtimeCoreSyncContent', {
-      current: runtime?.pymssVersion || runtime?.packageVersions?.pymss || app.runtimeInfo?.pymssVersion || t('settings.runtimeCoreVersionUnknown'),
-      latest: latestPymssVersion.value || t('settings.runtimeCoreVersionUnknown'),
-      coreCurrent: runtime?.pymssCoreVersion || runtime?.packageVersions?.['pymss-core'] || app.runtimeInfo?.pymssCoreVersion || t('settings.runtimeCoreVersionUnknown'),
-      coreLatest: latestPymssCoreVersion.value || t('settings.runtimeCoreVersionUnknown'),
-    }),
-    t('settings.runtimeCoreUpdate'),
-  )
-  if (!confirmed) return
+async function runRuntimeCoreOperation(card: { backend: RuntimeBackend; env?: InstalledRuntime }, mode: RuntimeCoreMode) {
+  if (!app.runtimeCoreUpdateSupported || runtimeBusy.value || runtimeCoreActionPending.value) return
+  runtimeCoreActionPending.value = true
   try {
-    await app.updateRuntimeCore(card.backend, runtimeMirror.value, currentLocale.value, {
-      pythonPath: runtime?.pythonPath,
+    const plan = await app.prepareRuntimeCoreUpdate(card.backend, runtimeMirror.value, currentLocale.value, {
+      pythonPath: card.env?.pythonPath,
+      mode,
+    })
+    const title = mode === 'rollback' ? 'settings.runtimeCoreRollback' : mode === 'update'
+      ? 'settings.runtimeCoreUpdateTitle' : mode === 'repair'
+        ? 'settings.runtimeDependencyRepairTitle' : 'settings.runtimeCoreSyncTitle'
+    const confirmed = await confirmRuntimeAction(
+      t(title),
+      t('settings.runtimeCorePlanContent', {
+        current: plan.currentVersions.pymss || t('settings.runtimeCoreVersionUnknown'),
+        coreCurrent: plan.currentVersions['pymss-core'] || t('settings.runtimeCoreVersionUnknown'),
+        latest: plan.targetVersions.pymss,
+        coreLatest: plan.targetVersions['pymss-core'],
+        count: plan.dependencyCount,
+        channel: t(plan.channel === 'prerelease' ? 'settings.updateChannelPrerelease' : 'settings.updateChannelStable'),
+      }),
+      t(mode === 'rollback' ? 'settings.runtimeCoreRollback' : mode === 'update' ? 'settings.runtimeCoreUpdate' : 'settings.runtimeCoreSync'),
+    )
+    if (!confirmed) {
+      app.discardRuntimeCorePlan(plan.id)
+      return
+    }
+    await app.updateRuntimeCore(plan.backend, plan.mirror, currentLocale.value, {
+      pythonPath: plan.pythonPath,
+      mode: plan.mode,
+      planId: plan.id,
     })
   } catch (error) {
-    message.error(error instanceof Error ? error.message : String(error))
+    if (app.runtimeCoreUpdateStatus !== 'cancelled') message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    runtimeCoreActionPending.value = false
   }
 }
 
+async function updateRuntimeCore(card: { backend: RuntimeBackend; env?: InstalledRuntime }) {
+  await runRuntimeCoreOperation(card, 'update')
+}
+
 async function repairRuntimeDependencies(card: RuntimeBackendCard) {
-  if (
-    runtimeBusy.value
-    || !runtimeCoreVersionCheckReady.value
-    || card.coreUpdateAvailable
-    || card.manifestNewer
-    || !card.env
-    || card.env.coreUpdateSupported === false
-  ) return
-  const confirmed = await confirmRuntimeAction(
-    t('settings.runtimeDependencyRepairTitle'),
-    t('settings.runtimeDependencyRepairContent', {
-      backend: runtimeBackendLabel(card.backend),
-    }),
-    t('settings.runtimeDependencyRepair'),
-  )
-  if (!confirmed) return
+  if (!app.runtimeManagementSupported) return
+  await runRuntimeCoreOperation(card, 'repair')
+}
+
+const runtimeCoreCancelling = ref(false)
+async function cancelRuntimeCoreUpdate() {
+  if (runtimeCoreCancelling.value) return
+  runtimeCoreCancelling.value = true
   try {
-    await app.updateRuntimeCore(card.backend, runtimeMirror.value, currentLocale.value, {
-      pythonPath: card.env.pythonPath,
-      repairDependencies: true,
-    })
+    await app.cancelRuntimeCoreUpdate()
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
+  } finally {
+    runtimeCoreCancelling.value = false
   }
 }
 
@@ -767,6 +826,7 @@ const aboutVersionItems = computed(() => [
   { label: t('settings.workerVersion'), value: workerVersion.value, meta: t('settings.pythonWorker') },
 ])
 const updateStatusLabel = computed(() => {
+  if (updates.restartRequired) return t('settings.updateRestartRequiredTitle')
   if (!updateSupported.value) return t('settings.updateUnsupported')
   if (updates.requiresManualInstall) return t('settings.updateManualInstallTitle')
   if (updates.status === 'failed' && updates.installFailed) return t('settings.updateInstallFailed')
@@ -779,6 +839,7 @@ const updateStatusLabel = computed(() => {
   return t('settings.updateIdle')
 })
 const updateBadgeTone = computed(() => {
+  if (updates.restartRequired) return 'warning'
   if (!updateSupported.value) return 'default'
   if (updates.status === 'failed') return 'error'
   if (updates.shouldShowDeferred) return 'warning'
@@ -801,7 +862,7 @@ const updateLastCheckedLabel = computed(() => {
 const runtimeSummaryItems = computed(() => [
   { label: t('settings.runtimeCurrentLabel'), value: runtimeCurrentLabel.value, meta: t('settings.runtimeCurrentMeta') },
   { label: 'Torch', value: app.runtimeInfo?.torchVersion || app.envInfo?.torchVersion || t('common.unknown'), meta: t('settings.runtimeTorchMeta') },
-  { label: 'pymss', value: app.envInfo?.pymssVersion || t('common.unknown'), meta: t('settings.runtimePymssMeta') },
+  { label: 'pymss', value: app.runtimeInfo?.pymssVersion || app.envInfo?.pymssVersion || t('common.unknown'), meta: t('settings.runtimePymssMeta') },
 ])
 const updateReleaseDateLabel = computed(() => {
   return formatDateTime(updates.releaseDate)
@@ -810,6 +871,13 @@ const updateChannelOptions = computed(() => [
   { label: t('settings.updateChannelStable'), value: 'stable' },
   { label: t('settings.updateChannelPrerelease'), value: 'prerelease' },
 ])
+const updateSourceOptions = computed(() => [
+  { label: t('settings.updateSourceAuto'), value: 'auto' },
+  { label: 'GitHub', value: 'github' },
+  { label: t('settings.updateSourceModelscope'), value: 'modelscope' },
+])
+const updateSelectedSourceLabel = computed(() => updates.selectedSource === 'github' ? 'GitHub'
+  : updates.selectedSource === 'modelscope' ? t('settings.updateSourceModelscope') : t('settings.updateSourceCustom'))
 const aboutLinks = computed(() => [
   { label: t('settings.desktopRepository'), url: repoUrl, icon: LogoGithub },
   { label: t('settings.coreRepository'), url: coreRepoUrl, icon: LinkOutline },
@@ -855,6 +923,13 @@ async function changeUpdateChannel(value: 'stable' | 'prerelease') {
   if (updateSupported.value) await checkForUpdates(true)
 }
 
+async function changeUpdateSource(value: 'auto' | 'github' | 'modelscope') {
+  if (value === updateSource.value || updates.isBusy) return
+  updateSource.value = value
+  updates.dismiss()
+  if (updateSupported.value) await checkForUpdates(true)
+}
+
 async function installUpdate() {
   if (updateInstalling.value || !updates.hasUpdate) return
   if (updates.shouldShowDeferred && updates.latestVersion) {
@@ -868,8 +943,8 @@ async function installUpdate() {
     if (!confirmed) return
     try {
       updateInstalling.value = true
-      await updates.downloadAndInstall()
-      message.success(t('settings.updateDeferredSaved'))
+      const exiting = await updates.downloadAndInstall()
+      if (exiting) message.success(t('settings.updateDeferredSaved'))
       return
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error))
@@ -1113,13 +1188,9 @@ async function resolveModelDirConflict(action: 'overwrite' | 'skip' | 'abort') {
 }
 
 onMounted(async () => {
-  if (route.query.section === 'runtime') activeSection.value = 'runtime'
   await loadBuildInfo()
   if (updateSupported.value) {
     void checkForUpdates(false)
-  }
-  if (!app.envInfo && !app.envLoading) {
-    app.checkEnvInBackground().catch(() => {})
   }
 })
 
@@ -1142,7 +1213,7 @@ onMounted(async () => {
           type="button"
           class="settings-nav-item"
           :class="{ active: activeSection === section.key }"
-          @click="activeSection = section.key"
+          @click="selectSettingsSection(section.key)"
         >
           <span class="settings-nav-item__icon"><n-icon :component="section.icon" size="18" /></span>
           <span class="settings-nav-item__copy">
@@ -1246,18 +1317,47 @@ onMounted(async () => {
                 <div v-if="updates.latestVersion" class="update-panel__meta">
                   <span>{{ t('settings.updateLastChecked', { time: updateLastCheckedLabel }) }}</span>
                   <span v-if="updateReleaseDateLabel">{{ t('settings.updateReleaseDate', { time: updateReleaseDateLabel }) }}</span>
+                  <span v-if="updates.selectedSource">{{ t('settings.updateSelectedSource', { source: updateSelectedSourceLabel }) }}</span>
                 </div>
 
                 <div class="update-panel__controls">
-                  <div class="update-panel__channel">
-                    <span>{{ t('settings.updateChannelLabel') }}</span>
-                    <n-select
-                      :value="updateChannel"
-                      :options="updateChannelOptions"
-                      :disabled="updates.isBusy"
-                      size="small"
-                      @update:value="changeUpdateChannel"
-                    />
+                  <div class="update-panel__preferences">
+                    <div class="update-panel__channel">
+                      <n-tooltip :show-arrow="false" style="max-width: 300px">
+                        <template #trigger>
+                          <span class="update-panel__field-label" tabindex="0">
+                            {{ t('settings.updateChannelLabel') }}
+                            <n-icon :component="InformationCircleOutline" size="13" />
+                          </span>
+                        </template>
+                        {{ updateChannel === 'prerelease' ? t('settings.updateChannelPrereleaseHint') : t('settings.updateChannelStableHint') }}
+                      </n-tooltip>
+                      <n-select
+                        :value="updateChannel"
+                        :options="updateChannelOptions"
+                        :disabled="updates.isBusy"
+                        size="small"
+                        @update:value="changeUpdateChannel"
+                      />
+                    </div>
+                    <div class="update-panel__channel">
+                      <n-tooltip :show-arrow="false" style="max-width: 300px">
+                        <template #trigger>
+                          <span class="update-panel__field-label" tabindex="0">
+                            {{ t('settings.updateSourceLabel') }}
+                            <n-icon :component="InformationCircleOutline" size="13" />
+                          </span>
+                        </template>
+                        {{ t('settings.updateSourceAutoHint') }}
+                      </n-tooltip>
+                      <n-select
+                        :value="updateSource"
+                        :options="updateSourceOptions"
+                        :disabled="updates.isBusy"
+                        size="small"
+                        @update:value="changeUpdateSource"
+                      />
+                    </div>
                   </div>
                   <div class="update-panel__actions">
                     <n-button
@@ -1275,13 +1375,14 @@ onMounted(async () => {
                       @click="openExternalUrl(updates.manualInstallUrl || repoUrl + '/releases/latest')"
                     >
                       <template #icon><n-icon :component="OpenOutline" /></template>
-                      {{ t('settings.updateOpenGitHub') }}
+                      {{ t('settings.updateOpenRelease') }}
                     </n-button>
                     <n-button
                       v-else-if="updates.hasUpdate"
                       type="primary"
                       :loading="updateInstalling || updates.isInstallingUpdate"
-                      :disabled="updates.isBusy"
+                      :disabled="updates.isBusy || Boolean(updates.installationBlockedReason)"
+                      :title="updates.installationBlockedReason"
                       @click="installUpdate"
                     >
                       <template #icon><n-icon :component="CloudDownloadOutline" /></template>
@@ -1299,13 +1400,36 @@ onMounted(async () => {
                     </n-button>
                   </div>
                 </div>
-                <p class="update-panel__channel-hint">{{ updateChannel === 'prerelease' ? t('settings.updateChannelPrereleaseHint') : t('settings.updateChannelStableHint') }}</p>
-
-                <div v-if="updates.latestVersion && updates.releaseNotes" class="update-panel__release-notes">
-                  <span>{{ t('settings.updateReleaseNotesLabel') }}</span>
+                <details v-if="updates.latestVersion && updates.releaseNotes" class="update-panel__release-notes">
+                  <summary>
+                    <n-icon class="update-panel__notes-chevron" :component="ChevronForwardOutline" size="13" />
+                    <span>{{ t('settings.updateReleaseNotesLabel') }}</span>
+                    <span class="update-panel__notes-preview">{{ updates.releaseNotes.replace(/\s+/g, ' ') }}</span>
+                  </summary>
                   <p class="update-panel__notes">{{ updates.releaseNotes }}</p>
-                </div>
+                </details>
               </template>
+            </div>
+          </article>
+
+          <article class="about-info-card about-guide-card" data-guide="guide-help">
+            <div class="section-title section-title--plain">
+              <span class="section-title__icon"><n-icon :component="CompassOutline" size="18" /></span>
+              <span>{{ t('beginnerGuide.label') }}</span>
+            </div>
+            <div class="about-guide-card__actions">
+              <n-button v-if="settings.beginnerGuideProgress.status === 'active'" type="primary" @click="beginnerGuide.start()">
+                <template #icon><n-icon :component="ChevronForwardOutline" /></template>
+                {{ t('beginnerGuide.resume') }}
+              </n-button>
+              <n-button type="primary" secondary @click="beginnerGuide.start(true)">
+                <template #icon><n-icon :component="RefreshOutline" /></template>
+                {{ t('beginnerGuide.restart') }}
+              </n-button>
+              <n-button secondary @click="showParameterHelp = true">
+                <template #icon><n-icon :component="OptionsOutline" /></template>
+                {{ t('parameterHelp.label') }}
+              </n-button>
             </div>
           </article>
 
@@ -1486,14 +1610,14 @@ onMounted(async () => {
 
         <!-- Runtime -->
         <section v-else-if="activeSection === 'runtime'" class="settings-section-panel runtime-section">
-          <article class="about-hero runtime-hero">
+          <article class="about-hero runtime-hero" data-guide="runtime-overview">
             <div class="about-hero__main">
               <div class="section-title__icon runtime-hero__icon">
                 <n-icon :component="TerminalOutline" size="18" />
               </div>
               <div class="about-hero__copy">
                 <span class="about-eyebrow">{{ t('settings.runtime') }}</span>
-                <h2 class="about-hero__title">{{ runtimeCurrentLabel }}</h2>
+                <h2 class="about-hero__title">{{ !app.runtimeInfo && !app.envInfo && runtimeDetecting ? t('settings.runtimeChecking') : runtimeCurrentLabel }}</h2>
                 <p v-if="runtimeCurrentError" class="runtime-hero__desc runtime-hero__desc--error">{{ runtimeCurrentError }}</p>
                 <p v-else class="runtime-hero__desc">{{ t('settings.runtimeDesc') }}</p>
               </div>
@@ -1505,7 +1629,8 @@ onMounted(async () => {
             <div class="about-stats" :aria-label="t('settings.runtime')">
               <div v-for="item in runtimeSummaryItems" :key="item.label" class="about-stat">
                 <span class="about-stat__label">{{ item.label }}</span>
-                <strong class="about-stat__value">{{ item.value }}</strong>
+                <n-skeleton v-if="!app.runtimeInfo && !app.envInfo && runtimeDetecting" text width="65%" :sharp="false" />
+                <strong v-else :key="item.value" class="about-stat__value runtime-value">{{ item.value }}</strong>
                 <small class="about-stat__meta">{{ item.meta }}</small>
               </div>
             </div>
@@ -1513,20 +1638,52 @@ onMounted(async () => {
 
           <!-- Runtime Environments -->
           <article class="about-info-card runtime-envs-card">
+            <div class="runtime-envs-card__content">
+            <n-alert v-if="!app.runtimeManagementSupported" type="info" :bordered="false">
+              {{ t('settings.runtimeCoreUpdatePlatformHint') }}
+            </n-alert>
             <div class="section-title section-title--plain">
               <span class="section-title__icon">
                 <n-icon :component="HardwareChipOutline" size="18" />
               </span>
               <span>{{ t('settings.runtimeBackendsSection') }}</span>
             </div>
-            <div class="runtime-envs-list">
+            <div class="runtime-read-status" role="status" aria-live="polite">
+              <span :class="{ 'runtime-read-status--error': app.runtimeInfoError }">
+                <n-spin v-if="app.runtimeInfoLoading" :size="12" />
+                <n-icon v-else :component="app.runtimeInfoError ? AlertCircleOutline : CheckmarkCircleOutline" size="14" />
+                {{ t(app.runtimeInfoLoading ? 'settings.runtimeChecking' : app.runtimeInfoError ? 'settings.runtimeRefreshFailed' : 'settings.runtimeInfoReady') }}
+              </span>
+              <span v-if="app.envLoading">
+                <n-spin :size="12" />{{ t('settings.runtimeDevicesChecking') }}
+              </span>
+              <span v-if="runtimeDiskMeasuring">
+                <n-spin :size="12" />{{ t('settings.runtimeDiskMeasuring') }}
+              </span>
+              <span v-else-if="app.runtimeEnvSizesError" class="runtime-read-status--error">
+                <n-icon :component="AlertCircleOutline" size="14" />{{ t('settings.runtimeDiskMeasureFailed') }}
+              </span>
+            </div>
+            <p v-if="app.runtimeInfoError" class="runtime-read-error">{{ app.runtimeInfoError }}</p>
+            <Transition name="runtime-content" mode="out-in" @after-enter="locateRuntimeBackend">
+            <div v-if="!app.runtimeInfo && app.runtimeInfoLoading" key="loading" class="runtime-envs-list" :aria-label="t('settings.runtimeChecking')" aria-busy="true">
+              <div v-for="backend in runtimeBackendCatalog" :key="backend.backend" class="runtime-env-card runtime-env-card--skeleton">
+                <strong class="runtime-env-card__backend">{{ backend.label }}</strong>
+                <n-skeleton text width="70%" :sharp="false" />
+                <n-skeleton text width="45%" :sharp="false" />
+                <n-skeleton height="24px" width="96px" :sharp="false" />
+              </div>
+            </div>
+            <div v-else key="ready" class="runtime-envs-list">
               <div
                 v-for="card in runtimeBackendCards"
                 :key="card.key"
                 class="runtime-env-card"
+                :data-runtime-backend="card.backend"
                 :class="{
                   'runtime-env-card--active': card.state === 'active',
                   'runtime-env-card--muted': card.state === 'not_installed',
+                  'runtime-env-card--requested': route.query.backend === card.backend,
                 }"
               >
                 <div class="runtime-env-card__head">
@@ -1591,19 +1748,19 @@ onMounted(async () => {
 
                 <div class="runtime-env-card__actions">
                   <n-button
-                    v-if="card.state === 'not_installed'"
+                    v-if="app.runtimeManagementSupported && card.state === 'not_installed'"
                     size="tiny"
                     secondary
                     type="primary"
                     :loading="card.installing"
-                    :disabled="runtimeBusy"
+                    :disabled="runtimeBusy || !app.runtimeInfo"
                     @click="installBackend(card.backend)"
                   >
                     <template #icon><n-icon :component="DownloadOutline" /></template>
                     {{ card.installing ? t('settings.runtimeInstalling') : t('settings.runtimeInstallBackend') }}
                   </n-button>
                   <n-button
-                    v-if="card.state === 'installed' && card.health !== 'broken'"
+                    v-if="app.runtimeManagementSupported && card.state === 'installed' && card.health !== 'broken'"
                     size="tiny"
                     secondary
                     type="primary"
@@ -1615,7 +1772,7 @@ onMounted(async () => {
                     {{ t('settings.runtimeActivateShort') }}
                   </n-button>
                   <n-button
-                    v-if="card.state !== 'not_installed'"
+                    v-if="app.runtimeManagementSupported && card.state !== 'not_installed'"
                     size="tiny"
                     tertiary
                     :loading="card.installing"
@@ -1625,7 +1782,7 @@ onMounted(async () => {
                     {{ card.installing ? t('settings.runtimeInstalling') : t('settings.runtimeRepair') }}
                   </n-button>
                   <n-button
-                    v-if="runtimeCoreVersionCheckReady
+                    v-if="app.runtimeManagementSupported && runtimeCoreVersionCheckReady
                       && card.state === 'active'
                       && !card.coreUpdateAvailable
                       && !card.manifestNewer
@@ -1653,6 +1810,20 @@ onMounted(async () => {
                     {{ t('settings.runtimeCoreUpdate') }}
                   </n-button>
                   <n-button
+                    v-if="app.runtimeCoreUpdateSupported && card.state === 'active' && runtimeCoreSyncAvailable(card.env, app.runtimeInfo?.manifestVersion)"
+                    size="tiny" secondary type="warning" :disabled="runtimeBusy"
+                    @click="runRuntimeCoreOperation(card, 'sync')"
+                  >
+                    {{ t('settings.runtimeCoreSync') }}
+                  </n-button>
+                  <n-button
+                    v-if="app.runtimeCoreUpdateSupported && card.state === 'active' && card.env?.coreUpdateSupported !== false && app.runtimeInfo?.rollbackAvailable"
+                    size="tiny" secondary :disabled="runtimeBusy"
+                    @click="runRuntimeCoreOperation(card, 'rollback')"
+                  >
+                    {{ t('settings.runtimeCoreRollback') }}
+                  </n-button>
+                  <n-button
                     v-if="card.env?.logPath"
                     size="tiny"
                     tertiary
@@ -1661,7 +1832,7 @@ onMounted(async () => {
                     {{ t('settings.runtimeViewLog') }}
                   </n-button>
                   <n-button
-                    v-if="card.leftover"
+                    v-if="app.runtimeManagementSupported && card.leftover"
                     size="tiny"
                     tertiary
                     type="error"
@@ -1673,7 +1844,7 @@ onMounted(async () => {
                     {{ t('settings.runtimeCleanLeftover') }}
                   </n-button>
                   <n-button
-                    v-if="card.state === 'installed' && card.env?.source !== 'bundled'"
+                    v-if="app.runtimeManagementSupported && card.state === 'installed' && card.env?.source !== 'bundled'"
                     size="tiny"
                     tertiary
                     type="error"
@@ -1702,18 +1873,25 @@ onMounted(async () => {
                 <div v-if="card.state === 'active' && runtimeCoreUpdating" class="runtime-env-card__progress">
                   <n-spin size="small" />
                   <span class="runtime-env-card__progress-msg">
-                    {{ app.runtimeCoreUpdateMessage || t(app.runtimeCoreUpdateMode === 'repair'
+                    {{ app.runtimeCoreUpdateStatus === 'preparing' ? t('settings.runtimeCorePreparing') : app.runtimeCoreUpdateMessage || t(app.runtimeCoreUpdateMode === 'repair'
                       ? 'settings.runtimeDependencyRepairing'
                       : 'settings.runtimeCoreUpdating') }}
                   </span>
+                  <n-button size="tiny" tertiary :loading="runtimeCoreCancelling" :disabled="app.runtimeCoreUpdateStage === 'activate'" @click="cancelRuntimeCoreUpdate">
+                    {{ t('common.cancel') }}
+                  </n-button>
                 </div>
               </div>
             </div>
+            </Transition>
+            <n-alert v-if="app.runtimeCoreUpdateStatus === 'error'" type="error" :bordered="false">
+              {{ app.runtimeCoreUpdateMessage }}
+            </n-alert>
+            <n-alert v-else-if="app.runtimeCoreUpdateStatus === 'success' || app.runtimeCoreUpdateStatus === 'cancelled'" :type="app.runtimeCoreUpdateStatus === 'success' ? 'success' : 'info'" :bordered="false">
+              {{ t(app.runtimeCoreUpdateStatus === 'success' ? 'settings.runtimeCoreOperationSuccess' : 'settings.runtimeCoreOperationCancelled') }}
+            </n-alert>
 
-            <p v-if="runtimeDiskMeasuring" class="setting-row__hint runtime-disk-total">
-              {{ t('settings.runtimeDiskMeasuring') }}
-            </p>
-            <p v-else-if="runtimeDiskTotalLabel" class="setting-row__hint runtime-disk-total">
+            <p v-if="runtimeDiskTotalLabel" class="setting-row__hint runtime-disk-total">
               {{ t('settings.runtimeDiskTotal', { size: runtimeDiskTotalLabel }) }}
             </p>
 
@@ -1728,7 +1906,6 @@ onMounted(async () => {
                 { label: t('onboarding.runtimeMirrorPypi'), value: 'pypi' },
               ]" />
             </div>
-            <p class="runtime-mirror-hint">{{ t('settings.runtimeMirrorHint') }}</p>
 
             <n-alert v-if="app.runtimeInstallStatus === 'error'" type="error" :show-icon="true">
               <div class="runtime-install-error">
@@ -1769,6 +1946,7 @@ onMounted(async () => {
                 {{ t('settings.runtimeShowInstallLog') }}
               </n-button>
             </div>
+            </div>
           </article>
         </section>
 
@@ -1796,7 +1974,7 @@ onMounted(async () => {
               </div>
             </div>
 
-            <div class="path-primary-grid">
+            <div class="path-primary-grid" data-guide="settings-paths">
               <div class="path-item path-item--primary">
                 <div class="path-item__head">
                   <div class="path-item__head-copy">
@@ -1862,7 +2040,7 @@ onMounted(async () => {
 
           <div class="settings-merged-layout">
             <section class="settings-group">
-              <div class="setting-field">
+              <div class="setting-field" data-guide="settings-device">
                 <label class="text-muted text-sm">{{ t('settings.defaultDevice') }}</label>
                 <n-select
                   v-model:value="defaultDevice"
@@ -1871,7 +2049,7 @@ onMounted(async () => {
               </div>
             </section>
 
-            <section class="settings-group">
+            <section class="settings-group" data-guide="settings-downloads">
               <div class="setting-field">
                 <label class="text-muted text-sm">{{ t('settings.downloadSource') }}</label>
                 <n-select
@@ -2184,7 +2362,7 @@ onMounted(async () => {
         <n-alert v-else-if="app.runtimeInstallStatus === 'success'" type="success" :show-icon="true" style="margin-bottom: 8px">
           {{ t('settings.runtimeInstallLogSuccess') }}
         </n-alert>
-        <pre v-if="app.runtimeInstallLogs.length" ref="runtimeLogPre" class="runtime-log-dialog__pre">{{ app.runtimeInstallLogs.join('\n') }}</pre>
+        <div v-if="app.runtimeInstallLogs.length" ref="runtimeLogPre" class="runtime-log-dialog__pre"><TaskLogConsole :lines="app.runtimeInstallLogs" embedded /></div>
         <div v-if="app.runtimeInfo?.logPath" class="runtime-log-dialog__path">
           <code>{{ app.runtimeInfo.logPath }}</code>
           <n-button size="tiny" tertiary @click="revealPath(app.runtimeInfo.logPath)">
@@ -2196,6 +2374,7 @@ onMounted(async () => {
         </p>
       </div>
     </n-modal>
+    <InferenceParameterHelp v-model:show="showParameterHelp" :model-type="modelStore.models.find(entry => entry.name === modelStore.selectedModel)?.modelType" />
   </div>
 </template>
 
@@ -2671,41 +2850,73 @@ onMounted(async () => {
 
 .update-panel__controls {
   display: flex;
-  align-items: flex-end;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 10px 16px;
   min-width: 0;
   padding-top: 12px;
   border-top: 1px solid color-mix(in srgb, var(--outline) 52%, transparent);
 }
 
+.update-panel__preferences {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  min-width: 0;
+}
+
 .update-panel__channel {
   display: grid;
-  grid-template-columns: auto minmax(180px, 1fr);
+  grid-template-columns: auto 150px;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
   color: var(--on-surface-muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .update-panel__channel .n-select {
-  width: min(100%, 320px);
+  width: 100%;
 }
 
-.update-panel__channel-hint {
-  margin: -4px 0 0;
-  color: var(--on-surface-muted);
-  font-size: 12px;
-  line-height: 1.5;
+.update-panel__field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
 }
 
-.update-panel__release-notes {
-  display: grid;
+.update-panel__field-label .n-icon { opacity: 0.65; }
+.update-panel__field-label:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+
+.update-panel__release-notes { min-width: 0; }
+
+.update-panel__release-notes summary {
+  display: flex;
+  align-items: center;
   gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+  list-style: none;
 }
 
-.update-panel__release-notes > span {
+.update-panel__release-notes summary::-webkit-details-marker { display: none; }
+.update-panel__notes-chevron { flex: 0 0 auto; color: var(--on-surface-muted); }
+.update-panel__release-notes[open] .update-panel__notes-chevron { transform: rotate(90deg); }
+.update-panel__release-notes[open] .update-panel__notes-preview { visibility: hidden; }
+
+.update-panel__notes-preview {
+  flex: 1;
+  min-width: 0;
+  margin-left: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 400;
+}
+
+.update-panel__release-notes summary {
   color: var(--on-surface-muted);
   font-size: 12px;
   font-weight: 700;
@@ -2713,13 +2924,12 @@ onMounted(async () => {
 
 .update-panel__notes {
   margin: 0;
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--surface-2) 42%, transparent);
+  padding: 8px 0 0 19px;
   color: var(--on-surface);
   font-size: 12px;
   line-height: 1.65;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .update-panel__actions {
@@ -2754,8 +2964,10 @@ onMounted(async () => {
   }
 
   .update-panel__channel {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: auto minmax(0, 1fr);
   }
+
+  .update-panel__preferences { display: grid; gap: 10px; }
 
   .update-panel__channel .n-select {
     width: 100%;
@@ -2790,6 +3002,21 @@ onMounted(async () => {
   display: grid;
   gap: 10px;
   flex: 1;
+}
+
+.about-guide-card {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.about-guide-card__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .about-info-card__body p {
@@ -2936,6 +3163,10 @@ onMounted(async () => {
 }
 
 .runtime-envs-card {
+  position: relative;
+}
+
+.runtime-envs-card__content {
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -2944,6 +3175,27 @@ onMounted(async () => {
 .runtime-envs-list {
   display: grid;
   gap: 10px;
+}
+
+.runtime-read-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  min-height: 20px;
+  color: var(--on-surface-muted);
+  font-size: 12px;
+}
+.runtime-read-status > span { display: inline-flex; align-items: center; gap: 6px; }
+.runtime-read-status--error, .runtime-read-error { color: var(--danger); }
+.runtime-read-error { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.runtime-env-card--skeleton { min-height: 140px; align-content: start; gap: 12px; }
+.runtime-content-enter-active, .runtime-content-leave-active { transition: opacity 160ms ease, transform 160ms ease; }
+.runtime-content-enter-from, .runtime-content-leave-to { opacity: 0; transform: translateY(4px); }
+.runtime-value { animation: runtime-value-in 180ms ease both; }
+@keyframes runtime-value-in { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .runtime-content-enter-active, .runtime-content-leave-active { transition: none; }
+  .runtime-value { animation: none; }
 }
 
 .runtime-env-card {
@@ -2965,6 +3217,12 @@ onMounted(async () => {
 .runtime-env-card--muted {
   background: color-mix(in srgb, var(--surface-2) 18%, transparent);
   border-style: dashed;
+}
+
+.runtime-env-card--requested {
+  border-style: solid;
+  border-color: var(--primary-border);
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 .runtime-env-card__desc {
@@ -3035,13 +3293,6 @@ onMounted(async () => {
 
 .runtime-mirror-row__select {
   width: 220px;
-}
-
-.runtime-mirror-hint {
-  margin: -4px 0 0;
-  color: var(--on-surface-muted);
-  font-size: 11px;
-  line-height: 1.5;
 }
 
 .runtime-env-card__head {

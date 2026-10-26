@@ -7,6 +7,7 @@ import { CloseOutline, FolderOpenOutline, MusicalNotesOutline, RefreshOutline } 
 import { useWorkbenchStore } from '@/stores/workbench'
 import { useSettingsStore } from '@/stores/settings'
 import { workbenchOutputDirectory, workflowInputNodes, workflowOutputNodes } from '@/workflows/workbench'
+import { detectWorkflowFormat } from '@/workflows/formats'
 
 const props = withDefaults(defineProps<{
   workflowKey: string; definition: Record<string, unknown>
@@ -18,11 +19,13 @@ const { t } = useI18n()
 const message = useMessage()
 const busy = ref(false)
 const session = computed(() => store.session(props.workflowKey))
+const nativeGraph = computed(() => detectWorkflowFormat(props.definition) === 'graph')
 const inputs = computed(() => props.mode === 'outputs' ? [] : workflowInputNodes(props.definition).filter(node => !props.nodeId || node.id === props.nodeId))
 const outputs = computed(() => props.mode === 'inputs' ? [] : props.aggregateOutput
   ? [{ id: 'save', label: t('workflows.saveNode') }] : workflowOutputNodes(props.definition).filter(node => !props.nodeId || node.id === props.nodeId))
 function outputDirectory(id: string) {
-  if (props.aggregateOutput) return session.value.bindings.outputDirectory || Object.values(session.value.bindings.outputs)[0] || settings.outputDir
+  if (props.aggregateOutput) return session.value.bindings.outputDirectory
+    || (!nativeGraph.value && Object.values(session.value.bindings.outputs)[0]) || settings.outputDir
   const node = outputs.value.find(item => item.id === id)!
   return workbenchOutputDirectory(node, session.value.bindings.outputs[id], settings.outputDir)
 }
@@ -34,7 +37,7 @@ function resetOutput(id: string) {
 }
 function isDefaultOutput(id: string) {
   return !(props.aggregateOutput
-    ? session.value.bindings.outputDirectory || Object.keys(session.value.bindings.outputs).length
+    ? session.value.bindings.outputDirectory || (!nativeGraph.value && Object.keys(session.value.bindings.outputs).length)
     : session.value.bindings.outputs[id])
 }
 function files(id: string) {
@@ -107,12 +110,13 @@ watch(() => [props.nodeId, props.action], () => {
     <div v-for="node in outputs" :key="node.id" class="binding-group" :data-workbench-output="node.id">
       <strong>{{ aggregateOutput ? t('separate.outputDirectorySummary') : node.label }}</strong>
       <n-input size="small" readonly :value="outputDirectory(node.id)" :title="outputDirectory(node.id)" />
+      <p v-if="nativeGraph" class="binding-hint">{{ t('workbench.outputRootHint') }}</p>
       <div class="binding-actions">
         <n-button size="small" secondary type="primary" :disabled="busy" @click="pickOutput(node.id)"><template #icon><n-icon :component="FolderOpenOutline" /></template>{{ t('workbench.chooseOutput') }}</n-button>
         <n-button size="small" secondary :disabled="busy || isDefaultOutput(node.id)" :title="t('separate.outputDefault')" @click="resetOutput(node.id)"><template #icon><n-icon :component="RefreshOutline" /></template>{{ t('workbench.defaultOutput') }}</n-button>
       </div>
     </div>
-    <label v-if="outputs.length" class="binding-layout">
+    <label v-if="outputs.length && !nativeGraph" class="binding-layout">
       <span>{{ t('separate.saveMode') }}</span>
       <n-select size="small" v-model:value="session.bindings.outputLayout" :options="[{ label: t('separate.saveModeFlatName'), value: 'flat' }, { label: t('separate.saveModeFolderName'), value: 'folders' }]" />
     </label>
@@ -123,6 +127,7 @@ watch(() => [props.nodeId, props.action], () => {
 .node-bindings { display: grid; gap: 16px; font-size: 12px; }
 .node-bindings--compact { gap: 8px; padding-top: 4px; }
 .binding-group { display: grid; gap: 10px; min-width: 0; }
+.binding-hint { margin: 0; color: var(--on-surface-muted); font-size: 12px; line-height: 1.6; }
 .binding-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .node-bindings--compact .binding-actions { flex-wrap: nowrap; }
 .node-bindings--compact .binding-actions > .n-button { flex: 1; }

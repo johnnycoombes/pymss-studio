@@ -1,0 +1,33 @@
+AAX module inspection boundary
+==============================
+
+This crate implements bundle resolution, export inspection and the documented
+ACFGetSDKVersion ABI. It has no ACF host object, factory registration, effect
+instantiation, processing context, parameter packet routing, state or GUI host.
+audioProcessingAvailable is always false. A successful module/version query
+does not establish a usable AAX audio host or commercial plugin compatibility.
+
+No Avid or RAVET implementation code is included. ABI declarations were checked
+against the public Avid SDK distributed in the JUCE repository, snapshot:
+454fe891acc8204f99f4ef1e3a28c84b1a4da145
+
+Relevant files under modules/juce_audio_plugin_client/AAX/SDK:
+  Interfaces/AAX_Exports.cpp: ACFGetSDKVersion export and calling convention.
+  Interfaces/ACF/acfbasetypes.h: 32-bit ACFRESULT on Windows and 64-bit macOS.
+  Interfaces/ACF/acfresult.h: ACFSUCCEEDED(result) is result >= 0.
+  Interfaces/AAX_Init.h and Libs/AAXLibrary/source/AAX_Init.cpp: the version query
+  writes a static 64-bit SDK/revision value without requiring host registration.
+
+Reference:
+https://github.com/juce-framework/JUCE/tree/454fe891acc8204f99f4ef1e3a28c84b1a4da145/modules/juce_audio_plugin_client/AAX/SDK
+https://developer.avid.com/aax/
+
+RAVET's public check-bundle.py independently demonstrates the same limited
+module/version inspection. Its registered-native.cpp exercises its own Gain
+fixture using an extra C++ symbol and a fixed context layout; that is not a
+general AAX loading contract and is not used by this crate.
+https://github.com/mo0kid/ravet/tree/e1c712c4faa095f36f5cf6ac1b88a31441da8519/tools/aax-validation
+
+Module initialization and the version export execute native code. Invoke this
+crate only through a disposable --aax-probe helper with an external timeout;
+the ordinary AAX scan/load admission remains unsupported.

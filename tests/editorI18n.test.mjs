@@ -31,7 +31,7 @@ Object.defineProperty(globalThis, 'window', {
 
 const vite = await createServer({
   configFile: false,
-  server: { middlewareMode: true, hmr: false },
+  server: { watch: null, middlewareMode: true, hmr: false, preTransformRequests: false },
   appType: 'custom',
   optimizeDeps: { noDiscovery: true },
   resolve: { alias: { '@': sourceRoot } },

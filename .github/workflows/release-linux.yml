@@ -1,0 +1,114 @@
+name: Release Linux AppImage
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  appimage:
+    name: Linux x86_64 AppImage
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      PYMSS_VERSION: ${{ inputs.version }}
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build and media dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libasound2-dev libwebkit2gtk-4.1-dev libssl-dev \
+            libxdo-dev libayatana-appindicator3-dev librsvg2-dev patchelf file \
+            libfuse2 squashfs-tools ffmpeg aria2 gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav
+      - uses: ./.github/actions/setup-release-env
+      - name: Sync build version metadata
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          version = os.environ['PYMSS_VERSION'].removeprefix('v')
+          if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?', version):
+              raise SystemExit('Invalid semantic version')
+          with open(os.environ['GITHUB_ENV'], 'a') as environment:
+              environment.write(f'RELEASE_VERSION={version}\n')
+          for name in ('package.json', 'src-tauri/tauri.conf.json'):
+              path = Path(name)
+              data = json.loads(path.read_text())
+              data['version'] = version
+              path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+          cargo = Path('src-tauri/Cargo.toml')
+          cargo.write_text(re.sub(r'(?m)^(version\s*=\s*)"[^"]+"', rf'\1"{version}"', cargo.read_text(), count=1))
+          PY
+      - name: Prepare standalone bootstrap and clean resources
+        run: |
+          bash scripts/prepare-python-runtime.sh minimal
+          mkdir -p src-tauri/resources/python
+          rsync -a --exclude '__pycache__' --exclude '*.pyc' python/ src-tauri/resources/python/
+          cp -a python-runtime src-tauri/resources/python-runtime
+          bash scripts/prepare-linux-bundled-tools.sh src-tauri/resources/bin
+      - name: Build AppImage
+        env:
+          # linuxdeploy's bundled strip can reject modern ELF relocation sections.
+          NO_STRIP: 'true'
+          PYMSS_BUILD_GIT_COMMIT: ${{ github.sha }}
+          PYMSS_BUILD_GIT_TAG: ${{ startsWith(inputs.version, 'v') && inputs.version || format('v{0}', inputs.version) }}
+          PYMSS_BUILD_GIT_REF: ${{ github.ref_name }}
+          PYMSS_BUILD_RUN_ID: ${{ github.run_id }}
+          PYMSS_BUILD_RUN_ATTEMPT: ${{ github.run_attempt }}
+          PYMSS_BUILD_REPOSITORY: ${{ github.repository }}
+          PYMSS_BUILD_REPOSITORY_OWNER: ${{ github.repository_owner }}
+          PYMSS_BUILD_UPDATE_SUPPORTED: 'true'
+          PYMSS_BUILD_TARGET: linux-x64
+          PYMSS_BUILD_VARIANT: linux-x64-appimage
+          PYMSS_BUILD_OFFICIAL: ${{ github.repository == 'pymss-project/pymss-studio' && github.repository_owner == 'pymss-project' && 'true' || 'false' }}
+        run: |
+          set -o pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          resources = Path('src-tauri/resources').resolve()
+          config = {'bundle': {
+              'resources': {str(resources / name): name for name in ('python', 'python-runtime', 'bin')},
+              'linux': {'appimage': {
+                  'bundleMediaFramework': True,
+              }},
+          }}
+          config['bundle']['resources'][str(resources / 'plugin-sdk')] = 'resources/plugin-sdk'
+          Path('src-tauri/tauri.bundle.resources.json').write_text(json.dumps(config))
+          PY
+          mkdir -p "$RUNNER_TEMP/pymss-linux-build"
+          pnpm plugins:build --verbose --bundles appimage --config src-tauri/tauri.bundle.resources.json 2>&1 \
+            | tee "$RUNNER_TEMP/pymss-linux-build/appimage-build.log"
+      - name: Upload AppImage failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage-build-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pymss-linux-build/appimage-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Verify packaged interpreter, tools, and first environment installation
+        run: |
+          bash scripts/verify-linux-appimage.sh
+      - name: Package release artifact
+        run: |
+          mkdir -p artifacts
+          version="${PYMSS_VERSION#v}"
+          mapfile -d '' images < <(find src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print0)
+          test "${#images[@]}" -eq 1
+          cp "${images[0]}" "artifacts/Pymss-Studio-${version}-linux-x64.AppImage"
+          cp scripts/README-Linux.txt artifacts/README-Linux.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pymss-Studio-${{ env.RELEASE_VERSION }}-linux-x64-appimage
+          path: artifacts/*
+          if-no-files-found: error

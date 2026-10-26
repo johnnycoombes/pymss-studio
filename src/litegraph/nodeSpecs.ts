@@ -54,6 +54,8 @@ export interface NodeSpec {
   inputs: InputSlotSpec[]
   outputs: OutputSlotSpec[]
   widgets: WidgetSpec[]
+  /** Retained for importing existing graphs, without an add-node entry. */
+  hidden?: boolean
   /** output node (pymss SaveAudio family) */
   isOutput?: boolean
   /** dynamic stem outputs — editor rebuilds outputs from the active model */
@@ -275,6 +277,7 @@ export const NODE_SPECS: Record<string, NodeSpec> = {
   },
   PreviewAudio: {
     type: 'PreviewAudio',
+    hidden: true,
     title: 'Preview Audio',
     category: 'pymss/output',
     inputs: [{ name: 'audio', type: PORT.AUDIO }],

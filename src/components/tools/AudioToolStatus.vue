@@ -45,6 +45,8 @@ const resultWarnings = computed(() => (props.result?.warnings || []).map((warnin
   if (warning === 'no_notes_detected') return t('tools.midiWarningNoNotes')
   if (warning === 'stereo_downmix_fallback') return t('tools.midiWarningStereoFallback')
   if (warning === 'timestamps_unavailable') return t('tools.asrWarningNoTimestamps')
+  if (warning === 'loudness_target_not_reached') return t('tools.loudnessTargetNotReached')
+  if (warning === 'loudness_true_peak_exceeded') return t('tools.loudnessTruePeakExceeded')
   return warning
 }))
 const completedCount = computed(() => {
@@ -73,6 +75,7 @@ const phaseLabels = computed<Record<AudioToolPhase, string>>(() => ({
   loading_asr_model: t('tools.phaseLoadingAsrModel'),
   recognizing_speech: t('tools.phaseRecognizingSpeech'),
   writing_transcript: t('tools.phaseWritingTranscript'),
+  analyzing_tempo_key: t('tools.phaseAnalyzingTempoKey'),
   completed: t('tools.phaseCompleted'),
   cancelled: t('tasks.statusCancelled'),
   failed: t('tools.phaseFailed'),
@@ -224,7 +227,7 @@ function showLogProgress(entry: AudioToolLogEntry) {
       <div v-else class="status-complete">
         <n-icon :component="resultWarnings.length ? AlertCircleOutline : CheckmarkCircleOutline" />
         <div>
-          <strong v-if="result.operation === 'sdr' || result.operation === 'inspect'">{{ t('tools.analysisCompleted') }}</strong>
+          <strong v-if="result.operation === 'sdr' || result.operation === 'inspect' || result.operation === 'tempo_key' || (result.operation === 'midi' && result.action === 'detect_bpm')">{{ t('tools.analysisCompleted') }}</strong>
           <strong v-else-if="resultWarnings.length">{{ t('tools.completedWithWarnings') }}</strong>
           <strong v-else>{{ t('tools.outputCount', { count: completedCount }) }}</strong>
           <span>{{ t('tools.completedIn', { time: formatElapsed(elapsedMs) }) }}</span>
@@ -250,7 +253,10 @@ function showLogProgress(entry: AudioToolLogEntry) {
     </section>
 
     <section v-else-if="result && !error" class="result-summary">
-      <div v-if="result.operation === 'midi'" class="midi-result-metrics">
+      <div v-if="result.operation === 'midi' && result.action === 'detect_bpm'" class="metric-grid">
+        <div class="metric-item"><span>{{ t('tools.bpm') }}</span><strong>{{ result.roundedBpm }}</strong></div>
+      </div>
+      <div v-else-if="result.operation === 'midi'" class="midi-result-metrics">
         <div>
           <span>{{ t('tools.midiNoteCount') }}</span>
           <strong>{{ result.noteCount ?? '—' }}</strong>

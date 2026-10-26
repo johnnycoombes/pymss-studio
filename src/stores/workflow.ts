@@ -1,3 +1,4 @@
+import { createLogger } from '@/utils/logger'
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -10,6 +11,8 @@ import {
   WORKFLOW_FORMAT_VERSION,
   type WorkflowFormat,
 } from '@/workflows/formats'
+
+const studioLog = createLogger('ui.stores.workflow')
 
 export type WorkflowEntry = {
   id: string
@@ -483,7 +486,7 @@ export const useWorkflowStore = defineStore('workflow', () => {
         )
       }
     }).catch((error) => {
-      console.warn('Failed to persist workflow selection:', error)
+      studioLog.warn('Failed to persist workflow selection:', error)
     })
   }
 

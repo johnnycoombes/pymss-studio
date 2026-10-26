@@ -255,9 +255,9 @@ class MultipleEnvironmentTests(unittest.TestCase):
             self.assertEqual(worker_bootstrap.cmd_activate_runtime({"backend": "cpu"}), 0)
             after_cpu = self._active()
         self.assertEqual(after_cuda["backend"], "cuda")
-        self.assertTrue(after_cuda["pythonPath"].endswith("cuda\\Scripts\\python.exe"))
+        self.assertEqual(Path(after_cuda["pythonPath"]), self.envs_dir / "cuda" / "Scripts" / "python.exe")
         self.assertEqual(after_cpu["backend"], "cpu")
-        self.assertTrue(after_cpu["pythonPath"].endswith("cpu\\Scripts\\python.exe"))
+        self.assertEqual(Path(after_cpu["pythonPath"]), self.envs_dir / "cpu" / "Scripts" / "python.exe")
         # Switching back and forth must not damage either environment.
         with self._runtime():
             self.assertEqual(len(worker_bootstrap._installed_envs(MANIFEST)), 2)
@@ -597,6 +597,86 @@ class BundledRuntimeFallbackTests(unittest.TestCase):
         }), encoding="utf-8")
         self.addCleanup(shutil.rmtree, self.root, True)
 
+    def _linked_user_python(self, backend):
+        python = self.user_envs / backend / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.write_text("stub", encoding="utf-8")
+        (python.parent.parent / "pymss-runtime-state.json").write_text(json.dumps({
+            "backend": backend,
+            "packages": {name: True for name in COMMON_PACKAGES},
+        }), encoding="utf-8")
+        # Exercise executable-link resolution even on Windows hosts without symlink privilege.
+        original_resolve = Path.resolve
+        bootstrap = self.bootstrap_python.resolve()
+
+        def resolve(path, *args, **kwargs):
+            return bootstrap if path == python else original_resolve(path, *args, **kwargs)
+
+        self.enterContext(mock.patch.object(Path, "resolve", autospec=True, side_effect=resolve))
+        return python
+
+    def test_user_venv_sharing_bootstrap_stays_managed_for_absolute_and_relative_pointers(self):
+        python = self._linked_user_python("cpu")
+        with mock.patch.object(worker_bootstrap, "RUNTIME_ENVS_DIR", self.user_envs), \
+             mock.patch.object(worker_bootstrap, "ACTIVE_RUNTIME_FILE", self.user_envs / "active-runtime.json"), \
+             mock.patch.object(worker_bootstrap, "BUNDLED_RUNTIME_ENVS_DIR", self.bundled_envs), \
+             mock.patch.object(worker_bootstrap, "_manifest", return_value=MANIFEST), \
+             mock.patch.object(sys, "platform", "darwin"):
+            for pointer in (str(python), "cpu/bin/python"):
+                (self.user_envs / "active-runtime.json").write_text(json.dumps({
+                    "backend": "cpu", "pythonPath": pointer,
+                }), encoding="utf-8")
+                state = worker_bootstrap._read_runtime_state()
+                self.assertEqual(state["backend"], "cpu")
+                self.assertNotEqual(state.get("source"), "bundled")
+                self.assertEqual(Path(state["pythonPath"]).parent.resolve(), python.parent.resolve())
+                target = worker_bootstrap._target_runtime_from_payload({"pythonPath": str(python)}, "cpu")
+                self.assertIsNotNone(target)
+                self.assertEqual(target[1], python.parent.parent)
+                self.assertEqual(target[3], python)
+
+    def test_idle_user_venv_link_can_be_deleted_without_touching_bundled_python(self):
+        python = self._linked_user_python("cpu")
+        with mock.patch.object(worker_bootstrap, "RUNTIME_ENVS_DIR", self.user_envs), \
+             mock.patch.object(worker_bootstrap, "ACTIVE_RUNTIME_FILE", self.user_envs / "active-runtime.json"), \
+             mock.patch.object(worker_bootstrap, "BUNDLED_RUNTIME_ENVS_DIR", self.bundled_envs), \
+             mock.patch.object(worker_bootstrap, "_manifest", return_value=MANIFEST), \
+             mock.patch.object(sys, "platform", "darwin"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = worker_bootstrap.cmd_delete_runtime({"backend": "cpu", "pythonPath": str(python)})
+        self.assertEqual(result, 0)
+        self.assertFalse(python.parent.parent.exists())
+        self.assertTrue(self.bootstrap_python.is_file())
+
+    def test_user_mlx_venv_is_distinct_from_the_bundled_mlx_runtime(self):
+        python = self._linked_user_python("mlx")
+        with mock.patch.object(worker_bootstrap, "RUNTIME_ENVS_DIR", self.user_envs), \
+             mock.patch.object(worker_bootstrap, "BUNDLED_RUNTIME_ENVS_DIR", self.bundled_envs), \
+             mock.patch.object(worker_bootstrap, "_manifest", return_value=MANIFEST), \
+             mock.patch.object(sys, "platform", "darwin"):
+            target = worker_bootstrap._target_runtime_from_payload({"pythonPath": str(python)}, "mlx")
+        self.assertIsNotNone(target)
+        state, env_dir, state_file, selected_python = target
+        self.assertNotEqual(state.get("source"), "bundled")
+        self.assertEqual(env_dir, python.parent.parent)
+        self.assertEqual(state_file, env_dir / "pymss-runtime-state.json")
+        self.assertEqual(selected_python, python)
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable symlink fixture")
+    def test_real_posix_venv_link_keeps_its_environment_identity(self):
+        python = self.user_envs / "cpu" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(os.path.relpath(self.bootstrap_python, python.parent))
+        pointer = self.user_envs / "active-runtime.json"
+        pointer.write_text(json.dumps({"backend": "cpu", "pythonPath": "cpu/bin/python"}), encoding="utf-8")
+        with mock.patch.object(worker_bootstrap, "RUNTIME_ENVS_DIR", self.user_envs), \
+             mock.patch.object(worker_bootstrap, "ACTIVE_RUNTIME_FILE", pointer), \
+             mock.patch.object(worker_bootstrap, "BUNDLED_RUNTIME_ENVS_DIR", self.bundled_envs), \
+             mock.patch.object(worker_bootstrap, "_manifest", return_value=MANIFEST):
+            state = worker_bootstrap._read_runtime_state()
+            self.assertEqual(Path(state["pythonPath"]), python.parent.resolve() / python.name)
+            self.assertNotEqual(state.get("source"), "bundled")
+
     def test_packaged_mlx_is_used_when_user_active_state_is_missing(self):
         with mock.patch.object(worker_bootstrap, "RUNTIME_ENVS_DIR", self.user_envs), \
              mock.patch.object(worker_bootstrap, "ACTIVE_RUNTIME_FILE", self.user_envs / "active-runtime.json"), \
@@ -808,7 +888,7 @@ class EnvironmentStateTrustTests(unittest.TestCase):
         self.assertEqual(state["torchBackend"], "cpu")
         self.assertIs(state["acceleratorAvailable"], False)
         # Probed the environment's own interpreter, not the active runtime's.
-        self.assertTrue(str(probe.call_args.args[0]).endswith("cpu\\Scripts\\python.exe"))
+        self.assertEqual(Path(probe.call_args.args[0]), self.envs_dir / "cpu" / "Scripts" / "python.exe")
         # Corrected on disk, so the cost is paid once.
         self.assertEqual(self._stored("cpu")["torchBackend"], "cpu")
 
@@ -970,8 +1050,9 @@ class InstallRecordsTheNewEnvironmentTests(unittest.TestCase):
              mock.patch.object(worker_bootstrap, "_manifest", return_value=manifest), \
              mock.patch.object(worker_bootstrap, "_probe_python_runtime", side_effect=self._probe), \
              mock.patch.object(worker_bootstrap, "_create_runtime_venv", side_effect=self._create_stub_venv), \
-             mock.patch.object(worker_bootstrap.subprocess, "run", return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(worker_bootstrap.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
              mock.patch.object(worker_bootstrap.subprocess, "Popen", pip), \
+             mock.patch.dict(os.environ, {"PYTHONHOME": "bundle-home", "PYTHONPATH": "bundle-overlay"}), \
              mock.patch.object(sys, "platform", "win32"), \
              contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(worker_bootstrap.cmd_install_runtime({"backend": "cpu", "mirror": "pypi"}), 0)
@@ -980,6 +1061,19 @@ class InstallRecordsTheNewEnvironmentTests(unittest.TestCase):
         self.assertEqual(state["torchBackend"], "cpu")
         self.assertIs(state["acceleratorAvailable"], False)
         self.assertEqual(state["stateVersion"], worker_bootstrap.ENV_STATE_VERSION)
+        self.assertGreater(pip.call_count, 0)
+        for call in [*pip.call_args_list, *run.call_args_list]:
+            self.assertNotIn("PYTHONHOME", call.kwargs["env"].keys())
+            self.assertNotIn("PYTHONPATH", call.kwargs["env"].keys())
+
+    def test_venv_interpreter_and_pip_checks_clear_bootstrap_environment(self):
+        with mock.patch.dict(os.environ, {"PYTHONHOME": "bundle-home", "PYTHONPATH": "bundle-overlay"}), \
+             mock.patch.object(worker_bootstrap.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertTrue(worker_bootstrap._runtime_python_works(Path("python")))
+            self.assertTrue(worker_bootstrap._runtime_pip_works(Path("python")))
+        for call in run.call_args_list:
+            self.assertNotIn("PYTHONHOME", call.kwargs["env"].keys())
+            self.assertNotIn("PYTHONPATH", call.kwargs["env"].keys())
 
     def test_missing_pip_is_bootstrapped_before_installing(self):
         calls = []
@@ -992,10 +1086,12 @@ class InstallRecordsTheNewEnvironmentTests(unittest.TestCase):
 
         def run(command, **kwargs):
             calls.append(command)
-            del kwargs
+            self.assertNotIn("PYTHONHOME", kwargs["env"].keys())
+            self.assertNotIn("PYTHONPATH", kwargs["env"].keys())
             return responses.pop(0)
 
-        with mock.patch.object(worker_bootstrap.subprocess, "run", side_effect=run), \
+        with mock.patch.dict(os.environ, {"PYTHONHOME": "bundle-home", "PYTHONPATH": "bundle-overlay"}), \
+             mock.patch.object(worker_bootstrap.subprocess, "run", side_effect=run), \
              mock.patch.object(worker_bootstrap, "_emit"):
             worker_bootstrap._ensure_runtime_pip(Path("python"), "task-1", lambda stage, message: logs.append((stage, message)))
 

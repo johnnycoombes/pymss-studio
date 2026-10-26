@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import contextlib
+import csv
+import hashlib
+import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+import venv
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -31,6 +38,9 @@ class OptionalRuntimePackageTests(unittest.TestCase):
         self.environment.start()
         self.addCleanup(self.environment.stop)
         self.addCleanup(shutil.rmtree, self.root, True)
+        self.enterContext(mock.patch.object(optional_packages, "_environment_version", side_effect=lambda name, runtime=None: {
+            "torch": "2.7.1", "torchaudio": "2.7.1",
+        }.get(name)))
 
     def test_release_manifest_does_not_bundle_funasr(self) -> None:
         manifest_path = Path(__file__).resolve().parents[2] / "python" / "runtime-manifest.json"
@@ -59,6 +69,7 @@ class OptionalRuntimePackageTests(unittest.TestCase):
         self.assertTrue(status["present"])
         self.assertEqual(status["version"], "1.3.26")
         self.assertEqual(status["source"], "managed")
+        self.assertTrue(status["canUninstall"])
         self.assertIsNone(status["issue"])
         environment_version.assert_not_called()
 
@@ -104,14 +115,116 @@ class OptionalRuntimePackageTests(unittest.TestCase):
         self.assertFalse(package_dir.exists())
         run_process.assert_not_called()
 
-    def test_uninstall_uses_the_captured_active_runtime_interpreter(self) -> None:
+    def test_windows_and_linux_keep_environment_component_uninstallation(self) -> None:
         runtime = optional_packages._runtime_context()
-        with mock.patch.object(optional_packages, "_environment_version", return_value="1.3.26"), \
+        for platform in ("win32", "linux"):
+            with self.subTest(platform=platform), \
+                 mock.patch.object(sys, "platform", platform), \
+                 mock.patch.object(optional_packages, "_environment_version", return_value="1.3.26"), \
+                 mock.patch.object(optional_packages, "_run_process") as run_process:
+                status = optional_packages.optional_package_status("funasr")
+                self.assertEqual(status["source"], "environment")
+                self.assertTrue(status["canUninstall"])
+                optional_packages._uninstall_package("funasr", runtime=runtime)
+                self.assertEqual(run_process.call_args.args[0], [
+                    str(runtime.executable), "-m", "pip", "uninstall", "--yes", "funasr",
+                ])
+
+    def test_macos_base_component_cannot_be_uninstalled(self) -> None:
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(optional_packages, "_environment_version", return_value="1.3.26"), \
              mock.patch.object(optional_packages, "_run_process") as run_process:
-            optional_packages._uninstall_package("funasr", runtime=runtime)
-        self.assertEqual(run_process.call_args.args[0][:4], [
-            str(runtime.executable), "-m", "pip", "uninstall",
-        ])
+            status = optional_packages.optional_package_status("funasr")
+            self.assertFalse(status["canUninstall"])
+            with self.assertRaisesRegex(RuntimeError, "base runtime"):
+                optional_packages._uninstall_package("funasr")
+            run_process.assert_not_called()
+
+    def test_windows_and_linux_uninstall_both_managed_and_environment_copies(self) -> None:
+        package_dir = optional_packages._package_dir("funasr")
+        for platform in ("win32", "linux"):
+            package_dir.mkdir(parents=True)
+            with self.subTest(platform=platform), \
+                 mock.patch.object(sys, "platform", platform), \
+                 mock.patch.object(optional_packages, "_environment_version", return_value="1.3.26"), \
+                 mock.patch.object(optional_packages, "_run_process") as run_process:
+                optional_packages._uninstall_package("funasr")
+                self.assertFalse(package_dir.exists())
+                self.assertIn("uninstall", run_process.call_args.args[0])
+
+    def test_uninstall_removes_only_the_managed_copy_when_the_base_also_supplies_it(self) -> None:
+        package_dir = optional_packages._package_dir("funasr")
+        package_dir.mkdir(parents=True)
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(optional_packages, "_environment_version", return_value="1.3.26"), \
+             mock.patch.object(optional_packages, "_run_process") as run_process:
+            optional_packages._uninstall_package("funasr")
+        self.assertFalse(package_dir.exists())
+        run_process.assert_not_called()
+
+    def test_uninstall_reports_the_preserved_base_component_as_read_only(self) -> None:
+        package_dir = optional_packages._package_dir("funasr")
+        information = package_dir / "funasr-1.3.26.dist-info"
+        information.mkdir(parents=True)
+        (information / "METADATA").write_text("Name: funasr\nVersion: 1.3.26\n", encoding="utf-8")
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(optional_packages, "_environment_version", return_value="1.3.26"), \
+             mock.patch.object(optional_packages, "_run_process") as run_process, \
+             mock.patch.object(optional_packages, "emit") as emit:
+            self.assertEqual(optional_packages.cmd_manage_optional_package({"package": "funasr", "action": "uninstall"}), 0)
+        self.assertFalse(package_dir.exists())
+        status = emit.call_args.args[1]
+        self.assertTrue(status["installed"])
+        self.assertEqual(status["source"], "environment")
+        self.assertFalse(status["canUninstall"])
+        run_process.assert_not_called()
+
+    def test_windows_and_linux_uninstall_commands_report_component_removed(self) -> None:
+        for platform in ("win32", "linux"):
+            with self.subTest(platform=platform), \
+                 mock.patch.object(sys, "platform", platform), \
+                 mock.patch.object(optional_packages, "_environment_version", side_effect=["1.3.26", "1.3.26", None]), \
+                 mock.patch.object(optional_packages, "_run_process") as run_process, \
+                 mock.patch.object(optional_packages, "emit") as emit:
+                self.assertEqual(optional_packages.cmd_manage_optional_package({"package": "funasr", "action": "uninstall"}), 0)
+                self.assertFalse(emit.call_args.args[1]["present"])
+                run_process.assert_called_once()
+
+    def test_macos_managed_component_uninstall_only_removes_its_directory(self) -> None:
+        package_dir = optional_packages._package_dir("funasr")
+        package_dir.mkdir(parents=True)
+        with mock.patch.object(sys, "platform", "darwin"), \
+             mock.patch.object(optional_packages, "_environment_version", return_value=None), \
+             mock.patch.object(optional_packages, "_run_process") as run_process:
+            optional_packages._uninstall_package("funasr")
+        self.assertFalse(package_dir.exists())
+        run_process.assert_not_called()
+
+    def test_bundled_component_directory_survives_first_core_activation(self) -> None:
+        bundled = self.root / "Installed.app/Contents/Resources/python-runtime/runtime-envs"
+        bundled.mkdir(parents=True)
+        (bundled / "active-runtime.json").write_text(json.dumps({"backend": "mlx"}), encoding="utf-8")
+        self.active_file.unlink()
+        with mock.patch.dict(os.environ, {"PYMSS_STUDIO_BUNDLED_RUNTIME_ENVS_DIR": str(bundled)}):
+            before = optional_packages._runtime_context()
+            self.active_file.write_text(json.dumps({"backend": "mlx", "overlayPath": "core-overlay"}), encoding="utf-8")
+            after = optional_packages._runtime_context()
+        self.assertEqual(before.backend, "mlx")
+        self.assertEqual(before.packages_dir, after.packages_dir)
+
+    def test_existing_executable_scoped_components_remain_available(self) -> None:
+        identity = optional_packages._runtime_identity(backend="", executable=Path(sys.executable).resolve())
+        legacy = self.envs_dir / "optional-packages" / identity
+        (legacy / "funasr").mkdir(parents=True)
+        runtime = optional_packages._runtime_context()
+        self.assertEqual(runtime.backend, "cuda")
+        self.assertEqual(runtime.packages_dir.resolve(), legacy.resolve())
+
+    def test_macos_default_component_root_is_outside_the_application(self) -> None:
+        with mock.patch.dict(os.environ, {"PYMSS_STUDIO_DATA_ROOT": str(self.root / "data")}), \
+             mock.patch.object(sys, "platform", "darwin"):
+            os.environ.pop("PYMSS_STUDIO_RUNTIME_ENVS_DIR")
+            self.assertEqual(optional_packages._runtime_envs_dir(), self.root / "data/runtime-envs")
 
     def test_install_stages_and_activates_package_without_writing_to_runtime(self) -> None:
         commands = []
@@ -190,12 +303,30 @@ class OptionalRuntimePackageTests(unittest.TestCase):
             ("torchaudio==2.7.1", "https://download.pytorch.org/whl/cu128"),
         )
 
+    def test_linux_rocm_audio_uses_the_linux_index_instead_of_windows_wheels(self) -> None:
+        self.active_file.write_text(json.dumps({"backend": "rocm"}), encoding="utf-8")
+        with mock.patch("worker_bootstrap.sys.platform", "linux"), mock.patch.object(
+            optional_packages, "_environment_version", side_effect=lambda name, runtime=None: {
+                "torch": "2.10.0+rocm7.1", "torchaudio": None,
+            }.get(name),
+        ):
+            self.assertEqual(optional_packages._torchaudio_requirement(), (
+                "torchaudio==2.10.0", "https://download.pytorch.org/whl/rocm7.1",
+            ))
+
     def test_matching_torchaudio_is_not_reinstalled(self) -> None:
         with mock.patch.object(optional_packages, "_environment_version", side_effect=lambda name, runtime=None: {
             "torch": "2.7.1+cu128",
             "torchaudio": "2.7.1+cu128",
         }.get(name)):
             self.assertIsNone(optional_packages._torchaudio_requirement())
+
+    def test_torchaudio_with_another_accelerator_build_is_replaced_in_the_component(self) -> None:
+        with mock.patch.object(optional_packages, "_environment_version", side_effect=lambda name, runtime=None: {
+            "torch": "2.7.1+cu128", "torchaudio": "2.7.1+cu124",
+        }.get(name)):
+            requirement = optional_packages._torchaudio_requirement()
+        self.assertEqual(requirement, ("torchaudio==2.7.1", "https://download.pytorch.org/whl/cu128"))
 
     def test_torchaudio_is_staged_without_reinstalling_torch(self) -> None:
         staging = self.root / "staging"
@@ -261,9 +392,158 @@ class OptionalRuntimePackageTests(unittest.TestCase):
             )
         self.assertEqual(resolved, ["funasr==1.3.26"])
 
+    def test_optional_resolution_rejects_changes_to_fixed_runtime_packages(self) -> None:
+        for name in ("torch", "torchvision", "triton", "mlx", "mlx-metal", "nvidia-cublas-cu12", "rocm-sdk-core", "pymss", "pymss-core", "PyMss__Core"):
+            with self.subTest(name=name):
+                report = self.root / "report.json"
+
+                def fake_process(command, *_args, **_kwargs):
+                    report.write_text(json.dumps({
+                        "install": [{"metadata": {"name": name, "version": "9.0"}}],
+                    }), encoding="utf-8")
+
+                with mock.patch.object(optional_packages, "_run_process", side_effect=fake_process):
+                    with self.assertRaisesRegex(RuntimeError, "runtime package"):
+                        optional_packages._resolve_install_requirements(
+                            "funasr==1.3.26", "https://pypi.org/simple", report, "funasr",
+                        )
+
+    def test_optional_resolution_constrains_torch_and_routes_audio_to_the_backend_installer(self) -> None:
+        report = self.root / "report.json"
+
+        def fake_process(command, *_args, **_kwargs):
+            constraints = Path(command[command.index("--constraint") + 1])
+            self.assertEqual(constraints.read_text(encoding="utf-8"), "torch==2.7.1+cu128\ntorchaudio==2.7.1\n")
+            report.write_text(json.dumps({"install": [
+                {"metadata": {"name": "funasr", "version": "1.3.26"}},
+                {"metadata": {"name": "torchaudio", "version": "2.7.1"}},
+                {"metadata": {"name": "audio-helper", "version": "1.0"}},
+            ]}), encoding="utf-8")
+
+        with mock.patch.object(optional_packages, "_environment_version", return_value="2.7.1+cu128"), \
+             mock.patch.object(optional_packages, "_run_process", side_effect=fake_process):
+            resolved = optional_packages._resolve_install_requirements(
+                "funasr==1.3.26", "https://pypi.org/simple", report, "funasr",
+            )
+        self.assertEqual(resolved, ["funasr==1.3.26", "audio-helper==1.0"])
+        self.assertFalse(report.with_suffix(".constraints.txt").exists())
+
     def test_unknown_package_is_rejected_before_running_pip(self) -> None:
         with self.assertRaisesRegex(ValueError, "Unsupported optional runtime package"):
             optional_packages._package_spec("unknown")
+
+
+class OfflineOptionalPackageTests(unittest.TestCase):
+    def test_install_load_and_uninstall_preserve_the_read_only_base(self) -> None:
+        self.check_offline_component(incompatible_torch=False)
+
+    def test_incompatible_torch_dependency_preserves_the_base_and_existing_component(self) -> None:
+        self.check_offline_component(incompatible_torch=True)
+
+    def check_offline_component(self, *, incompatible_torch: bool) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        base = root / "Installed.app/Contents/Resources/python-runtime"
+        venv.EnvBuilder(with_pip=True).create(base)
+        python = base / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        wheels = root / "wheels"
+        wheels.mkdir()
+
+        def wheel(name, version, requirements=()):
+            package = name.replace("-", "_")
+            info = f"{package}-{version}.dist-info"
+            entries = {
+                f"{package}/__init__.py": f"__version__ = {version!r}\n",
+                f"{info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+                + "".join(f"Requires-Dist: {requirement}\n" for requirement in requirements),
+                f"{info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            }
+            record = io.StringIO()
+            csv.writer(record).writerows((path, "", "") for path in [*entries, f"{info}/RECORD"])
+            entries[f"{info}/RECORD"] = record.getvalue()
+            output = wheels / f"{package}-{version}-py3-none-any.whl"
+            with zipfile.ZipFile(output, "w") as archive:
+                for path, content in entries.items():
+                    archive.writestr(path, content)
+
+        wheel("torch", "2.7.1")
+        wheel("torch", "2.8.0")
+        wheel("torchaudio", "2.7.1", ["torch==2.7.1"])
+        wheel("mlx", "0.31.0")
+        wheel("component-helper", "1.0")
+        wheel("funasr", "1.3.26", [
+            "torch>=2.8" if incompatible_torch else "torch>=2.7",
+            "torchaudio>=2.7", "component-helper>=1", "mlx>=0.31",
+        ])
+        environment = os.environ.copy()
+        for key in list(environment):
+            if key.startswith(("PIP_", "PYMSS_")) or key in {"PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"}:
+                environment.pop(key)
+        envs = root / "data/runtime-envs"
+        envs.mkdir(parents=True)
+        active = envs / "active-runtime.json"
+        active.write_text(json.dumps({"backend": "mlx"}), encoding="utf-8")
+        environment.update({
+            "PIP_NO_INDEX": "1", "PIP_FIND_LINKS": wheels.as_uri(), "PIP_CONFIG_FILE": os.devnull,
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_CACHE_DIR": str(root / "data/pip-cache"),
+            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+            "PYMSS_STUDIO_RUNTIME_ENVS_DIR": str(envs), "PYMSS_STUDIO_ACTIVE_RUNTIME_FILE": str(active),
+        })
+        subprocess.run([
+            str(python), "-m", "pip", "install", "torch==2.7.1", "mlx==0.31.0",
+        ], env=environment, capture_output=True, text=True, timeout=60, check=True)
+
+        def snapshot():
+            return {
+                path.relative_to(base).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in base.rglob("*") if path.is_file()
+            }
+
+        before = snapshot()
+        modes = [(path, path.stat().st_mode) for path in [base, *base.rglob("*")] if not path.is_symlink()]
+
+        def restore_permissions():
+            for path, mode in modes:
+                path.chmod(mode)
+
+        self.addCleanup(restore_permissions)
+        for path, mode in reversed(modes):
+            path.chmod(mode & ~0o222)
+
+        identity = f"mlx-py{sys.version_info.major}{sys.version_info.minor}"
+        runtime = optional_packages.RuntimeContext(python, "mlx", identity, envs / "optional-packages" / identity)
+        target = optional_packages._package_dir("funasr", runtime)
+        isolated_path = list(sys.path)
+        with mock.patch.dict(os.environ, environment, clear=True), \
+             mock.patch.object(sys, "path", isolated_path), \
+             contextlib.redirect_stdout(io.StringIO()):
+            if incompatible_torch:
+                target.mkdir(parents=True)
+                marker = target / "previous-component"
+                marker.write_text("preserved", encoding="utf-8")
+                with self.assertRaises(RuntimeError):
+                    optional_packages._install_package("funasr", optional_packages.OPTIONAL_PACKAGES["funasr"], "pypi", "en", runtime=runtime)
+                self.assertEqual(marker.read_text(encoding="utf-8"), "preserved")
+            else:
+                optional_packages._install_package("funasr", optional_packages.OPTIONAL_PACKAGES["funasr"], "pypi", "en", runtime=runtime)
+                # A fresh worker process adds the component directory only for
+                # the ASR path, while Torch and MLX keep loading from the base.
+                loaded = subprocess.run([
+                    str(python), "-c",
+                    "import sys, json; sys.path.insert(0, sys.argv[1]); "
+                    "from worker_optional_packages import activate_optional_packages; activate_optional_packages(); "
+                    "import funasr, component_helper, torchaudio, torch, mlx; "
+                    "print(json.dumps({m.__name__: m.__file__ for m in (funasr, component_helper, torchaudio, torch, mlx)}))",
+                    str(_worker_test_bootstrap.WORKER_DIR),
+                ], env=environment, capture_output=True, text=True, timeout=30, check=True)
+                paths = json.loads(loaded.stdout)
+                for name in ("funasr", "component_helper", "torchaudio"):
+                    self.assertTrue(Path(paths[name]).resolve().is_relative_to(target.resolve()))
+                for name in ("torch", "mlx"):
+                    self.assertTrue(Path(paths[name]).resolve().is_relative_to(base.resolve()))
+                with mock.patch.object(sys, "platform", "darwin"):
+                    optional_packages._uninstall_package("funasr", runtime=runtime)
+                self.assertFalse(target.exists())
+        self.assertEqual(snapshot(), before, "Component management must preserve the fixed runtime")
 
 
 if __name__ == "__main__":

@@ -72,27 +72,29 @@ export function workflowOutputNodes(definition: Record<string, unknown>): Workfl
   }
   return nodes
 }
-function fileStem(path: string): string {
-  return safeDirectoryPart((path.split(/[\\/]/).pop() || 'workflow').replace(/\.[^.]+$/, ''))
+function fileStem(path: string, windows: boolean): string {
+  const stem = (path.split(windows ? /[\\/]/ : /[/]/).pop() || 'workflow').replace(/\.[^.]+$/, '')
+  return windows ? safeDirectoryPart(stem) : !stem || stem === '.' || stem === '..' ? 'workflow' : stem
 }
 function safeDirectoryPart(value: string): string {
   return value.replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_').replace(/^[. ]+|[. ]+$/g, '') || 'workflow'
 }
-function appendDirectory(root: string, child: string): string {
-  return `${root.replace(/[\\/]+$/, '')}${/^[A-Za-z]:|^\\\\/.test(root) ? '\\' : '/'}${child}`
+function appendDirectory(root: string, child: string, windows: boolean): string {
+  return `${root.replace(windows ? /[\\/]+$/ : /[/]+$/, '')}${windows && /^[A-Za-z]:|^\\\\/.test(root) ? '\\' : '/'}${child}`
 }
-export function workbenchOutputDirectory(node: WorkflowBindingNode, override: string | undefined, defaultDirectory: string): string {
+export function workbenchOutputDirectory(node: WorkflowBindingNode, override: string | undefined, defaultDirectory: string, windows = /^[A-Za-z]:|^\\\\/.test(override || defaultDirectory)): string {
   const root = override || defaultDirectory
-  return node.subdirectory ? appendDirectory(root, node.subdirectory) : root
+  return node.subdirectory ? appendDirectory(root, node.subdirectory, windows) : root
 }
 
 /** Expand simple workflow bindings per file; execute native graphs unchanged once. */
 export function prepareWorkbenchRun(
   definition: Record<string, unknown>, bindings: WorkflowRuntimeBindings, defaultDirectory: string,
+  windows = /^[A-Za-z]:|^\\\\/.test(bindings.outputDirectory || defaultDirectory),
 ): { definition: Record<string, unknown>; runs: WorkbenchRun[] } {
   const transient = cloneWorkflow(definition)
   if (detectWorkflowFormat(transient) === 'graph') {
-    if (!defaultDirectory.trim()) throw new Error('workbench.missingOutputDirectory')
+    if (!(bindings.outputDirectory?.trim() || defaultDirectory.trim())) throw new Error('workbench.missingOutputDirectory')
     return { definition: transient, runs: [{ input: '', inputs: {}, outputs: {} }] }
   }
   const inputNodes = workflowInputNodes(transient)
@@ -115,8 +117,8 @@ export function prepareWorkbenchRun(
     definition: transient,
     runs: files.map(input => {
       const outputs = Object.fromEntries(outputNodes.map(node => {
-        const root = workbenchOutputDirectory(node, sharedDirectory || bindings.outputs[node.id], defaultDirectory)
-        return [node.id, bindings.outputLayout === 'folders' ? appendDirectory(root, fileStem(input)) : root]
+        const root = workbenchOutputDirectory(node, sharedDirectory || bindings.outputs[node.id], defaultDirectory, windows)
+        return [node.id, bindings.outputLayout === 'folders' ? appendDirectory(root, fileStem(input, windows), windows) : root]
       }))
       return { input, inputs: {}, outputs }
     }),

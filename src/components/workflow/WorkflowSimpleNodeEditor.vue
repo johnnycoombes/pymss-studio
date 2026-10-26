@@ -1632,7 +1632,7 @@ onBeforeUnmount(() => {
         closable
         role="dialog"
         aria-modal="true"
-        style="width: min(620px, calc(100vw - 32px))"
+        style="width: var(--modal-width-sm)"
         @close="closeInferenceEditor"
       >
         <div v-if="inferenceEditorStep" class="simple-inference-modal__body">

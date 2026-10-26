@@ -1,6 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, type Ref } from 'vue'
 import { loadAppStore, saveAppStore } from '@/utils/appStore'
-import { calculateEditorPanelCapacity } from '@/utils/editorLayout'
+import { calculateEditorPanelCapacity, resolveEditorPanelLayout } from '@/utils/editorLayout'
 
 type ResizeSide = 'assets' | 'inspector'
 
@@ -30,6 +30,7 @@ type EditorUiState = {
   inspectorCollapsed?: boolean
   assetPanelWidth?: number
   inspectorPanelWidth?: number
+  panelPriority?: ResizeSide
 }
 
 export function useEditorLayout(options: UseEditorLayoutOptions) {
@@ -48,19 +49,29 @@ export function useEditorLayout(options: UseEditorLayoutOptions) {
   } = options
 
   const viewportWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1440)
-  const inspectorPanelWidth = ref(initialInspectorWidth)
-  const assetPanelWidth = ref(initialAssetWidth)
+  const preferredInspectorWidth = ref<number | undefined>()
+  const preferredAssetWidth = ref(initialAssetWidth)
+  const panelPriority = ref<ResizeSide>('inspector')
   const isAssetCollapsed = ref(false)
   const isInspectorCollapsed = ref(true)
   const activeResize = ref<ResizeState | null>(null)
   const initialized = ref(false)
 
-  // Keep a narrow inspector launcher available after the full panel is collapsed.
-  // This gives the timeline its space without making track parameters inaccessible.
-  const inspectorVisible = computed(() => viewportWidth.value > 760)
-  const assetPanelVisible = computed(() => !isAssetCollapsed.value && viewportWidth.value > 920)
+  const layout = computed(() => resolveEditorPanelLayout({
+    shellWidth: viewportWidth.value, minCenterWidth, assetRailWidth, inspectorRailWidth, resizerWidth,
+    minAssetWidth, maxAssetWidth, minInspectorWidth, maxInspectorWidth,
+    assetPanelWidth: preferredAssetWidth.value,
+    inspectorPanelWidth: preferredInspectorWidth.value
+      ?? clamp(Math.round(viewportWidth.value * 0.18), initialInspectorWidth, maxInspectorWidth),
+    assetRequested: !isAssetCollapsed.value, inspectorRequested: !isInspectorCollapsed.value,
+    priority: panelPriority.value,
+  }))
+  const inspectorPanelWidth = computed(() => layout.value.inspectorPanelWidth)
+  const assetPanelWidth = computed(() => layout.value.assetPanelWidth)
+  const inspectorVisible = computed(() => layout.value.inspectorVisible)
+  const assetPanelVisible = computed(() => layout.value.assetPanelVisible)
   const assetResizerVisible = computed(() => assetPanelVisible.value)
-  const inspectorPanelVisible = computed(() => inspectorVisible.value && !isInspectorCollapsed.value)
+  const inspectorPanelVisible = computed(() => layout.value.inspectorPanelVisible)
 
   const shellStyle = computed(() => ({
     '--asset-rail-width': `${assetRailWidth}px`,
@@ -87,6 +98,8 @@ export function useEditorLayout(options: UseEditorLayoutOptions) {
   function getPanelCapacity(overrides: {
     inspectorPanelVisible?: boolean
     inspectorRailVisible?: boolean
+    assetPanelWidth?: number
+    inspectorPanelWidth?: number
   } = {}) {
     const nextInspectorPanelVisible = overrides.inspectorPanelVisible ?? inspectorPanelVisible.value
     const nextInspectorRailVisible = overrides.inspectorRailVisible
@@ -97,8 +110,8 @@ export function useEditorLayout(options: UseEditorLayoutOptions) {
       assetRailWidth,
       inspectorRailWidth,
       resizerWidth,
-      assetPanelWidth: assetPanelWidth.value,
-      inspectorPanelWidth: inspectorPanelWidth.value,
+      assetPanelWidth: overrides.assetPanelWidth ?? assetPanelWidth.value,
+      inspectorPanelWidth: overrides.inspectorPanelWidth ?? inspectorPanelWidth.value,
       assetPanelVisible: assetPanelVisible.value,
       inspectorRailVisible: nextInspectorRailVisible,
       inspectorPanelVisible: nextInspectorPanelVisible,
@@ -106,44 +119,39 @@ export function useEditorLayout(options: UseEditorLayoutOptions) {
   }
 
   function clampInspectorWidth(width: number) {
-    const responsiveMax = getPanelCapacity().availableInspectorWidth
+    const responsiveMax = getPanelCapacity({
+      assetPanelWidth: assetPanelVisible.value ? minAssetWidth : assetPanelWidth.value,
+    }).availableInspectorWidth
     return clamp(width, minInspectorWidth, Math.max(minInspectorWidth, Math.min(maxInspectorWidth, responsiveMax)))
   }
 
   function clampAssetWidth(width: number) {
-    const responsiveMax = getPanelCapacity().availableAssetWidth
+    const responsiveMax = getPanelCapacity({
+      inspectorPanelWidth: inspectorPanelVisible.value ? minInspectorWidth : inspectorPanelWidth.value,
+    }).availableAssetWidth
     return clamp(width, minAssetWidth, Math.max(minAssetWidth, Math.min(maxAssetWidth, responsiveMax)))
   }
 
-  function keepCenterWidthAvailable() {
-    if (!assetPanelVisible.value || !inspectorPanelVisible.value) return false
-    if (getPanelCapacity().centerWidth >= minCenterWidth) return false
-    isAssetCollapsed.value = true
-    return true
-  }
-
-  function clampPanelWidths() {
-    assetPanelWidth.value = assetPanelVisible.value
-      ? clampAssetWidth(assetPanelWidth.value)
-      : clamp(assetPanelWidth.value, minAssetWidth, maxAssetWidth)
-    inspectorPanelWidth.value = inspectorPanelVisible.value
-      ? clampInspectorWidth(inspectorPanelWidth.value)
-      : clamp(inspectorPanelWidth.value, minInspectorWidth, maxInspectorWidth)
-  }
-
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  let observer: ResizeObserver | null = null
+  let disposed = false
+
+  function persistPanelWidths() {
+    void saveAppStore('editor-ui', {
+      assetCollapsed: isAssetCollapsed.value,
+      inspectorCollapsed: isInspectorCollapsed.value,
+      assetPanelWidth: preferredAssetWidth.value,
+      inspectorPanelWidth: preferredInspectorWidth.value,
+      panelPriority: panelPriority.value,
+    } satisfies EditorUiState)
+  }
 
   function savePanelWidths() {
     if (!initialized.value) return
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(() => {
       saveTimer = null
-      void saveAppStore('editor-ui', {
-        assetCollapsed: isAssetCollapsed.value,
-        inspectorCollapsed: isInspectorCollapsed.value,
-        assetPanelWidth: assetPanelWidth.value,
-        inspectorPanelWidth: inspectorPanelWidth.value,
-      } satisfies EditorUiState)
+      persistPanelWidths()
     }, 80)
   }
 
@@ -151,10 +159,18 @@ export function useEditorLayout(options: UseEditorLayoutOptions) {
     const state = activeResize.value
     if (!state) return
     if (state.side === 'assets') {
-      assetPanelWidth.value = clampAssetWidth(state.startAssetWidth + (event.clientX - state.startX))
+      const width = clampAssetWidth(state.startAssetWidth + (event.clientX - state.startX))
+      if (width !== assetPanelWidth.value) {
+        preferredAssetWidth.value = width
+        panelPriority.value = 'assets'
+      }
       return
     }
-    inspectorPanelWidth.value = clampInspectorWidth(state.startInspectorWidth - (event.clientX - state.startX))
+    const width = clampInspectorWidth(state.startInspectorWidth - (event.clientX - state.startX))
+    if (width !== inspectorPanelWidth.value) {
+      preferredInspectorWidth.value = width
+      panelPriority.value = 'inspector'
+    }
   }
 
   function stopResize() {
@@ -182,72 +198,69 @@ export function useEditorLayout(options: UseEditorLayoutOptions) {
 
   async function restorePanelWidths() {
     const stored = await loadAppStore<EditorUiState>('editor-ui')
+    if (disposed) return
     isAssetCollapsed.value = Boolean(stored?.assetCollapsed)
     isInspectorCollapsed.value = typeof stored?.inspectorCollapsed === 'boolean'
       ? stored.inspectorCollapsed
       : true
-    assetPanelWidth.value = clamp(
-      Number(stored?.assetPanelWidth || assetPanelWidth.value),
+    preferredAssetWidth.value = clamp(
+      Number(stored?.assetPanelWidth || initialAssetWidth),
       minAssetWidth,
       maxAssetWidth,
     )
-    inspectorPanelWidth.value = clamp(
-      Number(stored?.inspectorPanelWidth || inspectorPanelWidth.value),
-      minInspectorWidth,
-      maxInspectorWidth,
-    )
-    const layoutAdjusted = keepCenterWidthAvailable()
-    clampPanelWidths()
+    const storedInspectorWidth = Number(stored?.inspectorPanelWidth)
+    preferredInspectorWidth.value = Number.isFinite(storedInspectorWidth) && storedInspectorWidth > 0
+      ? clamp(storedInspectorWidth, minInspectorWidth, maxInspectorWidth)
+      : undefined
+    panelPriority.value = stored?.panelPriority === 'assets' ? 'assets' : 'inspector'
+    syncPanelWidthsToViewport()
     initialized.value = true
-    if (layoutAdjusted) savePanelWidths()
   }
 
   function syncPanelWidthsToViewport() {
-    viewportWidth.value = window.innerWidth
-    const layoutAdjusted = keepCenterWidthAvailable()
-    clampPanelWidths()
-    if (layoutAdjusted) savePanelWidths()
+    if (disposed) return
+    viewportWidth.value = getShellWidth()
   }
 
   function toggleAssetPanel(expanded?: boolean) {
-    const shouldExpand = typeof expanded === 'boolean' ? expanded : isAssetCollapsed.value
-    if (shouldExpand === !isAssetCollapsed.value) return
-    if (
-      shouldExpand
-      && inspectorPanelVisible.value
-      && getPanelCapacity().availableAssetWidth < minAssetWidth
-    ) {
-      isInspectorCollapsed.value = true
-    }
+    const shouldExpand = typeof expanded === 'boolean' ? expanded : !assetPanelVisible.value
+    if (shouldExpand && assetPanelVisible.value) return
+    if (!shouldExpand && isAssetCollapsed.value) return
+    if (shouldExpand) panelPriority.value = 'assets'
     isAssetCollapsed.value = !shouldExpand
-    if (shouldExpand) assetPanelWidth.value = clampAssetWidth(assetPanelWidth.value)
     savePanelWidths()
   }
 
   function toggleInspectorPanel(expanded?: boolean) {
     if (!inspectorVisible.value) return
-    const shouldExpand = typeof expanded === 'boolean' ? expanded : isInspectorCollapsed.value
-    if (shouldExpand === !isInspectorCollapsed.value) return
-    if (
-      shouldExpand
-      && assetPanelVisible.value
-      && getPanelCapacity({ inspectorPanelVisible: true }).availableInspectorWidth < minInspectorWidth
-    ) {
-      isAssetCollapsed.value = true
-    }
+    const shouldExpand = typeof expanded === 'boolean' ? expanded : !inspectorPanelVisible.value
+    if (shouldExpand && inspectorPanelVisible.value) return
+    if (!shouldExpand && isInspectorCollapsed.value) return
+    if (shouldExpand) panelPriority.value = 'inspector'
     isInspectorCollapsed.value = !shouldExpand
-    if (shouldExpand) inspectorPanelWidth.value = clampInspectorWidth(inspectorPanelWidth.value)
     savePanelWidths()
   }
 
   onMounted(() => {
+    syncPanelWidthsToViewport()
     void restorePanelWidths()
     window.addEventListener('resize', syncPanelWidthsToViewport)
+    if (typeof ResizeObserver !== 'undefined' && shellEl.value) {
+      observer = new ResizeObserver(syncPanelWidthsToViewport)
+      observer.observe(shellEl.value)
+    }
   })
 
   onBeforeUnmount(() => {
+    disposed = true
     stopResize()
+    observer?.disconnect()
     window.removeEventListener('resize', syncPanelWidthsToViewport)
+    if (saveTimer) {
+      clearTimeout(saveTimer)
+      saveTimer = null
+      persistPanelWidths()
+    }
   })
 
   return {

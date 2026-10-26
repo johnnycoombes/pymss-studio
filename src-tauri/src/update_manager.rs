@@ -1,5 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
+use crate::update_sources::{self, UpdateProvider};
+pub use crate::update_sources::UpdateSource;
 use base64::Engine;
 use minisign_verify::{PublicKey, Signature};
 use reqwest::{NoProxy, Proxy};
@@ -12,9 +14,10 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_updater::{UpdaterBuilder, UpdaterExt};
+use tauri_plugin_updater::{Update, UpdaterBuilder, UpdaterExt};
 use url::Url;
 
 #[cfg(windows)]
@@ -37,7 +40,12 @@ use windows_sys::Win32::{
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const UPDATE_EVENT: &str = "pymss://managed-update-event";
+pub(crate) const UPDATE_EVENT: &str = "pymss://managed-update-event";
+static UPDATE_RESTART_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+pub fn restart_required() -> bool {
+    UPDATE_RESTART_REQUIRED.load(Ordering::SeqCst)
+}
 const UPDATE_ROOT: &str = "https://github.com/pymss-project/pymss-studio/releases/download/updater";
 const UPDATE_GENERATION: &str = "v1";
 const DEFAULT_UPDATE_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE5NzUyREY2NjAyNDVDQjAKUldTd1hDUmc5aTExcVFtUGM3ajB4R09ueU9xM3B6RG9xRDVKaUM0di9Qc1BpSGhYMXRFNUJvSWQK";
@@ -58,6 +66,7 @@ const ERROR_ELEVATION_REQUIRED: i32 = 740;
 // Apply an upper bound to connection setup and stalled reads without imposing a total
 // deadline on the archive download. Managed update archives can be large on slower links.
 const MANAGED_UPDATE_IO_TIMEOUT: Duration = Duration::from_secs(45);
+const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 const MANAGED_UPDATE_PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -65,6 +74,10 @@ const MANAGED_UPDATE_PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 pub enum DistributionKind {
     Inno,
     Portable,
+    #[cfg(target_os = "macos")]
+    MacosApp,
+    #[cfg(target_os = "linux")]
+    AppImage,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -96,6 +109,7 @@ pub struct ManagedUpdateInfo {
     pub requires_manual_install: bool,
     pub update_message: Option<String>,
     pub manual_install_url: Option<String>,
+    pub source: UpdateProvider,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -153,8 +167,21 @@ fn acquire_update_mutex() -> AppResult<UpdateMutex> {
 }
 
 pub fn current_distribution() -> Option<DistributionKind> {
-    let root = current_app_root().ok()?;
-    distribution_at(&root)
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return crate::macos_update::current_bundle().ok().map(|_| DistributionKind::MacosApp);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return std::env::var_os("APPIMAGE")
+            .filter(|path| Path::new(path).is_file())
+            .map(|_| DistributionKind::AppImage);
+    }
+    #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+    {
+        let root = current_app_root().ok()?;
+        distribution_at(&root)
+    }
 }
 
 fn distribution_at(root: &Path) -> Option<DistributionKind> {
@@ -168,32 +195,40 @@ fn distribution_at(root: &Path) -> Option<DistributionKind> {
 }
 
 pub fn update_supported() -> bool {
-    cfg!(windows) && is_official_build() && current_distribution().is_some()
+    cfg!(any(windows, all(target_os = "macos", target_arch = "aarch64"), all(target_os = "linux", target_arch = "x86_64")))
+        && is_official_build() && current_distribution().is_some()
 }
 
 pub async fn check(
     app: &AppHandle,
     channel: UpdateChannel,
     endpoint_override: Option<String>,
+    source: UpdateSource,
 ) -> AppResult<Option<ManagedUpdateInfo>> {
     let Some(distribution) = current_distribution() else {
         return Ok(None);
     };
-    let endpoint = resolve_update_endpoint(channel, endpoint_override)?;
-    let updater_builder = app
-        .updater_builder()
-        .endpoints(vec![endpoint])
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    let updater = configure_updater(app, updater_builder)?
-        .build()
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    Ok(update.map(|update| {
-        let auto_update_supported = update_auto_install_supported(&update.raw_json);
-        let requires_manual_install = update_requires_manual_install(&update.raw_json);
+    let update = check_sources(app, channel, endpoint_override, source).await?;
+    #[cfg(target_os = "macos")]
+    let installation_error = crate::macos_update::current_bundle()
+        .and_then(|bundle| crate::macos_update::check_location(&bundle))
+        .and_then(|_| update.as_ref().map_or(Ok(()), |checked| crate::macos_update::check_runtime_contract(app, &checked.update.raw_json)))
+        .err().map(|e| e.to_string());
+    #[cfg(target_os = "linux")]
+    let installation_error = crate::linux_update::current_image()
+        .and_then(|image| crate::linux_update::check_location(&image))
+        .err().map(|error| error.to_string());
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let installation_error: Option<String> = None;
+    Ok(update.map(|checked| {
+        let update = checked.update;
+        let auto_update_supported = installation_error.is_none() && update_auto_install_supported(&update.raw_json);
+        let requires_manual_install = installation_error.is_some() || update_requires_manual_install(&update.raw_json);
+        let manual_install_url = if checked.provider == UpdateProvider::Modelscope {
+            update_sources::release_page(&update.version)
+        } else {
+            update.raw_json.get("pymss_manual_install_url").and_then(|value| value.as_str()).map(str::to_string)
+        };
         ManagedUpdateInfo {
             current_version: update.current_version,
             prerelease: update.version.contains('-') || update.raw_json.get("prerelease").and_then(|value| value.as_bool()) == Some(true),
@@ -203,7 +238,9 @@ pub async fn check(
             distribution,
             auto_update_supported,
             requires_manual_install,
-            update_message: if requires_manual_install {
+            update_message: if installation_error.is_some() {
+                installation_error.clone()
+            } else if requires_manual_install {
                 Some(update_manual_install_message(&update.raw_json))
             } else {
                 update.raw_json
@@ -211,12 +248,23 @@ pub async fn check(
                     .and_then(|value| value.as_str())
                     .map(str::to_string)
             },
-            manual_install_url: update.raw_json
-                .get("pymss_manual_install_url")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
+            manual_install_url,
+            source: checked.provider,
         }
     }))
+}
+
+fn ensure_update_idle(state: &AppState, additional_windows: bool) -> AppResult<()> {
+    if additional_windows {
+        return Err(AppError::Worker("APPLICATION_UPDATE_WINDOWS: Close additional editor windows before installing the application update".into()));
+    }
+    if !state.tasks.lock().map_err(|_| AppError::Worker("Task registry lock poisoned".into()))?.is_empty()
+        || !state.native_tasks.lock().map_err(|_| AppError::Worker("Task registry lock poisoned".into()))?.is_empty()
+        || !state.migrations.lock().map_err(|_| AppError::Worker("Migration registry lock poisoned".into()))?.is_empty()
+    {
+        return Err(AppError::Worker("APPLICATION_UPDATE_BUSY: Wait for running tasks and model migrations to finish before updating".into()));
+    }
+    Ok(())
 }
 
 pub async fn start(
@@ -224,25 +272,23 @@ pub async fn start(
     channel: UpdateChannel,
     endpoint_override: Option<String>,
     expected_version: String,
+    source: UpdateSource,
 ) -> AppResult<()> {
     let Some(_) = current_distribution() else {
         return Err(AppError::Worker("This application directory is not managed by an installer or portable package".into()));
     };
-    let endpoint = resolve_update_endpoint(channel, endpoint_override)?;
-    let updater_builder = app
-        .updater_builder()
-        .endpoints(vec![endpoint])
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    let updater = configure_updater(app, updater_builder)?
-        .build()
-        .map_err(|error| AppError::Worker(error.to_string()))?;
-    let Some(update) = updater
-        .check()
-        .await
-        .map_err(|error| AppError::Worker(error.to_string()))?
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let application_guard = {
+        let guard = crate::python::worker::acquire_application_update()
+            .map_err(|error| AppError::Worker(format!("APPLICATION_UPDATE_BUSY: {error}")))?;
+        ensure_update_idle(&app.state::<AppState>(), app.webview_windows().keys().any(|label| label != "main"))?;
+        guard
+    };
+    let Some(checked) = check_sources(app, channel, endpoint_override, source).await?
     else {
         return Err(AppError::Worker("No newer managed update is available".into()));
     };
+    let update = checked.update;
     if update_requires_manual_install(&update.raw_json) {
         return Err(AppError::Worker(
             update_manual_install_message(&update.raw_json),
@@ -252,6 +298,45 @@ pub async fn start(
         return Err(AppError::Worker("The available update changed. Check for updates again before installing.".into()));
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        return crate::macos_update::start(app, &update, checked.provider, source).await;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return crate::linux_update::start(app, &update, checked.provider, source).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let candidates = download_candidates(&update.version, &update.download_url, checked.provider, source)?;
+        let candidates = order_download_candidates(app, candidates).await?;
+        let mut last_error = None;
+        for (index, (provider, download_url)) in candidates.into_iter().enumerate() {
+            let _ = app.emit(UPDATE_EVENT, serde_json::json!({
+                "event": "SourceSelected", "data": { "source": provider, "fallback": index > 0 },
+            }));
+            let mut candidate = update.clone();
+            candidate.download_url = download_url;
+            match download_archive(app, &candidate).await {
+                Ok(bytes) => {
+                    let root = current_app_root()?;
+                    stage_update(&root, &update.version, &update.signature, &bytes)?;
+                    UPDATE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
+                    let _ = app.emit(UPDATE_EVENT, serde_json::json!({ "event": "RestartRequired" }));
+                    // The helper is now waiting for this process to exit. Keep
+                    // workers excluded through frontend persistence and exit.
+                    std::mem::forget(application_guard);
+                    return Ok(());
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| AppError::Worker("No update download source is available".into())))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn download_archive(app: &AppHandle, update: &Update) -> AppResult<Vec<u8>> {
     let mut emitted_start = false;
     let mut downloaded_bytes = 0_u64;
     let download_started_at = Instant::now();
@@ -279,18 +364,172 @@ pub async fn start(
                     },
                 }));
             },
-            || {
-                let _ = app.emit(UPDATE_EVENT, serde_json::json!({ "event": "Finished" }));
-            },
+            || {},
         )
         .await
-        .map_err(|error| AppError::Worker(error.to_string()))?;
+        .map_err(updater_request_error)?;
     if bytes.len() as u64 > MAX_UPDATE_ARCHIVE_BYTES {
         return Err(AppError::Worker("The downloaded update archive exceeds the supported size limit".into()));
     }
 
-    let root = current_app_root()?;
-    stage_update(&root, &update.version, &update.signature, &bytes)
+    let _ = app.emit(UPDATE_EVENT, serde_json::json!({ "event": "Finished" }));
+    Ok(bytes)
+}
+
+fn updater_request_error(error: tauri_plugin_updater::Error) -> AppError {
+    let message = match error {
+        tauri_plugin_updater::Error::Reqwest(error) => error.without_url().to_string(),
+        error => error.to_string(),
+    };
+    AppError::Worker(message)
+}
+
+struct CheckedUpdate {
+    update: Update,
+    provider: UpdateProvider,
+    elapsed: Duration,
+}
+
+fn release_is_preferred(version: &str, elapsed: Duration, current: &str, current_elapsed: Duration) -> bool {
+    match (Version::parse(version), Version::parse(current)) {
+        (Ok(next), Ok(previous)) => next > previous || (next == previous && elapsed < current_elapsed),
+        _ => false,
+    }
+}
+
+async fn check_sources(
+    app: &AppHandle,
+    channel: UpdateChannel,
+    endpoint_override: Option<String>,
+    source: UpdateSource,
+) -> AppResult<Option<CheckedUpdate>> {
+    let endpoint = resolve_update_endpoint(channel, endpoint_override.clone())?;
+    if endpoint_override.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        return check_endpoint(app, endpoint, channel, UpdateProvider::Custom, None).await;
+    }
+    let mut requests = Vec::new();
+    for provider in source.providers() {
+        let app = app.clone();
+        let provider = *provider;
+        let github = endpoint.clone();
+        requests.push(tauri::async_runtime::spawn(async move {
+            let started = Instant::now();
+            let checked = if provider == UpdateProvider::Modelscope {
+                let client = source_client(&app)?;
+                let filename = update_sources::metadata_name(channel.endpoint_name(), UPDATE_GENERATION);
+                let manifest = update_sources::modelscope_manifest(&client, &filename).await?;
+                check_endpoint(&app, manifest.endpoint, channel, provider, Some(&manifest.version)).await?
+            } else {
+                check_endpoint(&app, github, channel, provider, None).await?
+            };
+            Ok::<_, AppError>(checked.map(|mut checked| { checked.elapsed = started.elapsed(); checked }))
+        }));
+    }
+    let mut best: Option<CheckedUpdate> = None;
+    let mut successful_check = false;
+    let mut errors = Vec::new();
+    for request in requests {
+        match request.await {
+            Ok(Ok(checked)) => {
+                successful_check = true;
+                if let Some(checked) = checked {
+                    if best.as_ref().map_or(true, |current| release_is_preferred(
+                        &checked.update.version, checked.elapsed, &current.update.version, current.elapsed,
+                    )) {
+                        best = Some(checked);
+                    }
+                }
+            }
+            Ok(Err(error)) => errors.push(error.to_string()),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if successful_check { return Ok(best); }
+    Err(AppError::Worker(format!("Unable to check update sources: {}", errors.join("; "))))
+}
+
+async fn check_endpoint(
+    app: &AppHandle,
+    endpoint: Url,
+    channel: UpdateChannel,
+    provider: UpdateProvider,
+    expected_version: Option<&str>,
+) -> AppResult<Option<CheckedUpdate>> {
+    let builder = app.updater_builder().endpoints(vec![endpoint])
+        .map_err(|error| AppError::Worker(error.to_string()))?;
+    let updater = configure_updater(app, builder.timeout(UPDATE_CHECK_TIMEOUT))?
+        .build().map_err(|error| AppError::Worker(error.to_string()))?;
+    let started = Instant::now();
+    let checked = updater.check().await.map_err(updater_request_error)?;
+    checked.map(|mut update| {
+        if expected_version.is_some_and(|expected| expected != update.version) {
+            return Err(AppError::Worker("The ModelScope update manifest does not match its release directory".into()));
+        }
+        if provider != UpdateProvider::Custom {
+            validate_update_channel(channel, &update.version, &update.raw_json)?;
+        }
+        decode_release_signature(&update.signature, &update.version)?;
+        // Metadata requests have a short deadline. Archive downloads retain the existing
+        // connection/read limits without imposing a total deadline on a large signed ZIP.
+        update.timeout = None;
+        Ok(CheckedUpdate { update, provider, elapsed: started.elapsed() })
+    }).transpose()
+}
+
+fn validate_update_channel(channel: UpdateChannel, version: &str, raw_json: &serde_json::Value) -> AppResult<()> {
+    let version = Version::parse(version)
+        .map_err(|error| AppError::Worker(format!("Invalid update version: {error}")))?;
+    if raw_json.get("channel").and_then(|value| value.as_str()) != Some(channel.endpoint_name()) {
+        return Err(AppError::Worker("The update manifest does not match the selected update channel".into()));
+    }
+    let prerelease = raw_json.get("prerelease").and_then(|value| value.as_bool())
+        .ok_or_else(|| AppError::Worker("The update manifest is missing a valid prerelease flag".into()))?;
+    // The signed archive name binds the version, so stable must reject SemVer
+    // prereleases even when unsigned metadata claims the release is stable.
+    if matches!(channel, UpdateChannel::Stable) && (!version.pre.is_empty() || prerelease) {
+        return Err(AppError::Worker("The stable update channel cannot install a prerelease version".into()));
+    }
+    if !version.pre.is_empty() && !prerelease {
+        return Err(AppError::Worker("The update manifest prerelease flag does not match its version".into()));
+    }
+    Ok(())
+}
+
+pub(crate) fn download_candidates(version: &str, original: &Url, provider: UpdateProvider, source: UpdateSource) -> AppResult<Vec<(UpdateProvider, Url)>> {
+    if provider == UpdateProvider::Custom {
+        return Ok(vec![(provider, original.clone())]);
+    }
+    let providers = if source == UpdateSource::Auto {
+        vec![provider, if provider == UpdateProvider::Github { UpdateProvider::Modelscope } else { UpdateProvider::Github }]
+    } else { vec![provider] };
+    let candidates: Vec<_> = providers.into_iter().filter_map(|provider| {
+        update_sources::archive_url(original, version, provider).map(|url| (provider, url))
+    }).collect();
+    if candidates.is_empty() {
+        return Err(AppError::Worker("The update archive URL is not a supported official release URL".into()));
+    }
+    Ok(candidates)
+}
+
+pub(crate) async fn order_download_candidates(app: &AppHandle, candidates: Vec<(UpdateProvider, Url)>) -> AppResult<Vec<(UpdateProvider, Url)>> {
+    if candidates.len() < 2 { return Ok(candidates); }
+    let client = source_client(app)?;
+    let mut probes = Vec::new();
+    for candidate in candidates {
+        let client = client.clone();
+        probes.push(tauri::async_runtime::spawn(async move {
+            let started = Instant::now();
+            let available = client.head(candidate.1.clone()).timeout(Duration::from_secs(3)).send().await
+                .is_ok_and(|response| response.status().is_success());
+            (candidate, available, started.elapsed())
+        }));
+    }
+    let mut results = Vec::new();
+    for probe in probes {
+        results.push(probe.await.map_err(|error| AppError::Worker(error.to_string()))?);
+    }
+    results.sort_by_key(|(_, available, elapsed)| (!*available, *elapsed));
+    Ok(results.into_iter().map(|(candidate, _, _)| candidate).collect())
 }
 
 pub fn run_helper_from_args() -> Option<i32> {
@@ -306,10 +545,10 @@ pub fn run_helper_from_args() -> Option<i32> {
             let signature = args.next()?.to_string_lossy().to_string();
             let result = apply_managed_update(pid, root.clone(), archive, version, signature, mode == "--apply-managed-update-elevated");
             if let Err(error) = &result {
-                eprintln!("Managed update helper failed: {error}");
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update helper failed: {error}"));
                 append_helper_log(&root, &format!("update failed: {error}"));
                 if let Err(recovery_error) = recover_or_relaunch(&root, mode == "--apply-managed-update-elevated") {
-                    eprintln!("Managed update recovery failed: {recovery_error}");
+                    crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update recovery failed: {recovery_error}"));
                     append_helper_log(&root, &format!("recovery failed: {recovery_error}"));
                 }
             }
@@ -334,9 +573,9 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
         Ok(Some(transaction)) => transaction,
         Ok(None) => return None,
         Err(error) => {
-            eprintln!("Unable to read interrupted update transaction: {error}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to read interrupted update transaction: {error}"));
             if let Err(quarantine_error) = quarantine_update_transaction(&root) {
-                eprintln!("Unable to quarantine the invalid update transaction: {quarantine_error}");
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to quarantine the invalid update transaction: {quarantine_error}"));
             }
             return None;
         }
@@ -344,7 +583,7 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
     let _update_mutex = match acquire_update_mutex() {
         Ok(mutex) => mutex,
         Err(AppError::Worker(message)) if message == "Another managed update is already in progress" => {
-            eprintln!("Managed update recovery is waiting for another update process: {message}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update recovery is waiting for another update process: {message}"));
             // The active updater holds this mutex while it launches the new
             // application and verifies the replacement.  Let the new process
             // continue booting; exiting here makes the helper treat the
@@ -352,14 +591,14 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
             return None;
         }
         Err(error) => {
-            eprintln!("Unable to acquire the managed update mutex during startup recovery: {error}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to acquire the managed update mutex during startup recovery: {error}"));
             return Some(1);
         }
     };
     let backup = PathBuf::from(&transaction.backup_dir);
     if transaction.phase == UpdatePhase::Prepared {
         if let Err(error) = cleanup_prepared_transaction(&root, &backup) {
-            eprintln!("Unable to clear prepared update transaction: {error}");
+            crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to clear prepared update transaction: {error}"));
         }
         return None;
     }
@@ -367,7 +606,7 @@ pub fn recover_interrupted_update_from_startup() -> Option<i32> {
     if helper.is_ok() {
         Some(0)
     } else {
-        eprintln!("Unable to start interrupted update recovery; continuing with the current application");
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to start interrupted update recovery; continuing with the current application"));
         if transaction.phase == UpdatePhase::Prepared {
             let _ = quarantine_update_transaction(&root);
             None
@@ -397,7 +636,7 @@ fn spawn_recovery_helper(root: &Path, backup: &Path) -> AppResult<()> {
 
 fn cleanup_prepared_transaction(root: &Path, backup: &Path) -> AppResult<()> {
     if let Err(error) = validate_backup_path(root, backup) {
-        eprintln!("Prepared update transaction has an invalid backup path: {error}");
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Prepared update transaction has an invalid backup path: {error}"));
         quarantine_update_transaction(root)?;
         return Ok(());
     }
@@ -409,7 +648,7 @@ fn cleanup_prepared_transaction(root: &Path, backup: &Path) -> AppResult<()> {
 }
 
 fn managed_endpoint(channel: UpdateChannel) -> Url {
-    Url::parse(&format!("{UPDATE_ROOT}/{}-{UPDATE_GENERATION}-windows-x64-update.json", channel.endpoint_name()))
+    Url::parse(&format!("{UPDATE_ROOT}/{}", update_sources::metadata_name(channel.endpoint_name(), UPDATE_GENERATION)))
         .expect("managed update endpoint is valid")
 }
 
@@ -434,7 +673,7 @@ fn update_manual_install_message(raw_json: &serde_json::Value) -> String {
         .get("pymss_update_message")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("This update requires manual installation from GitHub because it cannot be applied safely in place.")
+        .unwrap_or("This update requires manual installation from its release page because it cannot be applied safely in place.")
         .to_string()
 }
 
@@ -456,8 +695,29 @@ fn configure_updater_client_timeouts(client: reqwest::ClientBuilder) -> reqwest:
 }
 
 fn configure_updater(app: &AppHandle, builder: UpdaterBuilder) -> AppResult<UpdaterBuilder> {
+    let (direct, proxy) = updater_proxy(app)?;
+    Ok(builder.configure_client(move |client| configure_update_client(client, direct, proxy.clone())))
+}
+
+fn source_client(app: &AppHandle) -> AppResult<reqwest::Client> {
+    let (direct, proxy) = updater_proxy(app)?;
+    configure_update_client(update_sources::http_client_builder(), direct, proxy)
+        .user_agent("Pymss-Studio-Updater")
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .build()
+        .map_err(|error| AppError::Worker(error.to_string()))
+}
+
+pub(crate) fn configure_update_client(client: reqwest::ClientBuilder, direct: bool, proxy: Option<Proxy>) -> reqwest::ClientBuilder {
+    let client = configure_updater_client_timeouts(client);
+    if direct { client.no_proxy() }
+    else if let Some(proxy) = proxy { client.proxy(proxy) }
+    else { client }
+}
+
+pub(crate) fn updater_proxy(app: &AppHandle) -> AppResult<(bool, Option<Proxy>)> {
     let Some(state) = app.try_state::<AppState>() else {
-        return Ok(builder.configure_client(configure_updater_client_timeouts));
+        return Ok((false, None));
     };
     let proxy_settings = state
         .proxy_settings
@@ -465,11 +725,11 @@ fn configure_updater(app: &AppHandle, builder: UpdaterBuilder) -> AppResult<Upda
         .map_err(|_| AppError::Worker("proxy_settings lock poisoned".into()))?
         .clone();
     match proxy_settings.mode.as_str() {
-        "none" => Ok(builder.no_proxy().configure_client(configure_updater_client_timeouts)),
+        "none" => Ok((true, None)),
         "custom" => {
             let value = proxy_settings.url.trim();
             if value.is_empty() {
-                return Ok(builder.no_proxy().configure_client(configure_updater_client_timeouts));
+                return Ok((true, None));
             }
             let normalized = if value.contains("://") {
                 value.to_string()
@@ -481,11 +741,9 @@ fn configure_updater(app: &AppHandle, builder: UpdaterBuilder) -> AppResult<Upda
             let proxy = Proxy::all(proxy_url.as_str())
                 .map_err(|error| AppError::Worker(format!("Invalid updater proxy URL: {error}")))?;
             let no_proxy = NoProxy::from_string(&proxy_settings.bypass);
-            Ok(builder.configure_client(move |client| {
-                configure_updater_client_timeouts(client).proxy(proxy.clone().no_proxy(no_proxy.clone()))
-            }))
+            Ok((false, Some(proxy.no_proxy(no_proxy))))
         }
-        _ => Ok(builder.configure_client(configure_updater_client_timeouts)),
+        _ => Ok((false, None)),
     }
 }
 
@@ -501,6 +759,7 @@ fn current_app_root() -> AppResult<PathBuf> {
 }
 
 fn stage_update(root: &Path, version: &str, signature: &str, bytes: &[u8]) -> AppResult<()> {
+    decode_release_signature(signature, version)?;
     if read_update_transaction(root)?.is_some() {
         return Err(AppError::Worker("A previous managed update requires recovery before another update can start".into()));
     }
@@ -769,7 +1028,7 @@ fn apply_managed_update(
             return Err(error.into());
         }
     };
-    if let Err(error) = verify_payload_signature(&payload, &signature) {
+    if let Err(error) = verify_payload_signature(&payload, &signature, &version) {
         let _ = fs::remove_file(&archive);
         return Err(error);
     }
@@ -859,7 +1118,7 @@ fn apply_managed_update(
     }
     remove_update_transaction(&root)?;
     if let Err(error) = fs::remove_dir_all(&backup) {
-        eprintln!("Managed update succeeded but backup cleanup failed at {}: {error}", backup.display());
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Managed update succeeded but backup cleanup failed at {}: {error}", backup.display()));
     }
     Ok(())
 }
@@ -896,7 +1155,7 @@ fn replace_executable(current: &Path, replacement: &Path, backup: Option<&Path>)
             match replace_executable_with_moves(current, replacement, backup) {
                 Ok(()) => return Ok(()),
                 Err(fallback_error) => {
-                    eprintln!("Executable replacement failed with {error}; fallback also failed with {fallback_error}");
+                    crate::session_log::early("WARN", "update.diagnostic", &format!("Executable replacement failed with {error}; fallback also failed with {fallback_error}"));
                 }
             }
             return Err(error.into());
@@ -927,7 +1186,7 @@ fn replace_executable_with_moves(current: &Path, replacement: &Path, backup: Opt
                 )
             };
             if restored == 0 {
-                eprintln!("Unable to restore executable after fallback replacement failed: {}", std::io::Error::last_os_error());
+                crate::session_log::early("WARN", "update.diagnostic", &format!("Unable to restore executable after fallback replacement failed: {}", std::io::Error::last_os_error()));
             }
             return Err(replacement_error.into());
         }
@@ -1051,7 +1310,7 @@ fn remove_update_transaction(root: &Path) -> AppResult<()> {
 
 fn clear_recovered_transaction(root: &Path) -> AppResult<()> {
     if let Err(error) = remove_update_transaction(root) {
-        eprintln!("Recovered update files, but could not remove the transaction marker: {error}");
+        crate::session_log::early("WARN", "update.diagnostic", &format!("Recovered update files, but could not remove the transaction marker: {error}"));
         quarantine_update_transaction(root)?;
     }
     Ok(())
@@ -1091,21 +1350,36 @@ fn validate_backup_path(root: &Path, backup: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn verify_payload_signature(payload: &[u8], release_signature: &str) -> AppResult<()> {
+pub(crate) fn decode_release_signature(release_signature: &str, version: &str) -> AppResult<Signature> {
+    validate_update_version(version)?;
+    let signature = base64::engine::general_purpose::STANDARD.decode(release_signature)
+        .map_err(|error| AppError::Worker(format!("Invalid update signature: {error}")))?;
+    let signature = String::from_utf8(signature)
+        .map_err(|error| AppError::Worker(format!("Invalid update signature: {error}")))?;
+    let signature = Signature::decode(&signature)
+        .map_err(|error| AppError::Worker(format!("Invalid update signature: {error}")))?;
+    let expected = update_sources::archive_name(version);
+    let mut filenames = signature.trusted_comment().split('\t').filter_map(|part| part.strip_prefix("file:"));
+    if filenames.next() != Some(expected.as_str()) || filenames.next().is_some() {
+        return Err(AppError::Worker("The update signature does not match the expected release archive".into()));
+    }
+    Ok(signature)
+}
+
+pub(crate) fn update_public_key() -> AppResult<PublicKey> {
     let public_key = base64::engine::general_purpose::STANDARD
         .decode(UPDATE_PUBLIC_KEY)
         .map_err(|error| AppError::Worker(format!("Invalid embedded update public key: {error}")))?;
     let public_key = String::from_utf8(public_key)
         .map_err(|error| AppError::Worker(format!("Invalid embedded update public key: {error}")))?;
-    let signature = base64::engine::general_purpose::STANDARD
-        .decode(release_signature)
-        .map_err(|error| AppError::Worker(format!("Invalid update signature: {error}")))?;
-    let signature = String::from_utf8(signature)
-        .map_err(|error| AppError::Worker(format!("Invalid update signature: {error}")))?;
     let public_key = PublicKey::decode(&public_key)
         .map_err(|error| AppError::Worker(format!("Invalid update public key: {error}")))?;
-    let signature = Signature::decode(&signature)
-        .map_err(|error| AppError::Worker(format!("Invalid update signature: {error}")))?;
+    Ok(public_key)
+}
+
+pub(crate) fn verify_payload_signature(payload: &[u8], release_signature: &str, version: &str) -> AppResult<()> {
+    let public_key = update_public_key()?;
+    let signature = decode_release_signature(release_signature, version)?;
     public_key
         .verify(payload, &signature, true)
         .map_err(|error| AppError::Worker(format!("Update signature verification failed: {error}")))?;
@@ -1436,6 +1710,17 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn application_update_rejects_native_tasks_and_additional_windows() {
+        let state = crate::state::AppState::new();
+        assert!(super::ensure_update_idle(&state, false).is_ok());
+        assert!(super::ensure_update_idle(&state, true).unwrap_err().to_string().contains("APPLICATION_UPDATE_WINDOWS"));
+        state.native_tasks.lock().unwrap().insert("audio-task".into(), std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        assert!(super::ensure_update_idle(&state, false).unwrap_err().to_string().contains("APPLICATION_UPDATE_BUSY"));
+        state.native_tasks.lock().unwrap().clear();
+        assert!(super::ensure_update_idle(&state, false).is_ok());
+    }
+
     use super::{
         distribution_at, elevated_helper_args, is_elevation_required, managed_endpoint,
         pending_archive_path, read_update_transaction, restore_portable_backup,
@@ -1445,6 +1730,7 @@ mod tests {
         UpdatePhase, ERROR_ELEVATION_REQUIRED, MAX_UPDATE_ARCHIVE_BYTES,
     };
     use serde_json::json;
+    use base64::Engine;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1518,8 +1804,111 @@ mod tests {
     fn managed_updates_use_the_v1_endpoint() {
         assert_eq!(
             managed_endpoint(UpdateChannel::Stable).as_str(),
-            "https://github.com/pymss-project/pymss-studio/releases/download/updater/stable-v1-windows-x64-update.json",
+            format!("https://github.com/pymss-project/pymss-studio/releases/download/updater/{}", crate::update_sources::metadata_name("stable", "v1")),
         );
+    }
+
+    #[test]
+    fn source_selection_prefers_new_versions_before_response_speed() {
+        use std::time::Duration;
+        assert!(super::release_is_preferred("0.0.21", Duration::from_secs(3), "0.0.20", Duration::from_millis(10)));
+        assert!(!super::release_is_preferred("0.0.19", Duration::from_millis(1), "0.0.20", Duration::from_secs(3)));
+        assert!(super::release_is_preferred("0.0.20", Duration::from_millis(10), "0.0.20", Duration::from_secs(1)));
+        assert!(super::release_is_preferred("1.0.0", Duration::from_secs(2), "1.0.0-rc.1", Duration::from_millis(1)));
+        assert!(!super::release_is_preferred("invalid", Duration::ZERO, "0.0.20", Duration::ZERO));
+    }
+
+    #[test]
+    fn stable_channel_rejects_prerelease_versions_and_metadata() {
+        for (version, metadata) in [
+            ("0.0.21-rc.1", json!({"channel": "stable", "prerelease": false})),
+            ("0.0.21-rc.1", json!({"channel": "stable", "prerelease": true})),
+            ("0.0.21", json!({"channel": "stable", "prerelease": true})),
+            ("0.0.21", json!({"channel": "prerelease", "prerelease": false})),
+        ] {
+            assert!(super::validate_update_channel(UpdateChannel::Stable, version, &metadata).is_err());
+        }
+        assert!(super::validate_update_channel(
+            UpdateChannel::Stable, "0.0.21+build.1", &json!({"channel": "stable", "prerelease": false}),
+        ).is_ok());
+    }
+
+    #[test]
+    fn channel_metadata_must_match_the_requested_channel() {
+        for metadata in [
+            json!({}),
+            json!({"prerelease": false}),
+            json!({"channel": "stable"}),
+            json!({"channel": "stable", "prerelease": "false"}),
+            json!({"channel": "prerelease", "prerelease": true}),
+        ] {
+            assert!(super::validate_update_channel(UpdateChannel::Stable, "0.0.21", &metadata).is_err());
+        }
+        assert!(super::validate_update_channel(
+            UpdateChannel::Prerelease, "0.0.21", &json!({"channel": "stable", "prerelease": false}),
+        ).is_err());
+    }
+
+    #[test]
+    fn prerelease_channel_accepts_prerelease_and_stable_releases() {
+        for (version, prerelease) in [("0.0.21-rc.1", true), ("0.0.21", true), ("0.0.21", false)] {
+            assert!(super::validate_update_channel(
+                UpdateChannel::Prerelease, version, &json!({"channel": "prerelease", "prerelease": prerelease}),
+            ).is_ok());
+        }
+        assert!(super::validate_update_channel(
+            UpdateChannel::Prerelease, "0.0.21-rc.1", &json!({"channel": "prerelease", "prerelease": false}),
+        ).is_err());
+    }
+
+    #[test]
+    fn release_signature_cannot_be_reused_for_another_version() {
+        let signature = "untrusted comment: signature from tauri secret key\nRUSwXCRg9i11qZVeGcC91Q+ga6LNd9cnA5apzJD88EF9u5pWcmzJSRISDih2gqePAAT6XxRH4N73pv9RKnYnQ8E4Pca958Nf+Ag=\ntrusted comment: timestamp:1792132803\tfile:Pymss-Studio-0.0.20-windows-x64-update.zip\nKgHDaCK/VlKdFjhEV5Z/G+YmfoHBwkhRzSiwXXh/ZCcxmp6BDLxEw/9MucO2waR2s2FWAUa+0h1isXVdymJHBw==\n";
+        // This test checks filename binding before cryptographic verification.
+        let signature = signature.replace("Pymss-Studio-0.0.20-windows-x64-update.zip", &crate::update_sources::archive_name("0.0.20"));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&signature);
+        assert!(super::decode_release_signature(&encoded, "0.0.20").is_ok());
+        assert!(super::decode_release_signature(&encoded, "99.0.0").is_err());
+        let duplicate = signature.replace("\nKgHD", "\tfile:Pymss-Studio-0.0.20-windows-x64-update.zip\nKgHD");
+        assert!(super::decode_release_signature(&base64::engine::general_purpose::STANDARD.encode(duplicate), "0.0.20").is_err());
+    }
+
+    #[test]
+    fn automatic_download_fallbacks_keep_the_same_release_and_explicit_sources_stay_explicit() {
+        use crate::update_sources::{UpdateProvider, UpdateSource};
+        let original = url::Url::parse(&format!("https://github.com/pymss-project/pymss-studio/releases/download/v0.0.20/{}", crate::update_sources::archive_name("0.0.20"))).unwrap();
+        let candidates = super::download_candidates("0.0.20", &original, UpdateProvider::Github, UpdateSource::Auto).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], (UpdateProvider::Github, original.clone()));
+        assert_eq!(candidates[1].0, UpdateProvider::Modelscope);
+        let manual = super::download_candidates("0.0.20", &original, UpdateProvider::Modelscope, UpdateSource::Modelscope).unwrap();
+        assert_eq!(manual, vec![candidates[1].clone()]);
+        assert!(super::download_candidates("0.0.21", &original, UpdateProvider::Modelscope, UpdateSource::Auto).is_err());
+        let custom = url::Url::parse("http://localhost/custom.zip").unwrap();
+        assert!(super::download_candidates("0.0.20", &custom, UpdateProvider::Modelscope, UpdateSource::Modelscope).is_err());
+        assert_eq!(super::download_candidates("0.0.20", &custom, UpdateProvider::Custom, UpdateSource::Auto).unwrap(), vec![(UpdateProvider::Custom, custom)]);
+    }
+
+    #[test]
+    #[ignore = "Downloads and verifies the public signed update ZIP without installing it"]
+    fn live_modelscope_signed_package() {
+        tauri::async_runtime::block_on(async {
+            let client = crate::update_sources::http_client_builder().user_agent("Pymss-Studio-Updater").timeout(std::time::Duration::from_secs(45)).build().unwrap();
+            let manifest = crate::update_sources::modelscope_manifest(&client, "prerelease-v1-windows-x64-update.json").await.unwrap();
+            let raw: serde_json::Value = client.get(manifest.endpoint).send().await.unwrap().json().await.unwrap();
+            let version = raw["version"].as_str().unwrap();
+            let signature = raw["platforms"]["windows-x86_64"]["signature"].as_str().unwrap();
+            let original = url::Url::parse(raw["platforms"]["windows-x86_64"]["url"].as_str().unwrap()).unwrap();
+            let mirror = crate::update_sources::archive_url(&original, version, crate::update_sources::UpdateProvider::Modelscope).unwrap();
+            let bytes = client.get(mirror).header(reqwest::header::ACCEPT, "application/octet-stream").send().await.unwrap().error_for_status().unwrap().bytes().await.unwrap();
+            super::verify_payload_signature(&bytes, signature, version).unwrap();
+            assert!(super::verify_payload_signature(&bytes, signature, "99.0.0").is_err());
+            let text = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(signature).unwrap()).unwrap();
+            let tampered = text.replace(&format!("file:{}", crate::update_sources::archive_name(version)), &format!("file:{}", crate::update_sources::archive_name("99.0.0")));
+            let tampered = base64::engine::general_purpose::STANDARD.encode(tampered);
+            assert!(super::verify_payload_signature(&bytes, &tampered, "99.0.0").is_err());
+            println!("Verified ModelScope update {version}: {} bytes; replay and comment tampering rejected", bytes.len());
+        });
     }
 
     #[test]

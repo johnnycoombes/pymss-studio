@@ -22,6 +22,8 @@ const props = defineProps<{
   pixelsPerSecond: number
   trackLevels: Record<string, [number, number]>
   editingDisabled?: boolean
+  externalDragging?: boolean
+  externalImporting?: boolean
   recordingPreview?: {
     trackId: string
     start: number
@@ -445,7 +447,11 @@ defineExpose({
 </script>
 
 <template>
-  <section ref="mixerRootEl" class="editor-mixer">
+  <section ref="mixerRootEl" class="editor-mixer" :class="{ 'editor-mixer--external-drop': externalDragging }">
+    <div v-if="externalDragging || externalImporting" class="external-drop-hint" role="status">
+      <n-spin v-if="externalImporting" size="small" />
+      <span>{{ t(externalImporting ? 'editor.importingAudio' : 'editor.dropImportsTracks') }}</span>
+    </div>
     <div
       ref="scrollEl"
       class="editor-mixer__scroll"
@@ -600,7 +606,7 @@ defineExpose({
       <div
         v-else
         class="empty-state"
-        :class="{ 'empty-state--drop-target': dropTargetTrackId === '__empty__' || Boolean(fallbackDropSourceId) }"
+        :class="{ 'empty-state--drop-target': externalDragging || dropTargetTrackId === '__empty__' || Boolean(fallbackDropSourceId) }"
         @mouseenter="allowAssetDrop('__empty__')"
       >
         <strong>{{ t('editor.emptyTimeline') }}</strong>
@@ -629,10 +635,35 @@ defineExpose({
 
 <style scoped>
 .editor-mixer {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: block;
   background: color-mix(in srgb, var(--surface-1) 82%, var(--surface-2));
+}
+
+.editor-mixer--external-drop {
+  outline: 2px dashed var(--primary);
+  outline-offset: -2px;
+}
+
+.external-drop-hint {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 32px);
+  padding: 10px 14px;
+  border: 1px solid var(--primary-border);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--primary-strong);
+  font-size: 12px;
+  pointer-events: none;
 }
 
 .editor-mixer__scroll {

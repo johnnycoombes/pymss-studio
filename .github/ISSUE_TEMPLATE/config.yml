@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用问答 / Q&A
+    url: https://github.com/pymss-project/pymss-studio/discussions/categories/%E4%BD%BF%E7%94%A8%E9%97%AE%E7%AD%94-q-a
+    about: 安装、模型选择、参数设置和工作流使用问题。 / Ask about setup, models, settings and workflows.
+  - name: 功能建议 / Feature requests
+    url: https://github.com/pymss-project/pymss-studio/discussions/categories/%E5%8A%9F%E8%83%BD%E5%BB%BA%E8%AE%AE-ideas
+    about: 分享使用场景、功能需求与改进建议。 / Discuss use cases, feature requests and improvements.

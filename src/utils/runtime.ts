@@ -1,4 +1,16 @@
-import type { EnvInfo, InstalledRuntime, RuntimeBackend, RuntimeInfo } from '@/stores/app'
+import type { EnvInfo, InstalledRuntime, RuntimeBackend, RuntimeCoreVersions, RuntimeInfo } from '@/stores/app'
+
+export function supportsRuntimeManagement(info: Pick<RuntimeInfo, 'platform'> | null | undefined): boolean {
+  const reported = String(info?.platform || '').toLowerCase()
+  if (reported) return ['win32', 'windows', 'linux'].includes(reported)
+  return typeof navigator !== 'undefined' && /^(win|linux)/i.test(navigator.platform)
+}
+
+export function supportsRuntimeCoreUpdate(info: Pick<RuntimeInfo, 'platform'> | null | undefined): boolean {
+  const reported = String(info?.platform || '').toLowerCase()
+  if (reported) return ['win32', 'windows', 'darwin', 'linux'].includes(reported)
+  return typeof navigator !== 'undefined' && /^(win|mac|linux)/i.test(navigator.platform)
+}
 
 export function runtimeLoadError(info: RuntimeInfo | null | undefined, env: EnvInfo | null | undefined): string {
   if (info?.liveProbeError?.message) return info.liveProbeError.message
@@ -114,8 +126,7 @@ export function runtimeToActivate(info: RuntimeInfo | null | undefined): Install
 
 export function runtimeCoreUpdateAvailable(
   env: InstalledRuntime | undefined,
-  latestPymssVersion: string | null | undefined,
-  latestPymssCoreVersion: string | null | undefined,
+  comparison: RuntimeCoreVersions | null | undefined,
   currentManifestVersion: string | undefined,
 ) {
   if (!env || env.coreUpdateSupported === false) return false
@@ -124,8 +135,8 @@ export function runtimeCoreUpdateAvailable(
   const pymssVersion = env.pymssVersion || env.packageVersions?.pymss || ''
   const pymssCoreVersion = env.pymssCoreVersion || env.packageVersions?.['pymss-core'] || ''
   return Boolean(
-    versionGreaterThan(latestPymssVersion, pymssVersion)
-    || versionGreaterThan(latestPymssCoreVersion, pymssCoreVersion),
+    (comparison?.packages?.pymss?.currentVersion === pymssVersion && comparison.packages?.pymss?.updateAvailable)
+    || (comparison?.packages?.['pymss-core']?.currentVersion === pymssCoreVersion && comparison.packages?.['pymss-core']?.updateAvailable),
   )
 }
 
@@ -142,18 +153,6 @@ export function runtimeCoreSyncAvailable(
   const manifestStatus = runtimeManifestStatus(env, currentManifestVersion)
   return manifestStatus === 'older'
     || (manifestStatus === 'current' && env.pymssGraphAvailable === false)
-}
-
-function versionGreaterThan(candidate: string | null | undefined, current: string | null | undefined) {
-  const left = parseVersionParts(candidate)
-  const right = parseVersionParts(current)
-  if (!left || !right) return false
-  const length = Math.max(left.length, right.length)
-  for (let index = 0; index < length; index += 1) {
-    const difference = (left[index] || 0) - (right[index] || 0)
-    if (difference !== 0) return difference > 0
-  }
-  return false
 }
 
 function parseVersionParts(value: string | null | undefined) {
@@ -199,14 +198,13 @@ export function detectRuntimePlatform(info: RuntimeInfo | null | undefined) {
  * would leave a user unable to install the backend they actually need.
  */
 export function recommendedRuntimeBackend(info: RuntimeInfo | null | undefined): RuntimeBackend | null {
-  const { isMac, isAppleSilicon } = detectRuntimePlatform(info)
-  if (isMac) return isAppleSilicon ? 'mlx' : 'cpu'
+  const { isMac } = detectRuntimePlatform(info)
+  if (isMac) return 'mlx'
   const vendors = info?.gpuVendors
   if (!vendors?.length) return null
   // A discrete NVIDIA card wins over an AMD integrated one when both are present.
   if (vendors.includes('nvidia')) return 'cuda'
-  // ROCm is Windows-only in the manifest; recommending it elsewhere would fail at install time.
-  if (vendors.includes('amd')) return String(info?.platform || '') === 'win32' ? 'rocm' : 'cpu'
+  if (vendors.includes('amd')) return supportsRuntimeManagement(info) ? 'rocm' : 'cpu'
   return 'cpu'
 }
 

@@ -8,6 +8,7 @@ import AudioToolPanel from '../../shared/AudioToolPanel.vue'
 import AudioToolHeader from '../../shared/AudioToolHeader.vue'
 import { useAudioToolRuntime } from '../../runtime'
 import { loadAudioToolsState, updateAudioToolsState } from '../../state'
+import { sameAudioDirectory } from '../../paths'
 
 type MergeSortBy = 'name' | 'modified' | 'regex'
 type SortDirection = 'asc' | 'desc'
@@ -35,6 +36,7 @@ const directionOptions = computed(() => [
 const regexError = computed(() => sortBy.value === 'regex' && !regexPattern.value.trim()
   ? t('tools.mergeRegexRequired')
   : '')
+const directoryError = computed(() => sameAudioDirectory(inputDir.value, outputDir.value) ? t('tools.mergeSameDirectory') : '')
 const orderHint = computed(() => {
   if (sortBy.value === 'modified') return t('tools.mergeModifiedHint')
   if (sortBy.value === 'regex') return t('tools.mergeRegexHint')
@@ -77,7 +79,7 @@ async function pickOutput() {
 }
 
 function run() {
-  if (!inputDir.value || !outputDir.value || regexError.value) return
+  if (!inputDir.value || !outputDir.value || regexError.value || directoryError.value) return
   void runtime.execute('merge', {
     inputDir: inputDir.value,
     outputDir: outputDir.value,
@@ -93,7 +95,7 @@ function run() {
     <AudioToolHeader :icon="GitMergeOutline" :title="t('tools.mergeTitle')" :description="t('tools.mergeDescription')" />
 
     <div class="audio-tool-grid">
-      <div class="audio-tool-field">
+      <div data-guide="tool-input" class="audio-tool-field">
         <label>{{ t('tools.inputDirectory') }}</label>
         <div class="audio-tool-path">
           <n-input :value="inputDir" readonly :placeholder="t('tools.chooseInputDirectory')" />
@@ -115,6 +117,7 @@ function run() {
       </div>
     </div>
 
+    <n-alert v-if="directoryError" type="error" :bordered="false">{{ directoryError }}</n-alert>
     <div class="audio-tool-field">
       <div class="audio-tool-field-heading">
         <label>{{ t('tools.mergeRules') }}</label>
@@ -147,7 +150,7 @@ function run() {
       <n-button
         type="primary"
         :loading="state.busy"
-        :disabled="state.anyBusy || !inputDir || !outputDir || Boolean(regexError)"
+        :disabled="state.anyBusy || !inputDir || !outputDir || Boolean(regexError) || Boolean(directoryError)"
         @click="run"
       >
         {{ t('tools.startMerge') }}

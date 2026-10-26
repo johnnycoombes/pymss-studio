@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
+import { useRouter } from 'vue-router'
 import {
   AlertCircleOutline,
   CheckmarkCircleOutline,
@@ -17,26 +18,36 @@ import {
   TimeOutline,
   WarningOutline,
 } from '@vicons/ionicons5'
-import { useAppStore, type DiagnosticLevel } from '@/stores/app'
+import { useAppStore } from '@/stores/app'
 import { useSettingsStore } from '@/stores/settings'
 import { useTaskStore } from '@/stores/task'
-import { useModelStore } from '@/stores/model'
+import { useModelStore, type DownloadTask } from '@/stores/model'
+import { useWorkflowStore } from '@/stores/workflow'
+import { useOptionalRuntimePackage } from '@/features/audio-tools/optionalRuntimePackage'
+import { buildDiagnosticChecks, isDiagnosticIssueEvent, summarizeDiagnosticChecks, type DiagnosticState } from '@/utils/diagnostics'
+import { detectRuntimePlatform } from '@/utils/runtime'
+import { isTauriRuntime } from '@/utils/appStore'
+import TaskLogConsole from '@/components/TaskLogConsole.vue'
 import { formatBytes } from '@/utils/format'
+import { normalizeLogRecord, formatLogRecord, logContextPreview, logMessagePreview, locationLabel, logClock, sourceLabel, type LogRecord } from '@/utils/logRecord'
 
 const { t } = useI18n()
 const message = useMessage()
+const router = useRouter()
 const app = useAppStore()
 const settings = useSettingsStore()
 const task = useTaskStore()
 const modelStore = useModelStore()
+const workflow = useWorkflowStore()
+const funAsr = useOptionalRuntimePackage('funasr')
 
 const { developerMode, dataRoot, modelDir, outputDir, settingsDir, editorProjectsDir, logsDir, tempDir, defaultDevice, downloadSource, downloadMethod, maxConcurrentSeparations, updateEndpointOverride } = storeToRefs(settings)
 const { activeWorkerTasks, runningTasks } = storeToRefs(task)
 const { downloadTasks } = storeToRefs(modelStore)
 
-type DebugTab = 'overview' | 'runtime' | 'models' | 'events' | 'logs' | 'paths'
+type DebugTab = 'overview' | 'runtime' | 'activity' | 'models' | 'events' | 'logs' | 'runtime-tools' | 'updates'
 type CatalogEditMode = 'simple' | 'advanced'
-type DebugLogLevelFilter = 'all' | 'error' | 'warn' | 'info' | 'debug'
+type DebugLogLevelFilter = 'all' | 'error' | 'warn' | 'info' | 'debug' | 'unclassified'
 type DebugLogCategoryFilter = 'all' | 'issues' | 'traceback' | 'pymss' | 'worker' | 'app' | 'runtime' | 'store' | 'other'
 type DebugCatalogInfo = {
   baseCatalogPath: string
@@ -130,6 +141,7 @@ type DebugLogReport = {
   sizeBytes: number
 }
 type ParsedDebugLogLine = {
+  record: LogRecord
   id: string
   timestamp: string
   severity: DebugLogLevelFilter
@@ -141,6 +153,7 @@ type ParsedDebugLogLine = {
   command: string
   stage: string
   message: string
+  messageContext: string
   details: string
   location: string
   traceback: string
@@ -150,7 +163,9 @@ type ParsedDebugLogLine = {
 }
 
 const activeTab = ref<DebugTab>('overview')
+const diagnosticDetailsOpen = ref(false)
 const debugCatalogLoading = ref(false)
+const debugCatalogError = ref('')
 const debugCatalogSaving = ref(false)
 const debugCatalogInfo = ref<DebugCatalogInfo | null>(null)
 const debugCatalogText = ref('')
@@ -169,6 +184,7 @@ const debugConfigText = ref('')
 const workerEventDialogVisible = ref(false)
 const selectedWorkerEvent = ref<any | null>(null)
 const runtimeDebugLoading = ref(false)
+const runtimeDebugError = ref('')
 const runtimeDebugSaving = ref('')
 const runtimeDebugInfo = ref<DebugRuntimePointers | null>(null)
 const runtimeDebugEditorVisible = ref(false)
@@ -192,16 +208,100 @@ const debugLogCategory = ref<DebugLogCategoryFilter>('all')
 const debugLogTask = ref('all')
 const expandedDebugLogLines = ref<Record<string, boolean>>({})
 
-const diagnostics = computed(() => app.diagnostics)
+const checkingDiagnostics = ref(false)
+const optionalChecking = ref(false)
+const lastCheckedAt = ref<number | null>(null)
+const activityLoadError = ref('')
+const eventQuery = ref('')
+const eventIssuesOnly = ref(false)
+const debugLogError = ref('')
+const executionLogVisible = ref(false)
+const executionLogTaskId = ref('')
+const executionDownloadSnapshot = ref<DownloadTask | null>(null)
+const executionLogBody = ref<HTMLElement | null>(null)
+const failedTaskPage = ref(1)
+const failedTaskPageSize = 5
+const failedTaskScroller = ref<HTMLElement | null>(null)
+const executionLogTask = computed(() => task.tasks.find(item => item.id === executionLogTaskId.value))
+const liveExecutionDownload = computed(() => Object.values(downloadTasks.value).find(item => item.taskId === executionLogTaskId.value))
+watch(liveExecutionDownload, (current, previous) => {
+  if (current) executionDownloadSnapshot.value = current
+  else if (previous?.taskId === executionLogTaskId.value && modelStore.downloadStates[previous.model] === 'done') {
+    executionDownloadSnapshot.value = { ...previous, status: 'done', progress: 100, speedBytesPerSecond: 0 }
+  }
+}, { flush: 'sync' })
+const executionLogDownload = computed(() => liveExecutionDownload.value || executionDownloadSnapshot.value)
+const executionLogName = computed(() => executionLogTask.value?.runConfig?.workflowName || executionLogTask.value?.model || executionLogDownload.value?.model || executionLogTaskId.value)
+const executionLogs = computed(() => executionLogTask.value?.logs || (executionLogDownload.value?.logs || []).map(entry => entry.record || normalizeLogRecord({
+  message: entry.message, level: entry.level, timestamp: Number.isFinite(entry.ts) ? new Date(entry.ts).toISOString() : '',
+  source: 'worker', taskId: executionLogTaskId.value,
+})))
+const executionNodeLogs = computed(() => executionLogTask.value?.nodeLogs || {})
+const executionLogError = computed(() => executionLogTask.value?.error
+  || (executionLogTask.value?.status === 'failed' ? executionLogTask.value.message : '')
+  || executionLogDownload.value?.errorMessage
+  || (executionLogDownload.value?.status === 'error' ? executionLogDownload.value.message : '')
+  || '')
+const executionFailedNodes = computed(() => Object.entries(executionLogTask.value?.nodeStates || {})
+  .filter(([, state]) => state.status === 'failed').map(([id]) => id))
+const executionLogStatus = computed(() => executionLogTask.value ? t(taskStatusKeys[executionLogTask.value.status] || 'debug.stateUnknown')
+  : executionLogDownload.value ? downloadStatusLabel(executionLogDownload.value) : t('debug.stateUnknown'))
+const canReturnToTask = computed(() => executionLogTaskId.value && (executionLogTask.value || executionLogDownload.value))
+const isMac = computed(() => detectRuntimePlatform(app.runtimeInfo).isMac)
+const diagnostics = computed(() => buildDiagnosticChecks({
+  env: app.envInfo, runtime: app.runtimeInfo, envError: app.envError, runtimeError: app.runtimeInfoError,
+  connection: app.workerEventConnectionStatus, connectionError: app.workerEventConnectionError,
+  optionalPackage: funAsr.status.value, optionalError: funAsr.error.value, isMac: isMac.value,
+}))
+const diagnosticSummary = computed(() => summarizeDiagnosticChecks(diagnostics.value))
+watch([developerMode, () => diagnosticSummary.value.state], ([enabled, state], [wasEnabled]) => {
+  if (!enabled) diagnosticDetailsOpen.value = false
+  else if (!wasEnabled) diagnosticDetailsOpen.value = state === 'error' || state === 'warn'
+  else if (state === 'error' || state === 'warn') diagnosticDetailsOpen.value = true
+}, { immediate: true })
+const diagnosticStateLabels: Record<DiagnosticState, string> = {
+  ok: 'debug.stateOk', warn: 'debug.stateWarning', error: 'debug.stateError', unknown: 'debug.stateUnknown', optional: 'debug.stateOptional',
+}
+const diagnosticGroups = computed(() => [
+  { key: 'runtime', title: t('debug.environment'), hint: t('debug.groupRuntimeHint'), icon: PulseOutline },
+  { key: 'capabilities', title: t('debug.capabilities'), hint: t('debug.groupCapabilitiesHint'), icon: CheckmarkCircleOutline },
+  { key: 'connection', title: t('debug.connection'), hint: t('debug.groupConnectionHint'), icon: TerminalOutline },
+].map(group => ({ ...group, checks: diagnostics.value.filter(check => check.group === group.key) })))
+const diagnosticBusy = computed(() => checkingDiagnostics.value || optionalChecking.value || app.envLoading || app.runtimeInfoLoading)
+const failedTasks = computed(() => [...task.failedTasks].sort((a, b) => b.updatedAt - a.updatedAt))
+const latestFailedTask = computed(() => failedTasks.value[0])
+const failedTaskPageCount = computed(() => Math.max(1, Math.ceil(failedTasks.value.length / failedTaskPageSize)))
+const pagedFailedTasks = computed(() => {
+  const start = (failedTaskPage.value - 1) * failedTaskPageSize
+  return failedTasks.value.slice(start, start + failedTaskPageSize)
+})
+watch(failedTaskPageCount, (count) => {
+  failedTaskPage.value = Math.min(failedTaskPage.value, count)
+})
+watch(failedTaskPage, async () => {
+  await nextTick()
+  if (failedTaskScroller.value) failedTaskScroller.value.scrollTop = 0
+})
 const env = computed(() => app.envInfo)
-const recentWorkerEventGroups = computed(() => groupWorkerEvents(app.workerEvents as DebugWorkerEvent[]).slice(0, 40))
+const workerEventGroups = computed(() => groupWorkerEvents(app.workerEvents as DebugWorkerEvent[]))
+const recentWorkerEventGroups = computed(() => {
+  const query = eventQuery.value.trim().toLowerCase()
+  return workerEventGroups.value.filter(group => {
+    if (eventIssuesOnly.value && !group.events.some(isDiagnosticIssueEvent)) return false
+    return !query || [group.taskId, ...Object.keys(group.typeCounts), ...group.events.map(event => formatPayload(event.payload))].join('\n').toLowerCase().includes(query)
+  }).slice(0, 80)
+})
 const debugTabs = computed(() => [
   { key: 'overview', label: t('debug.tabOverview') },
+  { key: 'activity', label: t('debug.tabActivity') },
   { key: 'runtime', label: t('debug.tabRuntime') },
+  { key: 'logs', label: t('debug.tabLogs') },
+] as Array<{ key: DebugTab; label: string }>)
+const advancedTabs = computed(() => [
   { key: 'models', label: t('debug.tabModels') },
   { key: 'events', label: t('debug.tabEvents') },
-  { key: 'logs', label: t('debug.tabLogs') },
-  { key: 'paths', label: t('debug.tabPaths') },
+  { key: 'runtime-tools', label: t('debug.tabRuntimeTools') },
+  { key: 'updates', label: t('debug.updateEndpointTitle') },
 ] as Array<{ key: DebugTab; label: string }>)
 const debugModelOptions = computed(() => modelStore.models
   .filter((model) => model.downloaded || model.source === 'user')
@@ -475,6 +575,9 @@ const runningDownloadTasks = computed(() => Object.values(downloadTasks.value).f
 const runtimeDevice = computed(() => settings.getRuntimeDeviceConfig(app.envInfo))
 const cudaDevices = computed(() => env.value?.cudaDevices || [])
 const runtimeRows = computed(() => [
+  { label: t('settings.workerVersion'), value: env.value?.workerVersion },
+  { label: 'pymss-core', value: app.runtimeInfo?.pymssCoreVersion },
+  { label: t('debug.runtimeManifest'), value: app.runtimeInfo?.manifestVersion },
   { label: t('debug.defaultDevice'), value: defaultDevice.value },
   { label: t('debug.resolvedDevice'), value: `${runtimeDevice.value.device} [${runtimeDevice.value.deviceIds.join(', ')}]` },
   { label: t('debug.downloadSource'), value: downloadSource.value },
@@ -489,7 +592,6 @@ const pathRows = computed(() => [
   { label: t('debug.editorProjectsDir'), value: editorProjectsDir.value },
   { label: t('debug.logsDir'), value: logsDir.value },
   { label: t('debug.tempDir'), value: tempDir.value },
-  { label: t('debug.debugDir'), value: debugCatalogInfo.value?.debugDir || '' },
 ])
 const runtimeTree = computed<RuntimeTreeNode[]>(() => {
   const info = app.runtimeInfo
@@ -583,6 +685,7 @@ const debugLogLevelOptions = computed(() => [
   { label: 'WARN', value: 'warn' },
   { label: 'INFO', value: 'info' },
   { label: 'DEBUG', value: 'debug' },
+  { label: t('debug.logUnclassified'), value: 'unclassified' },
 ] as Array<{ label: string; value: DebugLogLevelFilter }>)
 const debugLogSourceOptions = computed(() => {
   const sources = Array.from(new Set(parsedDebugLogLines.value.map((line) => line.sourceKind).filter(Boolean))).sort()
@@ -603,7 +706,8 @@ const debugLogCategoryOptions = computed(() => [
   { label: t('debug.logCategoryOther'), value: 'other' },
 ] as Array<{ label: string; value: DebugLogCategoryFilter }>)
 const debugLogTaskOptions = computed(() => {
-  const tasks = Array.from(new Set(parsedDebugLogLines.value.map((line) => line.taskId).filter(Boolean))).sort()
+  const tasks = Array.from(new Set(parsedDebugLogLines.value.flatMap((line) => [line.taskId, ...(Array.isArray(line.record.context.taskIds) ? line.record.context.taskIds.filter((id): id is string => typeof id === 'string') : [])]).filter(Boolean))).sort()
+  if (debugLogTask.value !== 'all' && !tasks.includes(debugLogTask.value)) tasks.unshift(debugLogTask.value)
   return [
     { label: t('debug.logFilterAllTasks'), value: 'all' },
     ...tasks.map((taskId) => ({ label: shortTaskId(taskId), value: taskId })),
@@ -614,7 +718,7 @@ const filteredDebugLogLines = computed(() => {
   return parsedDebugLogLines.value.filter((line) => {
     if (debugLogLevel.value !== 'all' && line.severity !== debugLogLevel.value) return false
     if (debugLogSource.value !== 'all' && line.sourceKind !== debugLogSource.value) return false
-    if (debugLogTask.value !== 'all' && line.taskId !== debugLogTask.value) return false
+    if (debugLogTask.value !== 'all' && line.taskId !== debugLogTask.value && !(Array.isArray(line.record.context.taskIds) && line.record.context.taskIds.includes(debugLogTask.value))) return false
     if (debugLogCategory.value === 'issues' && !line.hasIssue) return false
     if (debugLogCategory.value === 'traceback' && !line.traceback) return false
     if (!['all', 'issues', 'traceback'].includes(debugLogCategory.value) && line.category !== debugLogCategory.value) return false
@@ -632,16 +736,29 @@ const debugLogIssueCounts = computed(() => {
   return { errors, warnings, tracebacks }
 })
 const statusCards = computed(() => [
-  { label: t('debug.envStatus'), value: app.envReady ? t('debug.ready') : t('debug.needsAttention'), tone: app.envReady ? 'ok' : 'warn' },
-  { label: t('debug.activeWorkerTasks'), value: String(activeWorkerTasks.value.length), tone: activeWorkerTasks.value.length ? 'warn' : 'ok' },
-  { label: t('debug.runningTasks'), value: String(runningTasks.value.length), tone: runningTasks.value.length ? 'warn' : 'ok' },
-  { label: t('debug.downloadingModels'), value: String(runningDownloadTasks.value.length), tone: runningDownloadTasks.value.length ? 'warn' : 'ok' },
+  { label: t('debug.envStatus'), value: t(diagnosticStateLabels[diagnosticSummary.value.state]), tone: diagnosticSummary.value.state, detail: t('debug.checkCounts', { ok: diagnosticSummary.value.ok, total: diagnostics.value.length }), tab: 'overview' as DebugTab },
+  { label: t('debug.runningTasks'), value: String(runningTasks.value.length), tone: 'neutral', detail: [t('debug.workflowCount', { count: runningTasks.value.filter(item => item.runConfig?.runMode === 'workflow').length }), t('debug.queuedCount', { count: task.queuedTasks.length })].join(' · '), tab: 'activity' as DebugTab },
+  { label: t('debug.downloadingModels'), value: String(runningDownloadTasks.value.length), tone: 'neutral', detail: t('debug.openActivity'), tab: 'activity' as DebugTab },
 ])
 
-function diagnosticIcon(level: DiagnosticLevel) {
+function downloadStatusLabel(item: DownloadTask) {
+  const keys: Record<string, string> = {
+    preparing: 'tasks.statusPreparing', downloading: 'models.downloadStatusDownloading', done: 'models.downloaded',
+    error: 'models.downloadStatusError', paused: 'models.downloadStatusPaused', cancelled: 'models.downloadStatusCancelled',
+    interrupted: 'models.downloadInterrupted', idle: 'models.downloadStatusIdle',
+  }
+  return keys[item.status] ? t(keys[item.status]!) : item.status
+}
+
+function openStatusCard(tab: DebugTab) {
+  activeTab.value = tab
+  if (tab === 'overview') diagnosticDetailsOpen.value = true
+}
+
+function diagnosticIcon(level: DiagnosticState) {
   if (level === 'ok') return CheckmarkCircleOutline
   if (level === 'warn') return WarningOutline
-  return AlertCircleOutline
+  return level === 'error' ? AlertCircleOutline : InformationCircleOutline
 }
 
 function eventTime(value: unknown) {
@@ -744,6 +861,7 @@ function workerEventGroupPayload(group: DebugWorkerEventGroup | null) {
     latestType: group.latestType,
     typeCounts: group.typeCounts,
     latestPayload: group.latestPayload,
+    events: [...group.events].reverse(),
   })
 }
 
@@ -757,12 +875,116 @@ function formatPayload(payload: unknown) {
 }
 
 async function checkEnv() {
-  if (!developerMode.value) return
+  if (!developerMode.value || diagnosticBusy.value) return
+  checkingDiagnostics.value = true
   try {
-    await app.checkEnv()
-    message.success(t('debug.envCheckDone'))
+    const results = await Promise.allSettled([app.checkRuntimeInfo(), app.checkEnv()])
+    await refreshOptionalDependency()
+    lastCheckedAt.value = Date.now()
+    if (results.some(result => result.status === 'rejected') || (!isMac.value && funAsr.error.value)) message.warning(t('debug.checkPartialFailure'))
+    else message.success(t('debug.envCheckDone'))
+    if (activeTab.value === 'runtime-tools') await loadRuntimeDebugPointers()
+  } finally {
+    checkingDiagnostics.value = false
+  }
+}
+
+async function refreshOptionalDependency() {
+  if (isMac.value || !isTauriRuntime() || optionalChecking.value) return
+  optionalChecking.value = true
+  try { await funAsr.refresh() }
+  finally { optionalChecking.value = false }
+}
+
+function openDiagnosticAction(action: 'runtime' | 'tools' | 'events') {
+  if (action === 'events') activeTab.value = 'events'
+  else if (action === 'runtime') void router.push({ name: 'settings', query: { section: 'runtime' } })
+  else void router.push({ name: 'tools' })
+}
+
+async function reconnectWorkerEvents() {
+  if (!isTauriRuntime() || app.workerEventConnectionStatus === 'connecting') return
+  try {
+    const { connectWorkerEvents } = await import('@/utils/events')
+    await connectWorkerEvents(app)
   } catch (error) {
     message.error(error instanceof Error ? error.message : String(error))
+  }
+}
+
+async function copyText(text: string, success: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(t(success))
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : String(error))
+  }
+}
+
+function copyDiagnosticSummary() {
+  const content = [
+    `Pymss Studio ${app.buildInfoVersion || '-'} (${app.buildInfoVariant || '-'})`,
+    `${t('debug.envStatus')}: ${t(diagnosticStateLabels[diagnosticSummary.value.state])}`,
+    `${t('debug.lastChecked')}: ${lastCheckedAt.value ? new Date(lastCheckedAt.value).toISOString() : t('debug.stateUnknown')}`,
+    ...diagnostics.value.map(check => `${check.label.startsWith('debug.') ? t(check.label) : check.label}: ${t(diagnosticStateLabels[check.state])}${check.value ? ` · ${check.value}` : ''}${check.detail && check.state !== 'ok' ? `\n  ${check.detail.replace(/\n/g, '\n  ')}` : ''}`),
+    `${t('debug.activeWorkerTasks')}: ${activeWorkerTasks.value.length}; ${t('debug.queuedCount', { count: task.queuedTasks.length })}`,
+    `${t('debug.workflowTasks')}: ${runningTasks.value.filter(item => item.runConfig?.runMode === 'workflow').length}`,
+  ].join('\n')
+  void copyText(content, 'debug.summaryCopied')
+}
+
+async function showTaskLogs(taskId: string) {
+  clearDebugLogFilters()
+  debugLogTask.value = taskId
+  activeTab.value = 'logs'
+  await loadDebugLog()
+}
+
+function showExecutionLogs(taskId: string) {
+  executionLogTaskId.value = taskId
+  executionDownloadSnapshot.value = Object.values(downloadTasks.value).find(item => item.taskId === taskId)
+    || (executionDownloadSnapshot.value?.taskId === taskId ? executionDownloadSnapshot.value : null)
+  executionLogVisible.value = true
+}
+
+async function showExecutionApplicationLogs() {
+  executionLogVisible.value = false
+  await showTaskLogs(executionLogTaskId.value)
+}
+
+function showExecutionEvents() {
+  executionLogVisible.value = false
+  eventQuery.value = executionLogTaskId.value
+  eventIssuesOnly.value = false
+  activeTab.value = 'events'
+}
+
+function showFailedNodeLogs(nodeId: string) {
+  const details = Array.from(executionLogBody.value?.querySelectorAll<HTMLDetailsElement>('.debug-node-logs') || [])
+    .find(element => element.dataset.nodeId === nodeId)
+  if (!details) return
+  details.open = true
+  void nextTick(() => details.scrollIntoView({ block: 'start' }))
+}
+
+const executionLogText = computed(() => [
+  ...executionLogs.value,
+  ...Object.entries(executionNodeLogs.value).flatMap(([id, lines]) => [`[node:${id}]`, ...lines]),
+].map(entry => formatLogRecord(normalizeLogRecord(entry))).join('\n'))
+
+const taskStatusKeys: Record<string, string> = {
+  queued: 'tasks.statusQueued', preparing: 'tasks.statusPreparing', validating_input: 'tasks.statusValidatingInput',
+  downloading_model: 'tasks.statusCheckingModel', ensuring_model: 'tasks.statusCheckingModel', loading_model: 'tasks.statusLoadingModel',
+  separating: 'tasks.statusSeparating', writing_output: 'tasks.statusWritingOutput', done: 'tasks.statusDone', failed: 'tasks.statusFailed', cancelled: 'tasks.statusCancelled',
+}
+
+async function loadActivity() {
+  activityLoadError.value = ''
+  try {
+    await workflow.initialize()
+    await workflow.refreshEditorWindows()
+  } catch (error) {
+    activityLoadError.value = error instanceof Error ? error.message : String(error)
   }
 }
 
@@ -773,12 +995,13 @@ function openWorkerEvent(group: DebugWorkerEventGroup) {
 
 async function loadDebugCatalog() {
   debugCatalogLoading.value = true
+  debugCatalogError.value = ''
   try {
     const result = await invoke<DebugCatalogInfo>('debug_catalog_info')
     debugCatalogInfo.value = result
     setCatalogEditor(catalogForEditor(result))
   } catch (error) {
-    message.error(error instanceof Error ? error.message : String(error))
+    debugCatalogError.value = error instanceof Error ? error.message : String(error)
   } finally {
     debugCatalogLoading.value = false
   }
@@ -878,8 +1101,11 @@ async function scrollDebugLogToLatest() {
 }
 
 async function loadDebugLog() {
-  if (!developerMode.value) return
+  if (!developerMode.value || debugLogLoading.value) return
+  const scroller = debugLogScroller.value
+  const followLatest = !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48
   debugLogLoading.value = true
+  debugLogError.value = ''
   try {
     const [info, content] = await Promise.all([
       invoke<DebugLogInfo>('debug_log_info'),
@@ -887,11 +1113,9 @@ async function loadDebugLog() {
     ])
     debugLogInfo.value = info
     debugLogContent.value = content
-    await scrollDebugLogToLatest()
+    if (followLatest) await scrollDebugLogToLatest()
   } catch (error) {
-    debugLogInfo.value = null
-    debugLogContent.value = null
-    message.error(error instanceof Error ? error.message : String(error))
+    debugLogError.value = error instanceof Error ? error.message : String(error)
   } finally {
     debugLogLoading.value = false
   }
@@ -913,7 +1137,7 @@ async function clearDebugLog() {
 }
 
 async function copyDebugLog() {
-  const content = debugLogContent.value?.content || ''
+  const content = filteredDebugLogLines.value.map(line => formatLogRecord(line.record)).join('\n')
   if (!content) return
   try {
     await navigator.clipboard.writeText(content)
@@ -924,7 +1148,7 @@ async function copyDebugLog() {
 }
 
 async function createDebugLogReport() {
-  if (!developerMode.value) return
+  if (!developerMode.value || debugLogReportLoading.value || debugLogClearing.value) return
   debugLogReportLoading.value = true
   try {
     const report = await invoke<DebugLogReport>('debug_log_create_report')
@@ -953,24 +1177,26 @@ async function loadRuntimeDebugPointers() {
     return
   }
   runtimeDebugLoading.value = true
+  runtimeDebugError.value = ''
   try {
     const info = await invoke<DebugRuntimePointers>('debug_runtime_pointers')
     setRuntimeDebugInfo(info)
   } catch (error) {
-    message.error(error instanceof Error ? error.message : String(error))
+    runtimeDebugError.value = error instanceof Error ? error.message : String(error)
   } finally {
     runtimeDebugLoading.value = false
   }
 }
 
 function openRuntimeDebugEditor(file: DebugRuntimeFileInfo) {
-  if (!developerMode.value || !file.editable) return
+  if (!app.runtimeDebugSupported || !developerMode.value || !file.editable) return
   runtimeDebugEditingPath.value = file.path
   runtimeDebugEditingContent.value = file.content || ''
   runtimeDebugEditorVisible.value = true
 }
 
 async function saveRuntimeDebugEditor() {
+  if (!app.runtimeDebugSupported) return
   const path = runtimeDebugEditingPath.value
   if (!path) return
   runtimeDebugSaving.value = path
@@ -991,7 +1217,7 @@ async function saveRuntimeDebugEditor() {
 }
 
 async function restoreRuntimeDebugFile(file: DebugRuntimeFileInfo) {
-  if (!developerMode.value || !file.backupExists) return
+  if (!app.runtimeDebugSupported || !developerMode.value || !file.backupExists) return
   runtimeDebugSaving.value = file.path
   try {
     const info = await app.updateDebugRuntime<DebugRuntimePointers>('debug_runtime_restore_file', { path: file.path })
@@ -1005,138 +1231,20 @@ async function restoreRuntimeDebugFile(file: DebugRuntimeFileInfo) {
 }
 
 function parseDebugLogLine(raw: string, index: number): ParsedDebugLogLine {
-  const appMatch = raw.match(/^(\S+)\s+(TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\s+(\S+)(?:\s+(.*))?$/)
-  const workerMatch = raw.match(/^(\S+)\s+PY\s+(\S+)(?:\s+(.*))?$/)
-  if (!appMatch && !workerMatch) {
-    const severity = inferLogSeverity('', raw)
-    return {
-      id: `${index}-${raw}`,
-      timestamp: '',
-      severity,
-      level: '',
-      source: '',
-      sourceKind: 'plain',
-      category: 'other',
-      taskId: '',
-      command: '',
-      stage: '',
-      message: raw,
-      details: '',
-      location: extractLogLocation(raw),
-      traceback: extractTraceback(raw),
-      hasIssue: severity === 'error' || severity === 'warn',
-      fields: {},
-      raw,
-    }
-  }
-
-  const timestamp = appMatch?.[1] || workerMatch?.[1] || ''
-  const level = appMatch?.[2] || 'PY'
-  const source = appMatch?.[3] || workerMatch?.[2] || ''
-  const attributes = appMatch?.[4] || workerMatch?.[3] || ''
-
-  const fields: Record<string, string> = {}
-  const fieldPattern = /([A-Za-z][\w]*)=(?:"((?:\\.|[^"])*)"|(\S+))/g
-  for (const field of attributes.matchAll(fieldPattern)) {
-    fields[field[1]] = parseDebugLogFieldValue(field[2] ?? field[3] ?? '')
-  }
-  const details = attributes.replace(fieldPattern, '').replace(/\s+/g, ' ').trim()
-  const fieldDetails = Object.entries(fields)
-    .filter(([key]) => key !== 'message' && key !== 'detail')
-    .map(([key, value]) => `${key}=${value}`)
-    .join(' ')
-  const embedded = parseEmbeddedLogMessage(fields.message || details)
-  const rawMessage = embedded.message || fields.message || details
-  const detail = fields.detail || ''
-  const location = extractLogLocation(`${rawMessage}\n${detail}\n${fieldDetails}`)
-  const message = stripLeadingLogLocation(rawMessage, location)
-  const traceback = extractTraceback(detail || message || raw)
-  const severity = inferLogSeverity(embedded.level || level, `${source}\n${message}\n${detail}`)
-  const sourceKind = inferLogSourceKind(source, rawMessage)
-  const category = inferLogCategory(source, sourceKind, rawMessage, fields)
-
+  const record = normalizeLogRecord(raw, index)
+  const severity: DebugLogLevelFilter = record.level === 'fatal' ? 'error'
+    : record.level === 'trace' ? 'debug' : record.level || 'unclassified'
+  const fields = Object.fromEntries(Object.entries({ ...record.context, taskId: record.taskId, nodeId: record.nodeId, jobId: record.jobId, requestId: record.requestId }).filter(([, value]) => value != null).map(([key, value]) => [key, typeof value === 'string' ? value : JSON.stringify(value)]))
+  const details = Object.entries(fields).map(([key, value]) => `${key}=${value}`).join('\n')
   return {
-    id: `${index}-${raw}`,
-    timestamp: formatDebugLogTimestamp(timestamp),
-    severity,
-    level: embedded.level || level,
-    source,
-    sourceKind,
-    category,
-    taskId: fields.taskId || '',
-    command: fields.command || '',
-    stage: fields.stage || '',
-    message,
-    details: [details && details !== message ? details : '', fieldDetails].filter(Boolean).join(' '),
-    location,
-    traceback,
-    hasIssue: severity === 'error' || severity === 'warn' || Boolean(traceback),
-    fields,
-    raw,
+    record, id: record.id, timestamp: logClock(record.timestamp), severity,
+    level: record.level?.toUpperCase() || t('debug.logUnclassified'),
+    source: (record.logger === 'logger' && record.location?.file ? record.location.file.replaceAll('\\', '/').split('/').pop() : record.logger) || record.event, sourceKind: record.source,
+    category: inferLogCategory(record.event, record.source, '', fields),
+    taskId: record.taskId || record.jobId || '', command: fields.command || '', stage: fields.stage || '',
+    message: record.message, messageContext: logContextPreview(record), details, location: locationLabel(record),
+    traceback: record.detail || '', hasIssue: severity === 'error' || severity === 'warn', fields, raw,
   }
-}
-
-function parseDebugLogFieldValue(value: string) {
-  if (!value) return ''
-  if (!/[\\"]/.test(value)) return value
-  try {
-    return JSON.parse(`"${value}"`)
-  } catch {
-    return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\')
-  }
-}
-
-function inferLogSeverity(level: string, text: string): DebugLogLevelFilter {
-  const normalized = normalizeLogLevel(level).toLowerCase()
-  if (normalized === 'fatal' || normalized === 'error') return 'error'
-  if (normalized === 'warn' || normalized === 'warning') return 'warn'
-  if (normalized === 'debug' || normalized === 'trace') return 'debug'
-  const lowered = text.toLowerCase()
-  if (lowered.includes('traceback') || lowered.includes('exception') || lowered.includes('failed')) return 'error'
-  if (lowered.includes(' warn ') || lowered.includes('cannot separate') || lowered.includes('unable to')) return 'warn'
-  return 'info'
-}
-
-function parseEmbeddedLogMessage(message: string) {
-  const text = String(message || '').trim()
-  const pymssMatch = text.match(/^(?:\d{2}:\d{2}:\d{2}\s+\|\s+)?(TRC|TRACE|DBG|DEBUG|INF|INFO|WRN|WARN|WARNING|ERR|ERROR|FTL|FATAL)\s+\|\s+(.+)$/)
-  if (pymssMatch) {
-    return {
-      level: normalizeLogLevel(pymssMatch[1]),
-      message: pymssMatch[2].trim(),
-    }
-  }
-  const pipeMatch = text.match(/^(.+?\.py:\d+)\s+\|\s+(.*)$/)
-  if (pipeMatch) {
-    return {
-      level: '',
-      message: `${pipeMatch[1]} | ${pipeMatch[2]}`.trim(),
-    }
-  }
-  return { level: '', message: text }
-}
-
-function normalizeLogLevel(level: string) {
-  const value = String(level || '').trim().toUpperCase()
-  const aliases: Record<string, string> = {
-    TRC: 'TRACE',
-    DBG: 'DEBUG',
-    INF: 'INFO',
-    WRN: 'WARN',
-    WARNING: 'WARN',
-    ERR: 'ERROR',
-    FTL: 'FATAL',
-  }
-  return aliases[value] || value
-}
-
-function inferLogSourceKind(source: string, message: string) {
-  const text = `${source} ${message}`.toLowerCase()
-  if (text.includes('pymss') || text.includes('separator.py')) return 'pymss'
-  if (text.includes('worker.')) return 'worker'
-  if (text.includes('app.')) return 'app'
-  if (text.includes('log.')) return 'log'
-  return source ? 'other' : 'plain'
 }
 
 function inferLogCategory(source: string, sourceKind: string, message: string, fields: Record<string, string>): DebugLogCategoryFilter {
@@ -1145,78 +1253,16 @@ function inferLogCategory(source: string, sourceKind: string, message: string, f
   if (text.includes('runtime') || text.includes('env_info') || text.includes('pythonpath')) return 'runtime'
   if (text.includes('app.store') || text.includes('store.')) return 'store'
   if (sourceKind === 'worker' || text.includes('worker.')) return 'worker'
-  if (sourceKind === 'app' || text.includes('app.')) return 'app'
+  if (sourceKind === 'studio' || sourceKind === 'app' || text.includes('app.')) return 'app'
   return 'other'
 }
 
 function logSourceLabel(source: string) {
-  const labels: Record<string, string> = {
-    app: 'App',
-    log: 'Log',
-    other: t('debug.logSourceOther'),
-    plain: t('debug.logSourcePlain'),
-    pymss: 'pymss',
-    worker: 'Worker',
-  }
-  return labels[source] || source
-}
-
-function extractLogLocation(text: string) {
-  const value = String(text || '')
-  const pipeLocation = value.match(/\|\s*([^|\n]+?\.py):(\d+)\s*\|/)
-  if (pipeLocation) return `${pipeLocation[1]}:${pipeLocation[2]}`
-  const tracebackFrame = value.match(/File\s+"([^"]+)",\s+line\s+(\d+),\s+in\s+([^\n]+)/)
-  if (tracebackFrame) return `${tracebackFrame[1]}:${tracebackFrame[2]} in ${tracebackFrame[3].trim()}`
-  const shortFrame = value.match(/([A-Za-z]:)?[^\s|]+\.py:(\d+)/)
-  return shortFrame ? shortFrame[0] : ''
-}
-
-function stripLeadingLogLocation(message: string, location: string) {
-  let text = String(message || '').trim()
-  if (!location) return text
-  const escaped = location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  text = text.replace(new RegExp(`^${escaped}\\s*\\|\\s*`), '')
-  text = text.replace(/^.*?\.py:\d+\s*\|\s*/, '')
-  return text.trim()
-}
-
-function extractTraceback(text: string) {
-  const value = String(text || '').trim()
-  if (!value) return ''
-  const marker = value.indexOf('Traceback (most recent call last):')
-  if (marker >= 0) return formatTracebackText(value.slice(marker))
-  if (/File\s+"[^"]+",\s+line\s+\d+,\s+in\s+/.test(value)) return formatTracebackText(value)
-  return ''
-}
-
-function formatTracebackText(value: string) {
-  return value
-    .replace(/\\n/g, '\n')
-    .replace(/\s+(File\s+")/g, '\n  $1')
-    .replace(/\s+([A-Za-z_][\w.]+(?:Error|Exception|Warning):)/g, '\n$1')
-    .trim()
-}
-
-function debugLogLineText(line: ParsedDebugLogLine) {
-  return [line.message, line.details].filter(Boolean).join(' ')
-}
-
-function debugLogLineSource(line: ParsedDebugLogLine) {
-  const source = logSourceLabel(line.sourceKind)
-  if (!line.category || line.category === 'all' || line.category === line.sourceKind) return source
-  return `${source}/${logCategoryLabel(line.category)}`
-}
-
-function debugLogLineLocation(line: ParsedDebugLogLine) {
-  const location = line.location.trim()
-  if (!location) return '-'
-  const normalized = location.replace(/\\/g, '/')
-  const fileMatch = normalized.match(/([^/]+\.py:\d+(?:\s+in\s+.+)?)$/)
-  return fileMatch?.[1] || location
+  return source === 'third_party' ? t('debug.logSourceExternal') : sourceLabel(source as LogRecord['source'])
 }
 
 function canExpandDebugLogLine(line: ParsedDebugLogLine) {
-  return Boolean(line.traceback || line.severity === 'error' || (line.severity === 'warn' && (line.location || line.details)))
+  return Boolean(line.raw || line.traceback || line.location || line.details)
 }
 
 function logCategoryLabel(category: DebugLogCategoryFilter) {
@@ -1240,15 +1286,6 @@ function clearDebugLogFilters() {
   debugLogTask.value = 'all'
 }
 
-function formatDebugLogTimestamp(value: string) {
-  const epoch = value.match(/^(\d+)\.(\d{3})Z?$/)
-  const date = epoch
-    ? new Date(Number(epoch[1]) * 1000 + Number(epoch[2]))
-    : new Date(value)
-  if (!Number.isFinite(date.getTime())) return value
-  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}`
-}
-
 function syncRuntimeOverrideFromCurrent(force = false) {
   if (!force && runtimeOverrideDirty.value) return
   const defaults = currentRuntimeOverrideDefaults.value
@@ -1266,7 +1303,7 @@ function markRuntimeOverrideDirty() {
 }
 
 async function overrideActiveRuntimePointer() {
-  if (!developerMode.value || !runtimeOverrideBackend.value || !runtimeOverridePythonPath.value.trim()) return
+  if (!app.runtimeDebugSupported || !developerMode.value || !runtimeOverrideBackend.value || !runtimeOverridePythonPath.value.trim()) return
   runtimeDebugSaving.value = 'active-runtime'
   try {
     const info = await app.updateDebugRuntime<DebugRuntimePointers>('debug_runtime_override_active', {
@@ -1286,11 +1323,17 @@ async function overrideActiveRuntimePointer() {
 function loadDebugPageData() {
   if (!developerMode.value) return
   if (!app.envLoading && !app.envInfo) app.checkEnvInBackground().catch(() => {})
-  app.checkRuntimeInfo().catch(() => {})
-  loadRuntimeDebugPointers().catch(() => {})
-  loadDebugLog().catch(() => {})
-  if (!modelStore.models.length) modelStore.loadModels().catch(() => {})
-  loadDebugCatalog().catch(() => {})
+  app.ensureRuntimeInfo().then(() => refreshOptionalDependency()).catch(() => {})
+  loadTabData(activeTab.value)
+}
+
+function loadTabData(tab: DebugTab) {
+  if (!developerMode.value || !isTauriRuntime()) return
+  if (tab === 'runtime-tools' && !runtimeDebugInfo.value && !runtimeDebugLoading.value) void loadRuntimeDebugPointers()
+  if (tab === 'logs' && !debugLogContent.value && !debugLogLoading.value) void loadDebugLog()
+  if (tab === 'models' && !debugCatalogInfo.value && !debugCatalogLoading.value) void loadDebugCatalog()
+  if (tab === 'models' && !modelStore.models.length) modelStore.loadModels().catch(() => {})
+  if (tab === 'activity') void loadActivity()
 }
 
 onMounted(() => {
@@ -1315,6 +1358,7 @@ watch(currentRuntimeOverrideDefaults, () => {
 }, { immediate: true })
 
 watch(activeTab, (tab) => {
+  loadTabData(tab)
   if (tab === 'logs') scrollDebugLogToLatest().catch(() => {})
 })
 
@@ -1328,6 +1372,7 @@ watch(developerMode, (enabled) => {
     selectedWorkerEvent.value = null
     runtimeDebugEditorVisible.value = false
     catalogModelDialogVisible.value = false
+    executionLogVisible.value = false
     runtimeDebugInfo.value = null
     debugLogInfo.value = null
     debugLogContent.value = null
@@ -1342,10 +1387,14 @@ watch(developerMode, (enabled) => {
         <h1>{{ t('debug.title') }}</h1>
         <p>{{ t('debug.subtitle') }}</p>
       </div>
-      <n-button type="primary" secondary :loading="app.envLoading" @click="checkEnv">
-        <template #icon><n-icon :component="RefreshOutline" /></template>
-        {{ app.envLoading ? t('settings.checkingEnv') : t('settings.checkEnv') }}
-      </n-button>
+      <div class="debug-header-actions">
+        <n-button secondary :disabled="!developerMode || diagnosticBusy" @click="copyDiagnosticSummary">{{ t('debug.copySummary') }}</n-button>
+        <n-button secondary :disabled="!developerMode || debugLogClearing" :loading="debugLogReportLoading" @click="createDebugLogReport">{{ t('debug.createReport') }}</n-button>
+        <n-button type="primary" :disabled="!developerMode || diagnosticBusy" :loading="diagnosticBusy" @click="checkEnv">
+          <template #icon><n-icon :component="RefreshOutline" /></template>
+          {{ diagnosticBusy ? t('settings.checkingEnv') : t('settings.checkEnv') }}
+        </n-button>
+      </div>
     </div>
 
     <div v-if="!developerMode" class="debug-page__lock" aria-live="polite">
@@ -1361,47 +1410,82 @@ watch(developerMode, (enabled) => {
     </div>
 
     <div class="debug-page__content" :class="{ 'debug-page__content--locked': !developerMode }" :inert="!developerMode || undefined">
-    <nav class="debug-tabs" aria-label="Debug sections">
+    <div class="debug-navigation">
+    <nav class="debug-tabs" :aria-label="t('debug.sectionNavigation')">
       <button
         v-for="tab in debugTabs"
         :key="tab.key"
         type="button"
         class="debug-tab"
         :class="{ 'debug-tab--active': activeTab === tab.key }"
+        :aria-current="activeTab === tab.key ? 'page' : undefined"
         @click="activeTab = tab.key"
       >
         {{ tab.label }}
       </button>
     </nav>
+    <nav class="debug-advanced-nav" :aria-label="t('debug.advancedTools')">
+      <button v-for="tab in advancedTabs" :key="tab.key" type="button" class="debug-tab" :class="{ 'debug-tab--active': activeTab === tab.key }" :aria-current="activeTab === tab.key ? 'page' : undefined" @click="activeTab = tab.key">{{ tab.label }}</button>
+    </nav>
+    </div>
 
-    <section v-if="activeTab === 'overview'" class="debug-status-grid">
-      <article v-for="item in statusCards" :key="item.label" class="debug-status-card" :class="`debug-status-card--${item.tone}`">
+    <section v-if="activeTab === 'overview'" class="debug-overview-summary">
+    <div class="debug-status-grid">
+      <button v-for="item in statusCards" :key="item.label" type="button" class="debug-status-card" :class="`debug-status-card--${item.tone}`" @click="openStatusCard(item.tab)">
         <span>{{ item.label }}</span>
         <strong>{{ item.value }}</strong>
-      </article>
+        <small>{{ item.detail }}</small>
+      </button>
+    </div>
+
+    <div class="debug-check-status" aria-live="polite">
+      <span>{{ diagnosticBusy ? t('settings.checkingEnv') : lastCheckedAt ? `${t('debug.lastChecked')} ${eventTime(new Date(lastCheckedAt).toISOString())}` : t('debug.cachedSnapshot') }}</span>
+      <span>{{ t('debug.issueCounts', { errors: diagnosticSummary.error, warnings: diagnosticSummary.warn, unknown: diagnosticSummary.unknown }) }}</span>
+    </div>
+    <article v-if="latestFailedTask" class="debug-latest-failure">
+      <n-icon :component="AlertCircleOutline" />
+      <div>
+        <span>{{ t('debug.latestFailure') }} · {{ new Date(latestFailedTask.updatedAt).toLocaleString() }}</span>
+        <strong>{{ latestFailedTask.runConfig?.workflowName || latestFailedTask.model }}</strong>
+        <p :title="latestFailedTask.error || latestFailedTask.message">{{ latestFailedTask.error || latestFailedTask.message }}</p>
+      </div>
+      <n-button size="small" secondary @click="showExecutionLogs(latestFailedTask.id)">{{ t('debug.viewTaskDetails') }}</n-button>
+    </article>
+    <p v-else class="debug-overview-empty">{{ t('debug.noFailures') }}</p>
     </section>
 
-    <section v-if="activeTab === 'overview'" class="debug-grid debug-grid--top">
-      <n-card class="debug-card" :bordered="true" size="small">
+    <details v-if="activeTab === 'overview'" class="debug-health-details" :open="diagnosticDetailsOpen" @toggle="diagnosticDetailsOpen = ($event.target as HTMLDetailsElement).open">
+    <summary>{{ t('debug.diagnosticDetails') }}<span>{{ t('debug.checkCounts', { ok: diagnosticSummary.ok, total: diagnostics.length }) }}</span></summary>
+    <section v-if="activeTab === 'overview'" class="debug-health-grid" :aria-busy="diagnosticBusy">
+      <n-card v-for="group in diagnosticGroups" :key="group.key" class="debug-card" :bordered="true" size="small">
         <template #header>
           <div class="debug-section-title">
-            <n-icon :component="PulseOutline" />
-            <span>{{ t('debug.environment') }}</span>
+            <n-icon :component="group.icon" />
+            <span>{{ group.title }}</span>
           </div>
         </template>
+        <p class="debug-group-hint">{{ group.hint }}</p>
         <div class="diagnostic-list">
-          <div v-for="item in diagnostics" :key="item.key" class="diagnostic-row" :class="`diagnostic-row--${item.level}`">
-            <n-icon :component="diagnosticIcon(item.level)" />
+          <div v-for="item in group.checks" :key="item.key" class="diagnostic-row" :class="`diagnostic-row--${item.state}`">
+            <n-icon :component="diagnosticIcon(item.state)" />
             <div class="diagnostic-row__main">
-              <strong>{{ item.label }}</strong>
-              <span>{{ item.value }}</span>
+              <div class="diagnostic-row__head">
+                <strong>{{ item.label.startsWith('debug.') ? t(item.label) : item.label }}</strong>
+                <span class="diagnostic-state">{{ item.state === 'unknown' && diagnosticBusy ? t('settings.checkingEnv') : t(diagnosticStateLabels[item.state]) }}</span>
+              </div>
+              <span v-if="item.value">{{ item.value }}</span>
               <code v-if="item.detail">{{ item.detail }}</code>
+              <p v-if="item.hint && ['warn', 'error', 'optional'].includes(item.state)">{{ t(item.hint) }}</p>
+              <button v-if="['warn', 'error', 'optional'].includes(item.state) || item.detail && item.state === 'unknown'" type="button" class="diagnostic-action" @click="openDiagnosticAction(item.action)">{{ t(item.action === 'runtime' ? 'debug.manageRuntime' : item.action === 'tools' ? 'debug.openTools' : 'debug.tabEvents') }}</button>
+              <n-button v-if="item.key === 'connection' && item.state !== 'ok' && isTauriRuntime()" size="tiny" tertiary :loading="app.workerEventConnectionStatus === 'connecting'" :disabled="app.workerEventConnectionStatus === 'connecting'" @click="reconnectWorkerEvents">{{ t('debug.reconnectEvents') }}</n-button>
             </div>
           </div>
-          <n-empty v-if="!diagnostics.length" :description="t('debug.envNotChecked')" />
         </div>
       </n-card>
+    </section>
+    </details>
 
+    <section v-if="activeTab === 'runtime'" class="debug-grid debug-environment-grid">
       <n-card class="debug-card" :bordered="true" size="small">
         <template #header>
           <div class="debug-section-title">
@@ -1410,7 +1494,7 @@ watch(developerMode, (enabled) => {
           </div>
         </template>
         <div class="kv-list">
-          <div v-for="row in runtimeRows" :key="row.label" class="kv-row">
+          <div v-for="row in [...runtimeStatusRows, ...runtimeRows]" :key="row.label" class="kv-row">
             <span>{{ row.label }}</span>
             <code>{{ row.value || '-' }}</code>
           </div>
@@ -1425,7 +1509,28 @@ watch(developerMode, (enabled) => {
         </div>
       </n-card>
 
-      <n-card class="debug-card" :bordered="true" size="small">
+    <n-card class="debug-card" :bordered="true" size="small">
+      <template #header>
+        <div class="debug-section-title">
+          <n-icon :component="FolderOpenOutline" />
+          <span>{{ t('debug.paths') }}</span>
+        </div>
+      </template>
+      <div class="path-debug-grid">
+        <div v-for="row in pathRows" :key="row.label" class="path-debug-row">
+          <span>{{ row.label }}</span>
+          <code :title="row.value || '-'">{{ row.value || '-' }}</code>
+          <n-button size="tiny" tertiary :disabled="!row.value" @click="copyText(row.value, 'debug.pathCopied')">{{ t('common.copy') }}</n-button>
+          <n-button size="tiny" secondary :disabled="!row.value" @click="revealPath(row.value)">
+            {{ t('common.open') }}
+          </n-button>
+        </div>
+      </div>
+    </n-card>
+
+    </section>
+
+      <n-card v-if="activeTab === 'updates'" class="debug-card" :bordered="true" size="small">
         <template #header>
           <div class="debug-section-title">
             <n-icon :component="CloudDownloadOutline" />
@@ -1467,38 +1572,23 @@ watch(developerMode, (enabled) => {
           </template>
         </div>
       </n-card>
-    </section>
 
-    <n-card v-if="activeTab === 'paths'" class="debug-card" :bordered="true" size="small">
-      <template #header>
-        <div class="debug-section-title">
-          <n-icon :component="FolderOpenOutline" />
-          <span>{{ t('debug.paths') }}</span>
-        </div>
-      </template>
-      <div class="path-debug-grid">
-        <div v-for="row in pathRows" :key="row.label" class="path-debug-row">
-          <span>{{ row.label }}</span>
-          <code :title="row.value || '-'">{{ row.value || '-' }}</code>
-          <n-button size="tiny" secondary :disabled="!row.value" @click="revealPath(row.value)">
-            {{ t('common.open') }}
-          </n-button>
-        </div>
-      </div>
-    </n-card>
-
-    <n-card v-if="activeTab === 'runtime'" class="debug-card" :bordered="true" size="small">
+    <n-card v-if="activeTab === 'runtime-tools'" class="debug-card" :bordered="true" size="small">
       <template #header>
         <div class="runtime-card-header">
           <div class="debug-section-title">
             <n-icon :component="FolderOpenOutline" />
             <span>{{ t('debug.runtimePageTitle') }}</span>
           </div>
-          <n-button size="tiny" secondary :loading="runtimeDebugLoading" @click="loadRuntimeDebugPointers">
+          <n-button size="tiny" secondary :loading="runtimeDebugLoading || diagnosticBusy" :disabled="runtimeDebugLoading || diagnosticBusy" @click="checkEnv">
             {{ t('common.refresh') }}
           </n-button>
         </div>
       </template>
+      <n-alert v-if="runtimeDebugError" type="error" class="debug-log-read-error">{{ runtimeDebugError }}</n-alert>
+      <n-alert v-if="!app.runtimeDebugSupported" type="info" :title="t('settings.runtimeDebugWindowsOnly')">
+        {{ t('settings.runtimeDebugReadOnlyHint') }}
+      </n-alert>
       <section class="runtime-status-panel">
         <div class="runtime-panel-copy">
           <strong>{{ t('debug.runtimeCurrentTitle') }}</strong>
@@ -1544,11 +1634,11 @@ watch(developerMode, (enabled) => {
                 </div>
                 <div class="runtime-file-editor__actions">
                   <n-button size="tiny" secondary :disabled="!runtimeDebugActiveFile.path" @click="revealPath(runtimeDebugActiveFile.path)">{{ t('common.open') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!developerMode || !runtimeDebugActiveFile.editable" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!developerMode || !runtimeDebugActiveFile.backupExists" :loading="runtimeDebugSaving === runtimeDebugActiveFile.path" @click="restoreRuntimeDebugFile(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !runtimeDebugActiveFile.editable" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !runtimeDebugActiveFile.backupExists" :loading="runtimeDebugSaving === runtimeDebugActiveFile.path" @click="restoreRuntimeDebugFile(runtimeDebugActiveFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
                 </div>
               </div>
-              <button type="button" class="runtime-file-editor__path-button" :disabled="!developerMode || !runtimeDebugActiveFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">
+              <button type="button" class="runtime-file-editor__path-button" :disabled="!app.runtimeDebugSupported || !developerMode || !runtimeDebugActiveFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(runtimeDebugActiveFile)">
                 <code class="runtime-file-editor__path">{{ runtimeDebugActiveFile.path }}</code>
               </button>
             </article>
@@ -1560,8 +1650,8 @@ watch(developerMode, (enabled) => {
                 </div>
                 <div class="runtime-file-editor__actions">
                   <n-button size="tiny" secondary :disabled="!envItem.pythonPath" @click="revealPath(envItem.pythonPath)">{{ t('debug.runtimeOpenPython') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!developerMode || !envItem.editableFile?.editable" @click="envItem.editableFile && openRuntimeDebugEditor(envItem.editableFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
-                  <n-button size="tiny" secondary :disabled="!developerMode || !envItem.editableFile?.backupExists" :loading="runtimeDebugSaving === envItem.editablePath" @click="envItem.editableFile && restoreRuntimeDebugFile(envItem.editableFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !envItem.editableFile?.editable" @click="envItem.editableFile && openRuntimeDebugEditor(envItem.editableFile)">{{ t('debug.runtimeDebugEdit') }}</n-button>
+                  <n-button size="tiny" secondary :disabled="!app.runtimeDebugSupported || !developerMode || !envItem.editableFile?.backupExists" :loading="runtimeDebugSaving === envItem.editablePath" @click="envItem.editableFile && restoreRuntimeDebugFile(envItem.editableFile)">{{ t('debug.runtimeDebugRestore') }}</n-button>
                 </div>
               </div>
               <div class="runtime-file-editor__paths">
@@ -1569,7 +1659,7 @@ watch(developerMode, (enabled) => {
                   <span>{{ t('debug.runtimePythonExecutable') }}</span>
                   <code :title="envItem.pythonPath || '-'">{{ envItem.pythonPath || '-' }}</code>
                 </div>
-                <button v-if="envItem.editableFile" type="button" class="runtime-file-editor__path-button" :disabled="!developerMode || !envItem.editableFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(envItem.editableFile)">
+                <button v-if="envItem.editableFile" type="button" class="runtime-file-editor__path-button" :disabled="!app.runtimeDebugSupported || !developerMode || !envItem.editableFile.editable" :title="t('debug.runtimeDebugEdit')" @click="openRuntimeDebugEditor(envItem.editableFile)">
                   <span>{{ t('debug.runtimeVenvConfig') }}</span>
                   <code class="runtime-file-editor__path runtime-file-editor__path--config">{{ envItem.editablePath }}</code>
                 </button>
@@ -1586,7 +1676,7 @@ watch(developerMode, (enabled) => {
               <p>{{ t('debug.runtimeOverrideHint') }}</p>
             </div>
           </div>
-          <div class="runtime-override-form">
+          <div v-if="app.runtimeDebugSupported" class="runtime-override-form">
             <label>
               <span>{{ t('debug.runtimeOverrideBackend') }}</span>
               <n-select v-model:value="runtimeOverrideBackend" size="small" :options="runtimeBackendOptions" @update:value="markRuntimeOverrideDirty" />
@@ -1665,7 +1755,7 @@ watch(developerMode, (enabled) => {
       <template #footer>
         <div class="runtime-debug-editor-modal__footer">
           <n-button secondary @click="runtimeDebugEditorVisible = false">{{ t('common.close') }}</n-button>
-          <n-button type="primary" secondary :loading="runtimeDebugSaving === runtimeDebugEditingPath" @click="saveRuntimeDebugEditor">
+          <n-button type="primary" secondary :disabled="!app.runtimeDebugSupported" :loading="runtimeDebugSaving === runtimeDebugEditingPath" @click="saveRuntimeDebugEditor">
             {{ t('common.save') }}
           </n-button>
         </div>
@@ -1680,10 +1770,18 @@ watch(developerMode, (enabled) => {
             <span>{{ t('debug.debugCatalogTitle') }}</span>
           </div>
         </template>
+        <n-alert v-if="debugCatalogError" type="error" class="debug-log-read-error">{{ debugCatalogError }}</n-alert>
         <div class="debug-editor-meta">
           <div class="kv-row">
             <span>{{ t('debug.debugCatalogPath') }}</span>
             <code>{{ debugCatalogInfo?.debugCatalogPath || '-' }}</code>
+          </div>
+          <div class="debug-task-context debug-directory-row">
+            <span>{{ t('debug.debugDir') }} · {{ debugCatalogInfo?.debugDir || '-' }}</span>
+            <div class="debug-directory-actions">
+              <n-button size="tiny" secondary :disabled="!debugCatalogInfo?.debugDir" @click="revealPath(debugCatalogInfo?.debugDir || '')">{{ t('common.open') }}</n-button>
+              <n-button size="tiny" tertiary :disabled="!debugCatalogInfo?.debugDir" @click="copyText(debugCatalogInfo?.debugDir || '', 'debug.pathCopied')">{{ t('common.copy') }}</n-button>
+            </div>
           </div>
           <n-alert type="info" :show-icon="true">
             {{ t('debug.debugCatalogHint') }}
@@ -1873,7 +1971,8 @@ watch(developerMode, (enabled) => {
       </n-card>
     </section>
 
-    <section v-if="activeTab === 'overview'" class="debug-grid">
+    <section v-if="activeTab === 'activity'" class="debug-grid debug-activity-grid">
+      <n-alert v-if="activityLoadError" class="debug-activity-error" type="error">{{ activityLoadError }}</n-alert>
       <n-card class="debug-card" :bordered="true" size="small">
         <template #header>
           <div class="debug-section-title">
@@ -1882,10 +1981,21 @@ watch(developerMode, (enabled) => {
           </div>
         </template>
         <div class="task-debug-list">
-          <div v-for="item in runningTasks" :key="item.id" class="task-debug-row">
-            <strong>{{ shortTaskId(item.id) }}</strong>
-            <span>{{ item.status }}</span>
-            <code :title="item.input">{{ item.model }}</code>
+          <div v-for="item in runningTasks" :key="item.id" class="debug-task-entry">
+            <div class="debug-task-entry__head">
+              <strong>{{ item.runConfig?.workflowName || item.model }}</strong>
+              <span>{{ t(taskStatusKeys[item.status]) }} · {{ Math.round(item.progress || 0) }}%</span>
+            </div>
+            <div class="debug-task-entry__meta">
+              <span>{{ t(item.runConfig?.runMode === 'workflow' ? 'debug.workflowTasks' : 'debug.modelTask') }}</span>
+              <code :title="item.id">{{ shortTaskId(item.id) }}</code>
+              <span v-if="item.batchId">{{ t('debug.batchTask') }}{{ item.batchIndex != null ? ` #${item.batchIndex + 1}` : '' }}</span>
+            </div>
+            <code class="debug-task-entry__input" :title="item.input">{{ item.input }}</code>
+            <p v-if="item.stageLabel || item.progressDetail">{{ item.stageLabel }} {{ item.progressDetail }}</p>
+            <div class="debug-task-entry__actions">
+              <n-button size="tiny" secondary @click="showExecutionLogs(item.id)">{{ t('debug.viewTaskDetails') }}</n-button>
+            </div>
           </div>
           <n-empty v-if="!runningTasks.length" :description="t('debug.noActiveTasks')" />
         </div>
@@ -1899,15 +2009,83 @@ watch(developerMode, (enabled) => {
           </div>
         </template>
         <div class="task-debug-list">
-          <div v-for="item in Object.values(downloadTasks)" :key="item.taskId" class="task-debug-row">
-            <strong>{{ item.model }}</strong>
-            <span>{{ item.status }} · {{ item.progress }}%</span>
-            <code>{{ item.completedFiles }} / {{ item.totalFiles }}</code>
+          <div v-for="item in Object.values(downloadTasks)" :key="item.taskId" class="debug-task-entry">
+            <div class="debug-task-entry__head"><strong>{{ item.model }}</strong><span>{{ downloadStatusLabel(item) }} · {{ Math.round(item.progress || 0) }}%</span></div>
+            <div class="debug-task-entry__meta"><code>{{ item.completedFiles }} / {{ item.totalFiles }}</code><code :title="item.taskId">{{ shortTaskId(item.taskId) }}</code></div>
+            <n-button size="tiny" secondary @click="showExecutionLogs(item.taskId)">{{ t('debug.viewTaskDetails') }}</n-button>
           </div>
           <n-empty v-if="!Object.values(downloadTasks).length" :description="t('debug.noDownloadTasks')" />
         </div>
       </n-card>
+
+      <n-card class="debug-card debug-failed-tasks" :bordered="true" size="small">
+        <template #header><div class="debug-section-title"><n-icon :component="AlertCircleOutline" /><span>{{ t('debug.recentFailures') }}</span></div></template>
+        <div ref="failedTaskScroller" class="task-debug-list debug-failed-task-list" :tabindex="failedTasks.length ? 0 : undefined" role="list" :aria-label="t('debug.recentFailures')">
+          <div v-for="item in pagedFailedTasks" :key="item.id" class="debug-task-entry" role="listitem">
+            <div class="debug-task-entry__head"><strong>{{ item.runConfig?.workflowName || item.model }}</strong><span>{{ new Date(item.updatedAt).toLocaleString() }}</span></div>
+            <code :title="item.id">{{ shortTaskId(item.id) }}</code>
+            <p class="debug-task-entry__error" :title="item.error || item.message">{{ item.error || item.message }}</p>
+            <div class="debug-task-entry__actions">
+              <n-button size="tiny" secondary @click="showExecutionLogs(item.id)">{{ t('debug.viewTaskDetails') }}</n-button>
+            </div>
+          </div>
+          <n-empty v-if="!failedTasks.length" :description="t('debug.noFailures')" />
+        </div>
+        <div v-if="failedTasks.length" class="debug-failed-task-pagination">
+          <span aria-live="polite">{{ t('debug.failurePageSummary', {
+            start: (failedTaskPage - 1) * failedTaskPageSize + 1,
+            end: Math.min(failedTaskPage * failedTaskPageSize, failedTasks.length),
+            total: failedTasks.length,
+          }) }}</span>
+          <n-pagination
+            v-if="failedTasks.length > failedTaskPageSize"
+            v-model:page="failedTaskPage"
+            :page-size="failedTaskPageSize"
+            :item-count="failedTasks.length"
+            :page-slot="5"
+            size="small"
+          />
+        </div>
+      </n-card>
+
+      <n-card class="debug-card" :bordered="true" size="small">
+        <template #header><div class="runtime-card-header"><div class="debug-section-title"><n-icon :component="InformationCircleOutline" /><span>{{ t('debug.editorWindows') }}</span></div><n-button size="tiny" secondary @click="loadActivity">{{ t('common.refresh') }}</n-button></div></template>
+        <div class="task-debug-list">
+          <div v-for="editor in workflow.openedEditors" :key="editor.label" class="debug-task-entry">
+            <div class="debug-task-entry__head"><strong>{{ workflow.workflows.find(item => item.id === editor.workflowId)?.name || editor.workflowId || t('debug.unsavedWorkflow') }}</strong><span>{{ t(editor.kind === 'advanced' ? 'debug.advancedEditor' : 'debug.simpleEditor') }}</span></div>
+            <code>{{ editor.label }}</code>
+          </div>
+          <n-empty v-if="!workflow.openedEditors.length" :description="t('debug.noEditors')" />
+        </div>
+      </n-card>
     </section>
+
+    <n-modal v-model:show="executionLogVisible" preset="card" :title="t('debug.taskDetails')" class="debug-execution-log-modal" :style="{ width: 'min(960px, calc(100vw - 48px))' }">
+      <div class="worker-event-modal-meta">
+        <strong :title="executionLogName">{{ executionLogName }}</strong>
+        <span>{{ executionLogStatus }}</span>
+        <code :title="executionLogTaskId">{{ shortTaskId(executionLogTaskId) }}</code>
+        <n-button size="tiny" tertiary :disabled="!executionLogText" @click="copyText(executionLogText, 'debug.logCopied')">{{ t('common.copy') }}</n-button>
+      </div>
+      <div class="debug-task-detail-actions">
+        <n-button size="small" secondary @click="showExecutionApplicationLogs">{{ t('debug.taskLogs') }}</n-button>
+        <n-button size="small" quaternary @click="showExecutionEvents">{{ t('debug.viewRawEvents') }}</n-button>
+      </div>
+      <div ref="executionLogBody" class="debug-execution-log-body" role="region" :aria-label="t('tasks.logs')" tabindex="0">
+        <p class="debug-task-detail-hint">{{ t('debug.taskDetailLogHint') }}</p>
+        <p v-if="executionLogTask?.input" class="debug-task-detail-input">{{ executionLogTask.input }}</p>
+        <p v-if="executionLogError" class="debug-execution-log-error" tabindex="0">{{ executionLogError }}</p>
+        <div v-if="executionFailedNodes.length" class="debug-failed-nodes">
+          <n-button v-for="nodeId in executionFailedNodes" :key="nodeId" size="tiny" secondary type="error" :disabled="!executionNodeLogs[nodeId]?.length" @click="showFailedNodeLogs(nodeId)">{{ t('debug.failedNode', { node: nodeId }) }}</n-button>
+        </div>
+        <h3 class="debug-task-output-title">{{ t('debug.executionLogs') }}</h3>
+        <TaskLogConsole :lines="executionLogs" embedded />
+        <details v-for="(lines, nodeId) in executionNodeLogs" :key="nodeId" class="debug-node-logs" :data-node-id="nodeId">
+          <summary>{{ t('debug.nodeLogs', { node: nodeId, count: lines.length }) }}</summary>
+          <TaskLogConsole :lines="lines" compact embedded />
+        </details>
+      </div>
+    </n-modal>
 
     <n-card v-if="activeTab === 'events'" class="debug-card debug-card--events" :bordered="true" size="small">
       <template #header>
@@ -1916,6 +2094,15 @@ watch(developerMode, (enabled) => {
           <span>{{ t('debug.workerEvents') }}</span>
         </div>
       </template>
+      <div class="debug-event-toolbar">
+        <n-input v-model:value="eventQuery" clearable :placeholder="t('debug.eventSearch')" :input-props="{ 'aria-label': t('debug.eventSearch') }" />
+        <n-checkbox v-model:checked="eventIssuesOnly">{{ t('debug.logCategoryIssues') }}</n-checkbox>
+        <span>{{ t('debug.eventGroupCount', { shown: recentWorkerEventGroups.length, total: workerEventGroups.length }) }}</span>
+      </div>
+      <div v-if="eventQuery === executionLogTaskId && canReturnToTask" class="debug-task-context">
+        <span>{{ t('debug.logScope', { id: executionLogTaskId }) }}</span>
+        <n-button size="tiny" tertiary @click="showExecutionLogs(executionLogTaskId)">{{ t('debug.returnToTask') }}</n-button>
+      </div>
       <div class="worker-event-list">
         <button
           v-for="group in recentWorkerEventGroups"
@@ -1943,6 +2130,7 @@ watch(developerMode, (enabled) => {
           <span>{{ t('debug.workerEventCount', { count: selectedWorkerEvent?.eventCount || 0 }) }}</span>
           <span>{{ workerEventGroupSummary(selectedWorkerEvent) }}</span>
           <time>{{ eventTime(selectedWorkerEvent?.lastTimestamp) }}</time>
+          <n-button size="tiny" tertiary @click="copyText(workerEventGroupPayload(selectedWorkerEvent), 'debug.eventCopied')">{{ t('common.copy') }}</n-button>
         </div>
         <pre class="worker-event-modal-payload">{{ workerEventGroupPayload(selectedWorkerEvent) }}</pre>
       </n-modal>
@@ -1955,6 +2143,7 @@ watch(developerMode, (enabled) => {
           <span>{{ t('debug.sessionLog') }}</span>
         </div>
       </template>
+      <n-alert v-if="debugLogError" type="error" class="debug-log-read-error">{{ debugLogError }}</n-alert>
       <div class="debug-log-console-head">
         <div class="debug-log-toolbar">
           <n-button size="small" secondary :loading="debugLogLoading" @click="loadDebugLog">
@@ -1963,18 +2152,14 @@ watch(developerMode, (enabled) => {
           <n-button size="small" secondary :disabled="!debugLogInfo?.logsDir" @click="revealPath(debugLogInfo?.logsDir || logsDir)">
             {{ t('debug.openLogsDir') }}
           </n-button>
-          <n-button size="small" secondary :disabled="!debugLogContent?.content" @click="copyDebugLog">
+          <n-button size="small" secondary :disabled="!filteredDebugLogLines.length" @click="copyDebugLog">
             {{ t('debug.copyLog') }}
           </n-button>
-          <n-button size="small" secondary :loading="debugLogReportLoading" @click="createDebugLogReport">
-            {{ t('debug.createReport') }}
-          </n-button>
-          <n-button size="small" secondary :disabled="!debugLogInfo?.reportExists" @click="revealPath(debugLogInfo?.reportPath || '')">
-            {{ t('debug.openReport') }}
-          </n-button>
-          <n-button size="small" secondary type="warning" :loading="debugLogClearing" @click="clearDebugLog">
-            {{ t('debug.clearLog') }}
-          </n-button>
+          <span class="debug-log-toolbar__spacer" />
+          <n-popconfirm @positive-click="clearDebugLog">
+            <template #trigger><n-button size="small" secondary type="warning" :disabled="debugLogReportLoading" :loading="debugLogClearing">{{ t('debug.clearLog') }}</n-button></template>
+            {{ t('debug.confirmClearLog') }}
+          </n-popconfirm>
         </div>
         <details class="debug-log-meta-panel">
           <summary>{{ t('debug.logFileDetails') }}</summary>
@@ -1989,6 +2174,10 @@ watch(developerMode, (enabled) => {
       <n-alert v-if="debugLogContent?.truncated" type="warning" :show-icon="true">
         {{ t('debug.logTailHint') }}
       </n-alert>
+      <div v-if="debugLogTask !== 'all'" class="debug-task-context">
+        <span>{{ t('debug.logScope', { id: debugLogTask }) }}</span>
+        <n-button v-if="debugLogTask === executionLogTaskId && canReturnToTask" size="tiny" tertiary @click="showExecutionLogs(executionLogTaskId)">{{ t('debug.returnToTask') }}</n-button>
+      </div>
       <section v-if="parsedDebugLogLines.length" class="debug-log-insights">
         <button class="debug-log-insight debug-log-insight--error" type="button" @click="debugLogLevel = 'error'; debugLogCategory = 'all'">
           <span>{{ t('debug.logErrors') }}</span>
@@ -2022,34 +2211,47 @@ watch(developerMode, (enabled) => {
           <div class="debug-log-table__head" aria-hidden="true">
             <span>{{ t('debug.logColumnTime') }}</span>
             <span>{{ t('debug.logColumnLevel') }}</span>
-            <span>{{ t('debug.logColumnCategory') }}</span>
-            <span>{{ t('debug.logColumnLocation') }}</span>
+            <span>{{ t('debug.logColumnSource') }}</span>
+            <span>{{ t('debug.logColumnModule') }}</span>
+            <span>{{ t('debug.logColumnScope') }}</span>
             <span>{{ t('debug.logColumnMessage') }}</span>
           </div>
           <article
             v-for="line in filteredDebugLogLines"
             :key="line.id"
             class="debug-log-row"
-            :class="[`debug-log-row--${line.severity}`, { 'debug-log-row--expandable': canExpandDebugLogLine(line) }]"
-            :title="line.raw"
+            :class="[`debug-log-row--${line.severity}`, `log-source--${line.sourceKind}`, { 'debug-log-row--expandable': canExpandDebugLogLine(line) }]"
+            :title="logMessagePreview(line.record)"
+            tabindex="0"
+            :aria-expanded="Boolean(expandedDebugLogLines[line.id])"
+            @keydown.enter.prevent="toggleDebugLogLine(line)"
+            @keydown.space.prevent="toggleDebugLogLine(line)"
             @click="toggleDebugLogLine(line)"
           >
             <code class="debug-log-row__time">{{ line.timestamp || '-' }}</code>
             <span class="debug-log-row__level">{{ line.level || line.severity }}</span>
-            <code class="debug-log-row__source" :title="line.source || '-'">{{ debugLogLineSource(line) }}</code>
-            <code class="debug-log-row__location" :title="line.location || '-'">{{ debugLogLineLocation(line) }}</code>
-            <span class="debug-log-row__message">{{ line.message || line.raw }}</span>
-            <div v-if="expandedDebugLogLines[line.id]" class="debug-log-row__detail">
+            <code class="debug-log-row__source" :title="line.source || '-'">{{ logSourceLabel(line.sourceKind) }}</code>
+            <code class="debug-log-row__module" :title="line.source">{{ line.source || '—' }}</code>
+            <code class="debug-log-row__location" :title="[line.taskId, line.record.nodeId].filter(Boolean).join(' / ')">{{ line.record.nodeId || shortTaskId(line.taskId) || '—' }}</code>
+            <span class="debug-log-row__message"><span class="debug-log-row__message-text">{{ line.message || line.record.event || line.raw }}</span><span v-if="line.messageContext" class="debug-log-row__message-context"> · {{ line.messageContext }}</span></span>
+            <div v-if="expandedDebugLogLines[line.id]" class="debug-log-row__detail" @click.stop @keydown.stop>
+              <div v-if="line.message" class="debug-log-row__full-message">
+                <span>{{ t('debug.logColumnMessage') }}</span>
+                <pre>{{ line.message }}</pre>
+              </div>
               <div v-if="line.location" class="debug-log-row__location-detail">
                 <span>{{ t('debug.logLocation') }}</span>
                 <code>{{ line.location }}</code>
               </div>
               <pre v-if="line.traceback">{{ line.traceback }}</pre>
-              <pre v-if="line.details && !line.traceback">{{ line.details }}</pre>
-              <details class="debug-log-row__raw">
-                <summary>{{ t('debug.logRawLine') }}</summary>
+              <pre v-if="line.details">{{ line.details }}</pre>
+              <div class="debug-log-row__raw">
+                <div class="debug-log-row__raw-head">
+                  <span>{{ t('debug.logRawLine') }}</span>
+                  <n-button size="tiny" quaternary @click.stop="copyText(line.raw, 'debug.logCopied')">{{ t('common.copy') }}</n-button>
+                </div>
                 <pre>{{ line.raw }}</pre>
-              </details>
+              </div>
             </div>
           </article>
         </div>
@@ -2153,7 +2355,271 @@ watch(developerMode, (enabled) => {
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
 }
+
+.debug-header-actions,
+.debug-task-entry__meta,
+.debug-task-entry__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.debug-navigation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid color-mix(in srgb, var(--outline) 50%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-1) 70%, transparent);
+}
+.debug-navigation .debug-tabs {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  min-width: 0;
+  overflow: visible;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.debug-advanced-nav {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  padding-left: 8px;
+  margin-left: 4px;
+  border-left: 1px solid var(--outline);
+}
+.debug-overview-summary { display: grid; gap: 14px; }
+.debug-latest-failure {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--danger) 30%, var(--outline));
+  border-radius: 12px;
+  background: var(--surface-1);
+}
+.debug-latest-failure > .n-icon { color: var(--danger); font-size: 22px; }
+.debug-latest-failure > div { display: grid; gap: 5px; min-width: 0; }
+.debug-latest-failure span, .debug-overview-empty { color: var(--on-surface-muted); font-size: 12px; }
+.debug-overview-empty { margin: 0; }
+.debug-latest-failure strong { color: var(--on-surface); font-size: 14px; overflow-wrap: anywhere; }
+.debug-latest-failure p { margin: 0; color: var(--danger); font-size: 12px; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.debug-health-details > summary {
+  padding: 12px 14px;
+  border: 1px solid var(--outline);
+  border-radius: 10px;
+  background: var(--surface-1);
+  color: var(--on-surface);
+  font-size: 13px;
+  cursor: pointer;
+}
+.debug-health-details > summary > span { float: right; color: var(--on-surface-muted); font-size: 12px; }
+.debug-health-details[open] > summary { margin-bottom: 14px; }
+.debug-health-details > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.debug-task-detail-actions { flex: none; display: flex; flex-wrap: wrap; gap: 8px; }
+.debug-task-detail-hint, .debug-task-detail-input { margin: 0 0 12px; color: var(--on-surface-muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
+.debug-task-detail-input { font-family: var(--font-mono); font-size: 11px; }
+.debug-task-output-title { margin: 12px 0 8px; font-size: 13px; color: var(--on-surface); }
+.debug-failed-nodes { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+.debug-task-context { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; padding: 10px 12px; border-left: 2px solid var(--primary); border-radius: 6px; background: var(--surface-2); font-size: 12px; }
+.debug-task-context > span { min-width: 0; overflow-wrap: anywhere; }
+.debug-directory-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+.debug-directory-actions { display: flex; gap: 6px; }
+
+.debug-health-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+
+.debug-health-grid > :last-child,
+.debug-activity-error {
+  grid-column: 1 / -1;
+}
+
+.debug-check-status,
+.diagnostic-row__head,
+.debug-task-entry__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.debug-check-status,
+.debug-group-hint,
+.debug-task-entry__meta,
+.debug-event-toolbar > span {
+  color: var(--on-surface-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.debug-group-hint { margin: 0 0 12px; }
+.diagnostic-state { flex-shrink: 0; font-size: 11px; }
+
+.diagnostic-row__main p {
+  margin: 2px 0;
+  color: var(--on-surface-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.diagnostic-action {
+  justify-self: start;
+  border: 0;
+  padding: 4px 0;
+  background: transparent;
+  color: var(--primary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.debug-tab,
+.debug-status-card,
+.diagnostic-action,
+.worker-event-row {
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+
+.debug-tab:hover,
+.debug-status-card:hover,
+.diagnostic-action:hover {
+  background-color: color-mix(in srgb, var(--primary) 7%, var(--surface-1));
+}
+
+.debug-tab:focus-visible,
+.debug-status-card:focus-visible,
+.diagnostic-action:focus-visible,
+.worker-event-row:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.debug-task-entry {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 36%, transparent);
+}
+
+.debug-task-entry__head strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.debug-task-entry__head span,
+.debug-task-entry p {
+  margin: 0;
+  color: var(--on-surface-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.debug-task-entry code { font-size: 11px; overflow-wrap: anywhere; }
+.debug-task-entry .debug-task-entry__error { color: var(--danger); white-space: pre-wrap; }
+.debug-task-entry > .n-button { justify-self: start; }
+
+.debug-failed-task-list {
+  max-height: min(480px, 62vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.debug-failed-task-list:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 3px;
+  border-radius: 10px;
+}
+
+.debug-failed-task-list .debug-task-entry__error {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+
+.debug-failed-task-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.debug-failed-task-pagination > span {
+  color: var(--on-surface-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.debug-event-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.debug-log-read-error { margin-bottom: 12px; }
+.debug-activity-grid { align-items: start; }
+:global(.debug-execution-log-modal) {
+  max-height: calc(100dvh - 80px);
+  margin: 56px auto 24px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+:global(.debug-execution-log-modal .n-card-header) { flex: none; }
+:global(.debug-execution-log-modal .n-card-content) {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow: hidden;
+}
+.debug-execution-log-modal .worker-event-modal-meta {
+  flex: none;
+  align-items: center;
+  margin-bottom: 0;
+}
+.debug-execution-log-modal .worker-event-modal-meta :is(code, span) {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.debug-execution-log-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--on-surface-muted) transparent;
+}
+.debug-execution-log-error {
+  max-height: min(240px, 30vh);
+  overflow: auto;
+  color: var(--danger);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.debug-node-logs { margin-top: 12px; }
+.debug-node-logs summary { padding: 8px 0; cursor: pointer; font-size: 12px; }
 
 .debug-tabs {
   display: flex;
@@ -2360,7 +2826,7 @@ watch(developerMode, (enabled) => {
 }
 
 .debug-status-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr));
 }
 
 .debug-status-card {
@@ -2370,6 +2836,9 @@ watch(developerMode, (enabled) => {
   border-radius: 16px;
   border: 1px solid color-mix(in srgb, var(--outline) 52%, transparent);
   background: color-mix(in srgb, var(--surface-1) 72%, transparent);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
 }
 
 .debug-status-card span {
@@ -2390,6 +2859,15 @@ watch(developerMode, (enabled) => {
 
 .debug-status-card--warn {
   border-color: color-mix(in srgb, var(--warning) 42%, var(--outline));
+}
+
+.debug-status-card--error {
+  border-color: color-mix(in srgb, var(--danger) 42%, var(--outline));
+}
+
+.debug-status-card small {
+  color: var(--on-surface-muted);
+  font-size: 11px;
 }
 
 .debug-card {
@@ -2657,6 +3135,10 @@ watch(developerMode, (enabled) => {
   gap: 8px;
 }
 
+.debug-log-toolbar__spacer {
+  flex: 1;
+}
+
 .debug-log-meta {
   margin-top: 10px;
 }
@@ -2750,9 +3232,12 @@ watch(developerMode, (enabled) => {
   border-radius: 10px;
   background: color-mix(in srgb, #0c111d 92%, var(--surface-1));
   color: #d9e2f1;
-  font-family: "JetBrains Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
-  font-size: 12px;
-  line-height: 1.5;
+  font-family: Consolas, "SFMono-Regular", Menlo, monospace;
+  font-size: 13px;
+  font-weight: 400;
+  font-synthesis: none;
+  font-variant-ligatures: none;
+  line-height: 1.6;
   scrollbar-width: thin;
   scrollbar-color: rgba(148, 163, 184, 0.46) transparent;
 }
@@ -2785,10 +3270,10 @@ watch(developerMode, (enabled) => {
 .debug-log-table__head,
 .debug-log-row {
   display: grid;
-  grid-template-columns: 72px 58px 126px 150px minmax(360px, 1fr);
+  grid-template-columns: 94px 68px 78px 138px 112px minmax(260px, 1fr);
   align-items: baseline;
   gap: 7px;
-  min-width: 820px;
+  min-width: 860px;
 }
 
 .debug-log-table__head {
@@ -2819,6 +3304,7 @@ watch(developerMode, (enabled) => {
 
 .debug-log-row__time,
 .debug-log-row__source,
+.debug-log-row__module,
 .debug-log-row__location,
 .debug-log-row__message {
   min-width: 0;
@@ -2839,18 +3325,47 @@ watch(developerMode, (enabled) => {
   color: #cbd5e1;
   font-size: 11px;
   font-weight: 700;
+  padding: 1px 4px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
   text-align: center;
 }
 
 .debug-log-row__source {
-  color: #a5b4fc;
-  font-size: 11px;
+  justify-self: start;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--log-source-color) 32%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--log-source-color) 10%, transparent);
+  color: var(--log-source-color);
+  font-size: 10px;
 }
+.debug-log-row__module { color: #a7b5cb; font-size: 11px; }
+.log-source--studio { --log-source-color: #93baff; }
+.log-source--worker { --log-source-color: #67d7d0; }
+.log-source--pymss { --log-source-color: #c7a6ff; }
+.log-source--third_party { --log-source-color: #ffc58b; }
+.log-source--unknown { --log-source-color: #a7b5cb; }
+.debug-log-row--warn { background: #facc1508; box-shadow: inset 3px 0 #d5a83f; }
+.debug-log-row--error { background: #fca5a50b; box-shadow: inset 3px 0 #e88191; }
+.debug-log-row:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+
 
 .debug-log-row__message {
-  color: #e2e8f0;
-  white-space: pre-wrap;
-  word-break: break-word;
+  color: #cbd5e1;
+  font-weight: 400;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.debug-log-row__message-context {
+  color: #94a3b8;
+}
+
+.debug-log-row__full-message > span {
+  color: #91a2b8;
+  font-size: 11px;
 }
 
 .debug-log-row__detail {
@@ -2859,19 +3374,20 @@ watch(developerMode, (enabled) => {
   gap: 6px;
   margin-top: 6px;
   padding: 10px 12px;
-  border: 1px solid rgba(148, 163, 184, 0.22);
+  border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 8px;
-  background: rgba(15, 23, 42, 0.86);
+  background: #151c29;
 }
 
 .debug-log-row__detail pre {
   margin: 0;
   overflow: auto;
   max-height: 360px;
-  color: #dbeafe;
-  font-family: inherit;
+  color: #a3afc2;
+  font-family: var(--font-mono);
   font-size: 11px;
-  line-height: 1.55;
+  font-weight: 400;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -2881,23 +3397,29 @@ watch(developerMode, (enabled) => {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  color: #93c5fd;
+  color: #91a2b8;
   font-size: 11px;
 }
 
 .debug-log-row__location-detail code {
   min-width: 0;
   overflow: hidden;
-  color: #bfdbfe;
+  color: #acb8c9;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.debug-log-row__raw summary {
-  width: max-content;
-  color: #93c5fd;
-  cursor: pointer;
+.debug-log-row__raw-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #91a2b8;
   font-size: 11px;
+}
+
+.debug-log-row__raw pre {
+  color: #8d9aaf;
 }
 
 .debug-log-row--info .debug-log-row__level { color: #86efac; }
@@ -3022,6 +3544,11 @@ watch(developerMode, (enabled) => {
 .diagnostic-row--ok { color: var(--success); }
 .diagnostic-row--warn { color: var(--warning); }
 .diagnostic-row--error { color: var(--danger); }
+.diagnostic-row--unknown,
+.diagnostic-row--optional { color: var(--on-surface-muted); }
+.diagnostic-row--ok .diagnostic-state { color: var(--success); }
+.diagnostic-row--warn .diagnostic-state { color: var(--warning); }
+.diagnostic-row--error .diagnostic-state { color: var(--danger); }
 
 .diagnostic-row__main {
   display: grid;
@@ -3073,7 +3600,13 @@ watch(developerMode, (enabled) => {
 }
 
 .path-debug-row {
-  grid-template-columns: 150px minmax(0, 1fr) auto;
+  grid-template-columns: 150px minmax(0, 1fr) auto auto;
+}
+
+.diagnostic-row__main code {
+  overflow: visible;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .cuda-list {
@@ -3166,7 +3699,7 @@ watch(developerMode, (enabled) => {
 }
 
 @media (max-width: 980px) {
-  .debug-status-grid,
+  .debug-health-grid,
   .debug-grid,
   .debug-model-workbench,
   .runtime-status-panel,
@@ -3174,6 +3707,12 @@ watch(developerMode, (enabled) => {
   .runtime-page-grid {
     grid-template-columns: 1fr;
   }
+
+  .debug-status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .debug-status-grid > :first-child { grid-column: 1 / -1; }
+  .debug-latest-failure { grid-template-columns: auto minmax(0, 1fr); }
+  .debug-latest-failure > .n-button { grid-column: 2; justify-self: start; }
+  .debug-event-toolbar { grid-template-columns: 1fr; }
 
   .catalog-simple-editor,
   .catalog-form-grid {
@@ -3218,6 +3757,15 @@ watch(developerMode, (enabled) => {
     grid-template-columns: 1fr;
     justify-items: center;
     text-align: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .debug-tab,
+  .debug-status-card,
+  .diagnostic-action,
+  .worker-event-row {
+    transition: none;
   }
 }
 </style>

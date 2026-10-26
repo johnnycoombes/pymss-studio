@@ -31,13 +31,17 @@ export type EditorClip = {
   locked: boolean
 }
 
-/** Non-destructive, track-level effects used by the editor preview and export. */
-export type EditorTrackEffects = {
-  reverb: number
-  delay: number
-  delayTime: number
-  clarity: number
-  compressor: number
+/** Persist unknown formats and opaque state references so projects remain recoverable. */
+export type EditorPluginSlot = {
+  id: string
+  format: string
+  pluginId: string
+  name: string
+  path: string
+  bypassed: boolean
+  skipLoad?: boolean
+  state?: string
+  [key: string]: unknown
 }
 
 export type EditorTrack = {
@@ -54,9 +58,19 @@ export type EditorTrack = {
   solo: boolean
   fadeIn: number
   fadeOut: number
-  effects?: EditorTrackEffects
+  /** Retained for older project versions; excluded from playback and export. */
+  effects?: Record<string, unknown>
+  pluginChain?: EditorPluginSlot[]
   type?: 'stem' | 'audio' | 'reference' | 'recording'
   clips?: EditorClip[]
+}
+
+export type EditorMasterLimiter = {
+  enabled: boolean
+  gainDb: number
+  ceilingDb: number
+  attackMs: number
+  releaseMs: number
 }
 
 export type EditorSession = {
@@ -66,6 +80,8 @@ export type EditorSession = {
   sourceResultDir?: string
   masterVolume: number
   masterPan: number
+  masterLimiter?: EditorMasterLimiter
+  pluginChain?: EditorPluginSlot[]
   sources: EditorSource[]
   tracks: EditorTrack[]
   createdAt: number

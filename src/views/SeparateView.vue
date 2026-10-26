@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { createLogger } from '@/utils/logger'
+
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useI18n } from 'vue-i18n'
@@ -27,6 +29,7 @@ import {
   ChevronDownOutline,
   GridOutline,
   ListOutline,
+  InformationCircleOutline,
 } from '@vicons/ionicons5'
 import { useTaskStore, type ModelListSortMode, type OutputLayout, type SeparationJob, type SeparationTask, type StemOutput } from '@/stores/task'
 import { resolveJobStatus } from '@/features/tasks/lifecycle'
@@ -42,6 +45,7 @@ import { useModelStore, type ModelDefaultInferenceParams, type ModelEntry } from
 import { useAppStore } from '@/stores/app'
 import { buildModelCategoryOptionsFromModels, getModelCategoryLabel } from '@/utils/modelCategory'
 import { matchesModelQuery } from '@/utils/modelSearch'
+import { getSeparateWorkflowInputIssue } from '@/utils/workflowInputs'
 import { sortStemOutputsByOrder } from '@/utils/stemOrder'
 import { retainAvailableModelNames } from '@/utils/modelSource'
 import { SEPARATE_MODEL_PAGE_SIZES } from '@/utils/pagination'
@@ -55,6 +59,14 @@ import {
   isStockNamingTemplate,
   modelSupportsDjStems,
 } from '@/audio/delivery'
+import InferenceParameterLesson from '@/components/InferenceParameterLesson.vue'
+import { parameterHelpTopics } from '@/features/inference/parameterHelp'
+import ParameterFieldGuide from '@/components/ParameterFieldGuide.vue'
+import { isTutorialFrame } from '@/features/onboarding/demoContext'
+import { useBeginnerGuideStore } from '@/stores/beginnerGuide'
+import { visibleParameterGuides } from '@/features/onboarding/parameters'
+
+const studioLog = createLogger('ui.views.SeparateView')
 
 const { t, locale } = useI18n()
 const message = useMessage()
@@ -66,6 +78,7 @@ const model = useModelStore()
 const workflow = useWorkflowStore()
 const settings = useSettingsStore()
 const app = useAppStore()
+const beginnerGuide = useBeginnerGuideStore()
 
 const {
   inputFiles,
@@ -105,6 +118,16 @@ const { workflows, selectedWorkflow, selectedWorkflowId } = storeToRefs(workflow
 
 const isDragging = ref(false)
 const showSettingsDrawer = ref(false)
+const parameterHelpPage = ref<number | null>(null)
+const expandedInferenceSections = ref<string[]>([])
+const settingsCardRef = ref<{ $el: HTMLElement } | null>(null)
+const fieldGuideRef = ref<{ syncPosition: () => void } | null>(null)
+const guideTarget = ref<HTMLElement | null>(null)
+let guideOpenedSettings = false
+const helpTopics = computed(() => parameterHelpTopics(currentModelInfo.value?.modelType))
+const guidedParameter = computed(() => beginnerGuide.parameterStep && (!beginnerGuide.demoActive || isTutorialFrame()) ? beginnerGuide.currentParameter : undefined)
+const guideRequiresAdvanced = computed(() => guidedParameter.value?.group === 'inference' && guidedParameter.value.id !== 'tta')
+watch(showSettingsDrawer, () => { parameterHelpPage.value = null })
 const showEnsembleModal = ref(false)
 const showNamingModal = ref(false)
 const showLogModal = ref(false)
@@ -130,8 +153,7 @@ const workflowMetaEditor = ref<WorkflowEntry | null>(null)
 const workflowNameDraft = ref('')
 const workflowNoteDraft = ref('')
 const workflowMetaSaving = ref(false)
-runMode.value = 'model'
-if (route.query.mode === 'workflow') void router.replace('/workflows')
+if (route.query.mode === 'workflow') runMode.value = 'workflow'
 const focusedSeparationJobId = ref<string | null>(null)
 const composingNewJob = ref(false)
 const submittingJob = ref(false)
@@ -189,6 +211,7 @@ const bitRateOptions = computed(() => [
   { label: t('audio.bitrate320'), value: '320k' },
   { label: t('audio.bitrate512'), value: '512k' },
 ])
+const mp3BitRateOptions = computed(() => bitRateOptions.value.filter(option => parseInt(option.value, 10) <= 320))
 const m4aCodecOptions = computed(() => [
   { label: t('audio.codecAac'), value: 'aac' },
 ])
@@ -276,6 +299,48 @@ function hasInferenceField(key: string) {
   return Object.prototype.hasOwnProperty.call(currentModelDefaults.value, key)
 }
 
+watch(() => beginnerGuide.parameterStep, active => {
+  if (beginnerGuide.demoActive && !isTutorialFrame()) return
+  if (active && runMode.value === 'model' && !ensembleEnabled.value) {
+    guideOpenedSettings = true
+    showSettingsDrawer.value = true
+    parameterHelpPage.value = null
+    expandedInferenceSections.value = ['inference']
+  } else if (guideOpenedSettings) {
+    guideOpenedSettings = false
+    showSettingsDrawer.value = false
+  }
+}, { immediate: true })
+watch(showSettingsDrawer, show => {
+  if (!show && guideOpenedSettings && beginnerGuide.parameterStep) beginnerGuide.pause()
+})
+watch(expandedInferenceSections, names => {
+  if (guideRequiresAdvanced.value && showSettingsDrawer.value && parameterHelpPage.value === null && !names.includes('inference')) beginnerGuide.pause()
+})
+
+async function locateGuidedParameter() {
+  await nextTick()
+  if (!beginnerGuide.parameterStep || !showSettingsDrawer.value || parameterHelpPage.value !== null) return
+  if (guideRequiresAdvanced.value && !expandedInferenceSections.value.includes('inference')) {
+    expandedInferenceSections.value = ['inference']
+    await nextTick()
+  }
+  const field = settingsCardRef.value?.$el.querySelector<HTMLElement>(`[data-parameter-guide="${guidedParameter.value?.id}"]`)
+  guideTarget.value = field || null
+  field?.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+  const input = field?.querySelector<HTMLInputElement>('input')
+  if (input && !input.readOnly) input.focus({ preventScroll: true })
+  fieldGuideRef.value?.syncPosition()
+}
+watch([guidedParameter, parameterHelpPage, expandedInferenceSections], () => {
+  void locateGuidedParameter()
+}, { flush: 'post' })
+
+function openParameterHelp() {
+  if (beginnerGuide.parameterStep) return
+  parameterHelpPage.value = 0
+}
+
 function collectCurrentModelInferenceDefaults(): ModelDefaultInferenceParams {
   const defaults = currentModelDefaults.value
   const hasField = (key: keyof ModelDefaultInferenceParams) => Object.prototype.hasOwnProperty.call(defaults, key)
@@ -336,7 +401,7 @@ async function saveCurrentModelInferenceDefaults() {
     applyCurrentModelInferenceDefaults(info)
     message.success(t('models.inferenceDefaultsSaved'))
   } catch (error) {
-    console.error('Failed to persist model inference defaults', error)
+    studioLog.error('Failed to persist model inference defaults', error)
     message.error(t('models.inferenceDefaultsSaveFailed'))
   }
 }
@@ -349,7 +414,7 @@ async function resetCurrentModelInferenceDefaults() {
     applyCurrentModelInferenceDefaults(info)
     message.success(t('models.inferenceDefaultsReset'))
   } catch (error) {
-    console.error('Failed to restore model inference defaults', error)
+    studioLog.error('Failed to restore model inference defaults', error)
     message.error(t('models.inferenceDefaultsResetFailed'))
   }
 }
@@ -507,6 +572,11 @@ function workflowDefinitionError(definition: Record<string, unknown>): string {
   if (issue === 'no-save-outputs') return t('workflows.workflowNoSaveOutputs')
   if (issue === 'invalid-definition') return t('workflows.workflowFormatInvalid')
   if (issue === 'invalid-format') return t('workflows.workflowFormatInvalid')
+  const inputIssue = getSeparateWorkflowInputIssue(definition)
+  if (inputIssue) return t(
+    inputIssue.code === 'multiple-inputs' ? 'separate.workflowMultipleInputs' : 'separate.workflowNoInput',
+    { count: inputIssue.count },
+  )
   return ''
 }
 
@@ -532,6 +602,15 @@ const contextMenuOptions = computed<DropdownOption[]>(() => {
 function selectRunnableWorkflow(item: WorkflowEntry) {
   if (workflowIssue(item)) return
   workflow.selectWorkflow(item.id)
+}
+
+function workflowIssueSummary(item: WorkflowEntry): string {
+  const inputIssue = getSeparateWorkflowInputIssue(item.definition)
+  if (inputIssue && !getWorkflowDefinitionIssue(item.definition)) return t(
+    inputIssue.code === 'multiple-inputs' ? 'separate.workflowMultipleInputsSummary' : 'separate.workflowNoInputSummary',
+    { count: inputIssue.count },
+  )
+  return workflowIssue(item)
 }
 
 function openSeparateContextMenu(
@@ -656,12 +735,12 @@ function workflowValidationError() {
 }
 const workflowStructureInvalid = computed(() => runMode.value === 'workflow' && Boolean(workflowValidationError()))
 const startStatusText = computed(() => {
+  const validationError = workflowValidationError()
+  if (validationError) return validationError
   if (runMode.value === 'workflow' && workflows.value.length && !runnableWorkflows.value.length) {
     return t('separate.startHintNoRunnableWorkflow')
   }
   if (runMode.value === 'workflow' && !selectedWorkflow.value) return t('separate.startHintNoWorkflow')
-  const validationError = workflowValidationError()
-  if (validationError) return validationError
   if (outputDirectoryError.value) return outputDirectoryError.value
   if (!inputFiles.value.length) return t('separate.outputDirectorySummary')
   if (runMode.value === 'model' && ensembleEnabled.value && !ensembleReady.value) return t('separate.ensembleNotReady')
@@ -860,7 +939,30 @@ const modelCompactLine = computed(() => {
 const currentTaskFileName = computed(() => currentTask.value ? getFileName(currentTask.value.input) : '')
 const currentTaskOutputPath = computed(() => currentJob.value?.output || currentTask.value?.output || normalizedOutputDir.value)
 const currentTaskOutputSummary = computed(() => shortenMiddle(currentTaskOutputPath.value, 72))
-const currentTaskDuration = computed(() => currentTask.value ? taskDuration(currentTask.value) : '')
+const taskClockNow = ref(Date.now())
+let taskClockTimer: ReturnType<typeof setInterval> | null = null
+const currentTaskDuration = computed(() => currentTask.value ? taskDuration(currentTask.value, taskClockNow.value) : '')
+
+function stopTaskClock() {
+  if (taskClockTimer === null) return
+  clearInterval(taskClockTimer)
+  taskClockTimer = null
+}
+
+function syncTaskClock(running: boolean) {
+  taskClockNow.value = Date.now()
+  if (!running) {
+    stopTaskClock()
+  } else if (taskClockTimer === null) {
+    taskClockTimer = setInterval(() => { taskClockNow.value = Date.now() }, 1000)
+  }
+}
+
+watch(
+  () => Boolean(currentTask.value && !['queued', 'done', 'failed', 'cancelled'].includes(currentTask.value.status)),
+  syncTaskClock,
+  { immediate: true },
+)
 
 function configuredStemOrder(item: SeparationTask) {
   if (item.runConfig?.outputNaming?.stemOrder?.length) return item.runConfig.outputNaming.stemOrder
@@ -1422,8 +1524,14 @@ function taskSubMessage(item: SeparationTask) {
   return normalizeProgressMessage(item.progressDetail || item.message)
 }
 
-function taskDuration(item: SeparationTask) {
-  const seconds = Math.max(0, Math.round((item.updatedAt - item.createdAt) / 1000))
+function taskDuration(item: SeparationTask, now: number) {
+  const terminal = ['done', 'failed', 'cancelled'].includes(item.status)
+  const startedAt = item.startedAt ?? item.createdAt
+  const durationMs = terminal
+    ? (typeof item.durationMs === 'number' && Number.isFinite(item.durationMs) && item.durationMs >= 0
+        ? item.durationMs : (item.finishedAt ?? item.updatedAt) - startedAt)
+    : item.status === 'queued' ? 0 : now - startedAt
+  const seconds = Math.max(0, Math.round(durationMs / 1000))
   if (seconds < 60) return `${seconds}s`
   const minutes = Math.floor(seconds / 60)
   const rest = seconds % 60
@@ -1599,6 +1707,15 @@ watch(
   { immediate: true },
 )
 
+const availableParameterGuides = computed(() => visibleParameterGuides({
+  modelType: currentModelType.value,
+  hasModel: Boolean(currentModelInfo.value),
+  defaults: currentModelDefaults.value,
+  format: effectiveFormat.value,
+  canSaveDefaults: Boolean(currentModelInfo.value && currentModelDefaultsResolved.value && !advancedParamsLoading.value),
+}))
+watch(availableParameterGuides, items => { if (!beginnerGuide.demoActive || isTutorialFrame()) beginnerGuide.registerParameters(items) }, { immediate: true })
+
 onMounted(async () => {
   if (import.meta.env.DEV && route.query.preview === 'results') {
     const previewJob = task.resultJobs.filter(isSeparationJob).sort((a, b) => b.updatedAt - a.updatedAt)[0]
@@ -1609,6 +1726,7 @@ onMounted(async () => {
   }
   try {
     unlistenDragDrop = await getCurrentWebview().onDragDropEvent(async (event) => {
+      if (beginnerGuide.demoActive) { isDragging.value = false; return }
       const type = event.payload.type
       if (type === 'over' || type === 'enter') {
         isDragging.value = true
@@ -1628,6 +1746,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  stopTaskClock()
   if (unlistenDragDrop) unlistenDragDrop()
   finishInputPointerDrag()
   finishStemPointerDrag()
@@ -1822,7 +1941,9 @@ async function start() {
   }
   submittingJob.value = true
   try {
-    const result = ensembleEnabled.value
+    const result = runMode.value === 'workflow' && selectedWorkflow.value
+      ? await task.startWorkflowInference(selectedWorkflow.value, { outputDir: normalizedOutputDir.value, outputLayout: effectiveOutputLayout.value })
+      : ensembleEnabled.value
         ? await task.startWorkflowInference(buildEnsembleWorkflow(), { outputDir: normalizedOutputDir.value, outputLayout: effectiveOutputLayout.value, outputNaming: outputNamingConfig.value })
         : await task.startSeparation({ outputDir: normalizedOutputDir.value, outputLayout: effectiveOutputLayout.value, outputNaming: outputNamingConfig.value })
     focusedSeparationJobId.value = result?.jobId || newestRunningJob.value?.id || focusedSeparationJobId.value
@@ -2010,16 +2131,29 @@ async function retryCurrentTask() {
           <span>{{ t('separate.subtitle') }}</span>
         </div>
       </div>
-      <div class="console-topbar__controls">
-        <n-button text class="console-topbar__manage" @click="router.push('/models')">
-          {{ t('separate.manageModelsInline') }}
+      <div class="console-topbar__controls" data-guide="separation-modes">
+        <n-radio-group
+          v-model:value="runMode"
+          class="mode-switch"
+          :disabled="isRunModeLocked"
+        >
+          <n-radio-button
+            v-for="option in runModeOptions"
+            :key="option.value"
+            :value="option.value"
+          >
+            {{ option.label }}
+          </n-radio-button>
+        </n-radio-group>
+        <n-button text class="console-topbar__manage" @click="router.push(runMode === 'workflow' ? '/workflows' : '/models')">
+          {{ runMode === 'workflow' ? t('separate.manageWorkflowsInline') : t('separate.manageModelsInline') }}
         </n-button>
       </div>
     </header>
 
     <div class="console" :class="[`console--${taskPanelState}`, { 'console--busy': isConfigCompact }]">
       <aside class="console__rail">
-        <section class="rail-card rail-card--input">
+        <section class="rail-card rail-card--input" data-guide="input">
           <div class="rail-card__head">
             <span class="rail-card__index">01</span>
             <div class="rail-card__label">
@@ -2093,7 +2227,7 @@ async function retryCurrentTask() {
           </div>
         </section>
 
-        <section class="rail-card rail-card--output">
+        <section class="rail-card rail-card--output" data-guide="output">
           <div class="rail-card__head">
             <span class="rail-card__index">02</span>
             <div class="rail-card__label">
@@ -2106,7 +2240,7 @@ async function retryCurrentTask() {
             </n-button>
           </div>
           <div class="rail-card__body rail-card__body--output">
-            <label class="ofield">
+            <label class="ofield" data-guide="output-location">
               <span class="ofield__label">{{ t('separate.temporaryOutputDir') }}</span>
               <div class="dir-input">
                 <n-input v-model:value="outputDirectoryInput" size="small" :status="outputDirectoryError ? 'error' : undefined" :placeholder="t('separate.outputDefault')" :disabled="isRunModeLocked" clearable />
@@ -2117,7 +2251,7 @@ async function retryCurrentTask() {
               <small v-if="outputDirectoryError" class="output-directory-error">{{ outputDirectoryError }}</small>
             </label>
 
-            <div class="ofield-row">
+            <div class="ofield-row" data-guide="output-format">
               <label class="ofield">
                 <span class="ofield__label">{{ runMode === 'workflow' ? t('separate.currentFormat') : t('settings.defaultFormat') }}</span>
                 <n-select v-if="runMode === 'model'" v-model:value="settings.defaultFormat" size="small" :options="formatOptions" :disabled="isRunModeLocked" />
@@ -2144,7 +2278,7 @@ async function retryCurrentTask() {
               </div>
             </div>
 
-            <div v-if="runMode === 'model'" class="ofield naming-field">
+            <div v-if="runMode === 'model'" class="ofield naming-field" data-guide="output-naming">
               <span class="ofield__label">{{ t('separate.namingRule') }}</span>
               <button type="button" class="naming-summary" :disabled="isRunModeLocked" @click="showNamingModal = true">
                 <span>{{ outputNamingSummary }}</span>
@@ -2152,7 +2286,7 @@ async function retryCurrentTask() {
               </button>
             </div>
 
-            <div v-if="runMode === 'model'" class="ofield ofield--stems">
+            <div v-if="runMode === 'model'" class="ofield ofield--stems" data-guide="output-stems">
               <div class="ofield__heading">
                 <span class="ofield__label">{{ t('separate.outputStems') }}</span>
                 <div v-if="!ensembleEnabled && availableStemNames.length > 3" class="stem-selection-actions">
@@ -2196,7 +2330,7 @@ async function retryCurrentTask() {
                   {{ statusLabel(currentTask.status) }}
                 </span>
                 <div class="stage-hero__top-actions">
-                  <n-button text size="small" @click="showQueueModal = true">
+                  <n-button text size="small" data-guide="task-queue" @click="showQueueModal = true">
                     {{ t('separate.batchQueue') }} ({{ queueJobs.length }})
                   </n-button>
                   <n-button text size="small" :disabled="!currentTask.logs.length" @click="openCurrentLogs">
@@ -2263,7 +2397,7 @@ async function retryCurrentTask() {
                   {{ statusLabel(currentTask.status) }}
                 </span>
                 <div class="stage-hero__top-actions">
-                  <n-button v-if="hasQueueEntries" text size="small" @click="showQueueModal = true">
+                  <n-button v-if="hasQueueEntries" text size="small" data-guide="task-queue" @click="showQueueModal = true">
                     {{ t('separate.batchQueue') }} ({{ queueJobs.length }})
                   </n-button>
                   <n-button v-if="taskPanelState !== 'done' && currentTask.logs.length" text size="small" @click="openCurrentLogs">
@@ -2379,7 +2513,7 @@ async function retryCurrentTask() {
                 </div>
               </div>
               <div class="stage-head__controls">
-                <div v-if="runMode === 'model'" class="stage-head__extra">
+                <div v-if="runMode === 'model'" class="stage-head__extra" data-guide="model-mode">
                   <n-select
                     :value="ensembleEnabled ? 'ensemble' : 'single'"
                     size="small"
@@ -2392,7 +2526,7 @@ async function retryCurrentTask() {
                     @update:value="(value: string | number) => { ensembleEnabled = value === 'ensemble' }"
                   />
                 </div>
-                <n-button class="stage-head__queue" size="small" secondary @click="showQueueModal = true">
+                <n-button class="stage-head__queue" size="small" secondary data-guide="task-queue" @click="showQueueModal = true">
                   <template #icon><n-icon :component="ListOutline" /></template>
                   {{ t('separate.batchQueue') }}
                   <span class="stage-head__queue-count" :class="{ 'stage-head__queue-count--active': hasQueueEntries }">{{ queueJobs.length }}</span>
@@ -2403,7 +2537,7 @@ async function retryCurrentTask() {
             <transition name="stage-swap" mode="out-in">
               <div v-if="runMode === 'model'" key="model" class="target-pane" :class="{ 'target-pane--ensemble': ensembleEnabled }">
                 <template v-if="modelPanelHasModels">
-                  <div class="target-toolbar">
+                  <div class="target-toolbar" data-guide="separation-models">
                     <n-input
                       v-model:value="modelSearch"
                       clearable
@@ -2518,12 +2652,66 @@ async function retryCurrentTask() {
                   </div>
                   <strong>{{ modelPanelLoading ? t('separate.modelPanelLoadingTitle') : t('separate.modelPanelEmptyTitle') }}</strong>
                   <p>{{ modelPanelLoading ? t('separate.modelPanelLoadingDesc') : t('separate.modelPanelEmptyDesc') }}</p>
-                  <n-button v-if="!modelPanelLoading" secondary @click="model.loadModels()">
+                  <n-button v-if="!modelPanelLoading" secondary @click="router.push('/models')">
                     {{ t('separate.modelPanelPrimaryAction') }}
                   </n-button>
                 </div>
               </div>
 
+              <div v-else key="workflow" class="target-pane">
+                <div class="target-toolbar target-toolbar--single">
+                  <n-input
+                    v-model:value="workflowSearch"
+                    clearable
+                    :placeholder="t('separate.workflowSearchPlaceholder')"
+                  >
+                    <template #prefix><n-icon :component="SearchOutline" /></template>
+                  </n-input>
+                </div>
+                <div v-if="filteredWorkflows.length" class="target-list" role="listbox" :aria-label="t('separate.workflow')">
+                  <button
+                    v-for="item in filteredWorkflows"
+                    :key="item.id"
+                    type="button"
+                    role="option"
+                    :aria-selected="selectedWorkflowId === item.id"
+                    :aria-disabled="Boolean(workflowIssue(item))"
+                    :title="workflowIssue(item) || item.name"
+                    class="target-row workflow-target"
+                    :class="{
+                      'target-row--active': selectedWorkflowId === item.id,
+                      'target-row--unavailable': Boolean(workflowIssue(item)),
+                      'workflow-target--restricted': Boolean(getSeparateWorkflowInputIssue(item.definition)) && !getWorkflowDefinitionIssue(item.definition),
+                    }"
+                    @click="selectRunnableWorkflow(item)"
+                    @contextmenu.stop.prevent="openSeparateContextMenu($event, 'workflow', item)"
+                  >
+                    <span class="target-row__radio"></span>
+                    <span class="target-row__body">
+                      <span class="target-row__heading">
+                        <span class="target-row__name" :title="item.name">{{ item.name }}</span>
+                        <span v-if="workflowIssue(item)" class="target-row__unavailable">
+                          {{ t(getSeparateWorkflowInputIssue(item.definition) && !getWorkflowDefinitionIssue(item.definition)
+                            ? 'separate.workflowPageRequired' : 'separate.workflowUnavailable') }}
+                        </span>
+                      </span>
+                      <span class="target-row__meta">
+                        <span class="target-row__tag">{{ t('separate.workflow') }}</span>
+                        <span v-if="workflowIssue(item)" class="target-row__issue">{{ workflowIssueSummary(item) }}</span>
+                        <span v-else class="target-row__desc" :title="item.description">{{ item.description || t('separate.workflowNoDescription') }}</span>
+                      </span>
+                    </span>
+                  </button>
+                </div>
+                <div v-else class="stage-empty">
+                  <div class="stage-empty__glyph"><n-icon :component="GitNetworkOutline" /></div>
+                  <strong>{{ t('separate.workflowEmptyTitle') }}</strong>
+                  <p>{{ t('separate.workflowEmptyDesc') }}</p>
+                  <n-button secondary @click="router.push('/workflows')">
+                    {{ t('separate.workflowCreateAction') }}
+                  </n-button>
+                </div>
+              </div>
             </transition>
 
             <footer class="launch-bar" :class="`launch-bar--${canStart ? 'ready' : 'idle'}`">
@@ -2539,7 +2727,7 @@ async function retryCurrentTask() {
                   <template #icon><n-icon :component="OpenOutline" /></template>
                   {{ t('separate.openOutput') }}
                 </n-button>
-                <n-button type="primary" size="large" class="launch-bar__go" :loading="submittingJob" :disabled="!canStart" @click="start">
+                <n-button type="primary" size="large" class="launch-bar__go" data-guide="start-separation" :loading="submittingJob" :disabled="!canStart" @click="start">
                   <template #icon><n-icon :component="PlayOutline" /></template>
                   {{ t('separate.startTask') }}
                 </n-button>
@@ -2691,8 +2879,17 @@ async function retryCurrentTask() {
       </n-card>
     </n-modal>
 
-    <n-modal v-model:show="showSettingsDrawer">
+    <n-modal v-model:show="showSettingsDrawer" @after-enter="locateGuidedParameter">
+      <InferenceParameterLesson
+        v-if="parameterHelpPage !== null" :topic="helpTopics[parameterHelpPage]!" :topics="helpTopics" :progress="`${parameterHelpPage + 1} / ${helpTopics.length}`"
+        :close-label="t('parameterHelp.backToParameters')" :next-label="parameterHelpPage === helpTopics.length - 1 ? t('parameterHelp.done') : undefined"
+        @select="topic => parameterHelpPage = helpTopics.indexOf(topic)"
+        @close="parameterHelpPage = null" @previous="parameterHelpPage > 0 ? parameterHelpPage-- : parameterHelpPage = null"
+        @next="parameterHelpPage < helpTopics.length - 1 ? parameterHelpPage++ : parameterHelpPage = null"
+      />
       <n-card
+        v-else
+        ref="settingsCardRef"
         class="settings-modal"
         :title="t('separate.settingsDrawerTitle')"
         :bordered="false"
@@ -2702,13 +2899,13 @@ async function retryCurrentTask() {
         @close="showSettingsDrawer = false"
       >
         <div class="settings-drawer__content">
-          <div class="settings-group">
+          <div v-if="runMode === 'model'" class="settings-group settings-group--run">
             <div class="settings-group__head">
               <strong>{{ t('separate.runOptionsTitle') }}</strong>
               <span>{{ t('separate.runOptionsHint') }}</span>
             </div>
             <div class="check-list">
-              <n-checkbox v-model:checked="useTta">{{ t('separate.tta') }}</n-checkbox>
+              <n-checkbox v-model:checked="useTta" data-parameter-guide="tta" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'tta' }">{{ t('separate.tta') }}</n-checkbox>
               <n-checkbox v-model:checked="djOutput" :disabled="ensembleEnabled || !djModelSupported">{{ t('separate.djOutput') }}</n-checkbox>
             </div>
             <p class="settings-group__note">{{ djModelSupported ? t('separate.djOutputHint') : t('separate.djOutputUnavailable') }}</p>
@@ -2717,29 +2914,30 @@ async function retryCurrentTask() {
           <div class="settings-group">
             <div class="settings-group__head">
               <strong>{{ t('separate.audioQualityTitle') }} · {{ formatLabel }}</strong>
-              <span>{{ t('separate.audioQualityEditable') }}</span>
+              <span>{{ t(runMode === 'workflow' && effectiveFormat !== 'm4a'
+                ? 'separate.workflowAudioQualityHint' : 'separate.audioQualityEditable') }}</span>
             </div>
-            <n-grid :cols="2" :x-gap="16" :y-gap="16" responsive="screen">
-              <n-grid-item v-if="effectiveFormat === 'wav'">
-                <div class="field-block">
+            <n-grid v-if="runMode === 'model' || effectiveFormat === 'm4a'" :cols="2" :x-gap="12" :y-gap="12" responsive="screen">
+              <n-grid-item v-if="runMode === 'model' && effectiveFormat === 'wav'">
+                <div class="field-block" data-parameter-guide="wavBitDepth" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'wavBitDepth' }">
                   <label>{{ t('audio.wavBitDepth') }}</label>
                   <n-select v-model:value="settings.wavBitDepth" :options="wavBitDepthOptions" />
                 </div>
               </n-grid-item>
-              <n-grid-item v-if="effectiveFormat === 'flac'">
-                <div class="field-block">
+              <n-grid-item v-if="runMode === 'model' && effectiveFormat === 'flac'">
+                <div class="field-block" data-parameter-guide="flacBitDepth" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'flacBitDepth' }">
                   <label>{{ t('audio.flacBitDepth') }}</label>
                   <n-select v-model:value="settings.flacBitDepth" :options="flacBitDepthOptions" />
                 </div>
               </n-grid-item>
-              <n-grid-item v-if="effectiveFormat === 'mp3'">
-                <div class="field-block">
+              <n-grid-item v-if="runMode === 'model' && effectiveFormat === 'mp3'">
+                <div class="field-block" data-parameter-guide="mp3BitRate" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'mp3BitRate' }">
                   <label>{{ t('audio.mp3BitRate') }}</label>
-                  <n-select v-model:value="settings.mp3BitRate" :options="bitRateOptions" />
+                  <n-select v-model:value="settings.mp3BitRate" :options="mp3BitRateOptions" />
                 </div>
               </n-grid-item>
               <n-grid-item v-if="effectiveFormat === 'm4a'">
-                <div class="field-block">
+                <div class="field-block" data-parameter-guide="m4aBitRate" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'm4aBitRate' }">
                   <label>{{ t('audio.m4aBitRate') }}</label>
                   <n-select v-model:value="settings.m4aBitRate" :options="bitRateOptions" />
                 </div>
@@ -2758,76 +2956,77 @@ async function retryCurrentTask() {
                 </div>
               </n-grid-item>
               <n-grid-item v-if="effectiveFormat === 'm4a'">
-                <div class="field-block">
+                <div class="field-block" data-parameter-guide="m4aCodec" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'm4aCodec' }">
                   <label>{{ t('audio.m4aCodec') }}</label>
                   <n-select v-model:value="settings.m4aCodec" :options="m4aCodecOptions" />
                 </div>
               </n-grid-item>
-              <n-grid-item v-if="runMode === 'workflow' || showNormalizeField">
-                <div class="field-block field-block--inline-check">
+              <n-grid-item v-if="runMode === 'model' && showNormalizeField">
+                <div class="field-block field-block--inline-check" data-parameter-guide="normalize" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'normalize' }">
                   <n-checkbox v-model:checked="normalize">{{ t('inference.normalize') }}</n-checkbox>
                 </div>
               </n-grid-item>
             </n-grid>
           </div>
 
-          <div class="settings-group">
-            <n-collapse :default-expanded-names="[]">
+          <div v-if="runMode === 'model'" class="settings-group">
+            <n-collapse v-model:expanded-names="expandedInferenceSections">
               <n-collapse-item :title="t('inference.advancedParams')" name="inference">
+                <template #header-extra><n-button v-if="!beginnerGuide.parameterStep" text size="small" :aria-label="t('parameterHelp.label')" @click.stop="openParameterHelp"><n-icon :component="InformationCircleOutline" size="18" /></n-button></template>
                 <p class="advanced-hint">{{ t('separate.advancedPanelHint') }}</p>
                 <div v-if="advancedParamsLoading" class="advanced-loading">
                   <n-spin size="small" />
                   <span>{{ t('separate.advancedPanelLoading') }}</span>
                 </div>
-                <n-grid v-if="runMode === 'model'" :cols="2" :x-gap="16" :y-gap="16" responsive="screen">
+                <n-grid v-if="runMode === 'model'" :cols="2" :x-gap="12" :y-gap="12" responsive="screen">
                   <n-grid-item v-if="hasInferenceField('batch_size')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="batch_size" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'batch_size' }">
                       <label>{{ t('inference.batchSize') }}</label>
                       <n-input-number v-model:value="batch_size" :min="0" :max="32" style="width:100%" @blur="task.restoreInferenceNumberFallback('batch_size')" />
                     </div>
                   </n-grid-item>
                   <n-grid-item v-if="hasInferenceField('overlap_size')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="overlap_size" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'overlap_size' }">
                       <label>{{ t('inference.overlapSize') }}</label>
                       <AlignedInferenceInputNumber :value="overlap_size" :step="overlapSizeStep" :alignment-step="currentInferenceSampleStep" @update:value="updateOverlapSize" @blur="task.restoreInferenceNumberFallback('overlap_size')" />
                     </div>
                   </n-grid-item>
                   <n-grid-item v-if="hasInferenceField('num_overlap')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="num_overlap" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'num_overlap' }">
                       <label>{{ t('inference.numOverlap') }}</label>
                       <n-input-number v-model:value="num_overlap" :min="0" :max="128" style="width:100%" @blur="task.restoreInferenceNumberFallback('num_overlap')" />
                     </div>
                   </n-grid-item>
                   <n-grid-item v-if="hasInferenceField('chunk_size')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="chunk_size" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'chunk_size' }">
                       <label>{{ t('inference.chunkSize') }}</label>
                       <AlignedInferenceInputNumber :value="chunk_size" :step="chunkSizeStep" :alignment-step="currentChunkConstraint?.step || currentInferenceSampleStep" :alignment-offset="currentChunkConstraint?.offset" :alignment-min="currentChunkConstraint?.min" @update:value="updateChunkSize" @blur="task.restoreInferenceNumberFallback('chunk_size')" />
                       <n-text v-if="currentChunkIssue" type="warning">{{ t('inference.invalidChunkSize', currentChunkIssue) }}</n-text>
                     </div>
                   </n-grid-item>
                   <n-grid-item v-if="hasInferenceField('window_size')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="window_size" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'window_size' }">
                       <label>{{ t('inference.vrWindowSize') }}</label>
                       <n-input-number v-model:value="window_size" :min="0" :max="4096" style="width:100%" @blur="task.restoreInferenceNumberFallback('window_size')" />
                     </div>
                   </n-grid-item>
                   <n-grid-item v-if="hasInferenceField('aggression')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="aggression" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'aggression' }">
                       <label>{{ t('inference.vrAggression') }}</label>
                       <n-input-number v-model:value="aggression" :min="0" :max="100" style="width:100%" />
                     </div>
                   </n-grid-item>
                   <n-grid-item v-if="hasInferenceField('post_process_threshold')">
-                    <div class="field-block">
+                    <div class="field-block" data-parameter-guide="post_process_threshold" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'post_process_threshold' }">
                       <label>{{ t('inference.vrPostProcessThreshold') }}</label>
                       <n-input-number v-model:value="post_process_threshold" :min="0" :max="1" :step="0.05" style="width:100%" />
                     </div>
                   </n-grid-item>
                 </n-grid>
                 <div class="check-list check-list--spaced">
-                  <n-checkbox v-if="runMode === 'workflow' || showStandardizeField" v-model:checked="standardize">{{ t('inference.standardize') }}</n-checkbox>
-                  <n-checkbox v-if="runMode === 'model' && hasInferenceField('enable_post_process')" v-model:checked="enable_post_process">{{ t('inference.vrEnablePostProcess') }}</n-checkbox>
-                  <n-checkbox v-if="runMode === 'model' && hasInferenceField('high_end_process')" v-model:checked="high_end_process">{{ t('inference.vrHighEndProcess') }}</n-checkbox>
+                  <n-checkbox v-if="showStandardizeField" v-model:checked="standardize" data-parameter-guide="standardize" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'standardize' }">{{ t('inference.standardize') }}</n-checkbox>
+                  <n-checkbox v-if="runMode === 'model' && hasInferenceField('enable_post_process')" v-model:checked="enable_post_process" data-parameter-guide="enable_post_process" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'enable_post_process' }">{{ t('inference.vrEnablePostProcess') }}</n-checkbox>
+                  <n-checkbox v-if="runMode === 'model' && hasInferenceField('high_end_process')" v-model:checked="high_end_process" data-parameter-guide="high_end_process" :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'high_end_process' }">{{ t('inference.vrHighEndProcess') }}</n-checkbox>
                 </div>
                 <p v-if="runMode === 'model' && !advancedParamsLoading && !hasVisibleAdvancedFields" class="advanced-empty">
                   {{ t('separate.advancedPanelEmpty') }}
@@ -2835,6 +3034,8 @@ async function retryCurrentTask() {
                 <div
                   v-if="runMode === 'model' && currentModelInfo && currentModelDefaultsResolved && !advancedParamsLoading"
                   class="advanced-actions"
+                  data-parameter-guide="modelDefaults"
+                  :class="{ 'parameter-guide-target--active': guidedParameter?.id === 'modelDefaults' }"
                 >
                   <n-button size="small" secondary @click="resetCurrentModelInferenceDefaults">
                     {{ t('separate.resetInferenceDefaults') }}
@@ -2848,6 +3049,8 @@ async function retryCurrentTask() {
           </div>
         </div>
 
+        <ParameterFieldGuide v-if="guidedParameter" ref="fieldGuideRef" :parameter="guidedParameter" :target="guideTarget" />
+
         <template #footer>
           <div class="drawer-footer">
             <n-button type="primary" @click="showSettingsDrawer = false">{{ t('common.close') }}</n-button>
@@ -2855,7 +3058,7 @@ async function retryCurrentTask() {
         </template>
       </n-card>
     </n-modal>
-    <n-modal v-model:show="showNamingModal" style="width:min(640px, 92vw)">
+    <n-modal v-model:show="showNamingModal" style="width:var(--modal-width-sm)">
       <n-card
         class="naming-modal"
         :title="t('separate.namingModalTitle')"
@@ -2953,7 +3156,7 @@ async function retryCurrentTask() {
         </template>
       </n-card>
     </n-modal>
-    <n-modal v-model:show="showQueueModal" style="width:min(720px, 92vw)">
+    <n-modal v-model:show="showQueueModal" style="width:var(--modal-width-md)">
       <n-card
         class="batch-queue-modal"
         :title="t('separate.batchQueue')"
@@ -3036,7 +3239,7 @@ async function retryCurrentTask() {
         <n-empty v-else :description="t(queueScope === 'no-results' ? 'separate.queueNoResultEmpty' : 'separate.queueEmpty')" />
       </n-card>
     </n-modal>
-    <n-modal v-model:show="showLogModal" style="width:min(900px, 92vw)">
+    <n-modal v-model:show="showLogModal" style="width:var(--modal-width-lg)">
       <n-card
         :title="currentTask ? `${currentTaskFileName} - ${t('tasks.logs')}` : t('tasks.logs')"
         :bordered="false"
@@ -3806,6 +4009,16 @@ async function retryCurrentTask() {
 .stage-view--failed { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 40%, transparent), var(--shadow-panel); }
 .stage-view--cancelled { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warning) 40%, transparent), var(--shadow-panel); }
 
+.dark-theme .rail-card,
+.dark-theme .stage-view {
+  background: var(--surface-1);
+}
+.dark-theme .rail-card,
+.dark-theme .stage-view--ready {
+  box-shadow: inset 0 0 0 1px var(--outline);
+}
+.dark-theme .launch-bar__go { box-shadow: none; }
+
 .stage-swap-enter-active { transition: opacity 260ms cubic-bezier(0.22,1,0.36,1), transform 300ms cubic-bezier(0.22,1,0.36,1); }
 .stage-swap-leave-active { transition: opacity 160ms ease, transform 160ms ease; }
 .stage-swap-enter-from { opacity: 0; transform: translateY(10px) scale(0.99); }
@@ -4123,6 +4336,18 @@ async function retryCurrentTask() {
   background: color-mix(in srgb, var(--surface-2) 34%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 24%, var(--outline));
 }
+
+.workflow-target { height: 68px; min-width: 0; }
+.workflow-target--restricted,
+.workflow-target--restricted:hover {
+  opacity: 1;
+  box-shadow: inset 0 0 0 1px var(--outline);
+}
+.workflow-target--restricted .target-row__unavailable {
+  color: var(--on-surface-muted);
+  background: var(--surface-2);
+}
+.workflow-target--restricted .target-row__issue { color: var(--on-surface-muted); }
 
 .target-row__radio {
   flex: 0 0 auto;
@@ -4759,24 +4984,23 @@ async function retryCurrentTask() {
 
 .settings-drawer__content {
   display: grid;
-  gap: 14px;
+  gap: 12px;
   min-height: 0;
-  padding-top: 18px;
-  padding-bottom: 8px;
+  padding-top: 16px;
 }
 
 .settings-modal {
-  width: min(760px, calc(100vw - 48px));
-  max-height: min(760px, calc(100vh - 64px));
+  width: var(--modal-width-md);
+  max-height: var(--modal-max-height);
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-radius: 20px;
+  border-radius: 16px;
 }
 
 .settings-modal :deep(.n-card-header) {
   flex: 0 0 auto;
-  padding: 18px 22px 14px;
+  padding: 14px 20px;
   border-bottom: 1px solid color-mix(in srgb, var(--outline) 86%, transparent);
   background: color-mix(in srgb, var(--surface-1) 96%, transparent);
 }
@@ -4791,19 +5015,19 @@ async function retryCurrentTask() {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
-  padding: 0 22px 20px;
+  padding: 0 20px 16px;
 }
 
 .settings-modal :deep(.n-card-footer),
 .settings-modal :deep(.n-card__footer) {
   flex: 0 0 auto;
-  padding: 14px 22px 16px;
+  padding: 12px 20px;
   border-top: 1px solid color-mix(in srgb, var(--outline) 86%, transparent);
   background: color-mix(in srgb, var(--surface-1) 96%, transparent);
 }
 
 .naming-modal {
-  max-height: min(620px, calc(100vh - 72px));
+  max-height: min(620px, var(--modal-max-height));
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -5019,6 +5243,9 @@ async function retryCurrentTask() {
   gap: 6px;
 }
 
+.parameter-guide-target--active { position: relative; }
+.field-block.parameter-guide-target--active > label { color: var(--primary-strong); }
+
 .field-block label {
   font-size: 12px;
   color: var(--on-surface-muted);
@@ -5057,11 +5284,17 @@ async function retryCurrentTask() {
 
 .settings-group {
   display: grid;
-  gap: 14px;
-  padding: 16px;
+  gap: 10px;
+  padding: 12px 14px;
   border: 1px solid var(--outline);
-  border-radius: 16px;
+  border-radius: 12px;
   background: color-mix(in srgb, var(--surface-2) 62%, transparent);
+}
+
+.settings-group--run {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
 }
 
 .settings-group__head {
@@ -5262,8 +5495,8 @@ async function retryCurrentTask() {
   .progress-ring { width: 120px; height: 120px; }
   .progress-ring__center strong { font-size: 32px; }
   .settings-modal {
-    width: calc(100vw - 28px);
-    max-height: calc(100vh - 40px);
+    width: var(--modal-width-md);
+    max-height: var(--modal-max-height);
   }
   .settings-drawer__content,
   .settings-modal :deep(.n-card-content),

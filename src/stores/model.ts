@@ -1,3 +1,5 @@
+import { createLogger } from '@/utils/logger'
+import { workerLogRecord, type LogRecord } from '@/utils/logRecord'
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
@@ -13,6 +15,8 @@ import { inferenceChunkSizeIssue, normalizeInferenceParamMeta, type InferencePar
 /** How the model library lays its entries out. */
 export type ModelViewMode = 'card' | 'list'
 import { useSettingsStore } from '@/stores/settings'
+
+const studioLog = createLogger('ui.stores.model')
 
 export type ModelEntry = {
   name: string
@@ -159,6 +163,7 @@ export type DownloadLogEntry = {
   ts: number
   level: DownloadLogLevel
   message: string
+  record?: LogRecord
   fileIndex?: number
   totalFiles?: number
   stage?: string
@@ -533,7 +538,7 @@ export const useModelStore = defineStore('model', () => {
       }).catch((error) => {
         if (persistErrorReported) return
         persistErrorReported = true
-        console.warn('Failed to persist model state', error)
+        studioLog.warn('Failed to persist model state', error)
       })
     }, 120)
   }
@@ -973,11 +978,12 @@ export const useModelStore = defineStore('model', () => {
           })
         }
       } else if (event.type === 'download_log') {
-        const level = (payload.level === 'warn' || payload.level === 'error' ? payload.level : 'info') as DownloadLogLevel
+        const record = workerLogRecord(event)
+        const level = (record.level === 'warn' ? 'warn' : record.level === 'error' || record.level === 'fatal' ? 'error' : 'info') as DownloadLogLevel
         const message = String(payload.message || '')
         next.logs = appendLog(next.logs, {
           ts: Date.now(),
-          level,
+          level, record,
           message,
           fileIndex: payload.fileIndex,
           totalFiles: payload.totalFiles,
@@ -1573,8 +1579,9 @@ export const useModelStore = defineStore('model', () => {
   }
 
   async function removeCustomModel(name: string, deleteFiles = false) {
+    const settings = useSettingsStore()
     const result = await invoke<CustomModelRemoval>('unregister_custom_model', {
-      payload: { name, deleteFiles },
+      payload: { name, deleteFiles, modelDir: settings.modelDir || null },
     })
     await loadModels()
     return result

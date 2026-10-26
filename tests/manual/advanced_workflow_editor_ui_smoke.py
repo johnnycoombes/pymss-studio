@@ -31,6 +31,7 @@ with sync_playwright() as playwright:
     toolbar = page.locator('.litegraph-editor > .toolbar')
     expect(canvas).to_be_visible()
     expect(toolbar.get_by_role('button', name=copy['common']['save'], exact=True)).to_have_count(0)
+    expect(toolbar.get_by_role('button', name=copy['workflows']['editMeta'], exact=True)).to_have_count(0)
     page.wait_for_function("document.querySelector('canvas.lg-canvas')?.data?.graph.nodes.length===4")
     expect(page.locator('.config-grid')).to_have_count(0)
     canvas.evaluate('''el=>{
@@ -68,11 +69,46 @@ with sync_playwright() as playwright:
     expect(page.locator('.workflow-save-status')).to_have_text(copy['workflows']['autoSaveSaved'])
     page.screenshot(path=str(args.output_dir / 'after-light.png'), animations='disabled')
 
+    output_button = toolbar.get_by_role('button', name=copy['separate']['output'], exact=True)
+    output_button.click()
+    output_modal = page.locator('.advanced-output-settings-modal')
+    output_path = output_modal.locator('input')
+    choose_output = output_modal.get_by_role('button', name=copy['workbench']['chooseOutput'], exact=True)
+    default_output = output_modal.get_by_role('button', name=copy['workbench']['defaultOutput'], exact=True)
+    expect(output_path).to_have_value('D:/outputs')
+    expect(default_output).to_be_disabled()
+    expect(output_modal.locator('.binding-layout')).to_have_count(0)
+    original_definition = page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].definition")
+    page.evaluate('''() => {
+      const settings=document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('settings');
+      window.__outputSelection='E:/WorkflowOutput';
+      settings.pickFolder=async()=>window.__outputSelection;
+    }''')
+    choose_output.click()
+    expect(output_path).to_have_value('E:/WorkflowOutput')
+    assert page.evaluate("document.querySelector('#app').__vue_app__.config.globalProperties.$pinia._s.get('settings').outputDir") == 'D:/outputs'
+    page.evaluate('window.__outputSelection=null')
+    choose_output.click()
+    expect(choose_output).to_be_enabled()
+    expect(output_path).to_have_value('E:/WorkflowOutput')
+    default_output.click()
+    expect(output_path).to_have_value('D:/outputs')
+    expect(default_output).to_be_disabled()
+    page.evaluate("window.__outputSelection='E:/WorkflowOutput'")
+    choose_output.click()
+    expect(output_path).to_have_value('E:/WorkflowOutput')
+    assert page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].definition") == original_definition
+    page.screenshot(path=str(args.output_dir / 'output-settings-light.png'), animations='disabled')
+    output_modal.get_by_role('button', name=copy['common']['close'], exact=True).click()
+
     add = toolbar.get_by_role('button', name=copy['workflows']['addNode'], exact=True)
     add.click()
     palette = page.locator('.palette')
     search = palette.locator('.palette-input')
     expect(search).to_be_focused()
+    search.fill('PreviewAudio')
+    expect(palette.locator('.palette-item')).to_have_count(0)
+    expect(palette.get_by_text(copy['workflows']['advancedEditor']['noMatchingNodes'], exact=True)).to_be_visible()
     search.fill('no-node-matches-this-query')
     expect(palette.get_by_text(copy['workflows']['advancedEditor']['noMatchingNodes'], exact=True)).to_be_visible()
     search.press('Escape')
@@ -93,14 +129,16 @@ with sync_playwright() as playwright:
     page.wait_for_function("document.querySelector('canvas.lg-canvas').data.graph.nodes.length===4")
     toolbar.get_by_role('button', name=copy['common']['redo'], exact=True).click()
     page.wait_for_function("document.querySelector('canvas.lg-canvas').data.graph.nodes.length===5")
-    toolbar.get_by_role('button', name=copy['workflows']['editMeta'], exact=True).click()
-    info = page.locator('.advanced-workflow-info-modal')
-    info.locator('textarea').fill('Vocal processing')
-    info.get_by_role('button', name=copy['common']['close'], exact=True).click()
+    def rename_workflow(value):
+        toolbar.locator('.workflow-name-trigger').click()
+        name_input = toolbar.locator('.workflow-name-input input')
+        name_input.fill(value)
+        name_input.press('Enter')
+    rename_workflow('Vocal processing')
     canvas.focus()
     page.keyboard.press('Control+s')
     expect(page.locator('.workflow-save-status')).to_have_text(copy['workflows']['autoSaveSaved'])
-    page.wait_for_function("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].description==='Vocal processing'")
+    page.wait_for_function("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].name==='Vocal processing'")
     assert canvas.evaluate('el=>el.data===window.__savedCanvas && el.data.graph===window.__savedGraph')
     entries = page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows")
     assert len(entries) == 1 and entries[0]['id'] == saved['id']
@@ -175,6 +213,10 @@ with sync_playwright() as playwright:
     page.set_viewport_size({'width': 1000, 'height': 760})
     assert toolbar.evaluate('el=>el.scrollWidth<=el.clientWidth+1')
     page.screenshot(path=str(args.output_dir / 'running-narrow.png'), animations='disabled')
+    output_button.click()
+    expect(output_path).to_have_value('E:/WorkflowOutput')
+    page.screenshot(path=str(args.output_dir / 'output-settings-dark.png'), animations='disabled')
+    output_modal.get_by_role('button', name=copy['common']['close'], exact=True).click()
     assert not errors, errors
 
     # A failed automatic write retains the live graph and can be retried explicitly.
@@ -185,25 +227,26 @@ with sync_playwright() as playwright:
         return window.__setItem.call(this,key,value);
       };
     }''')
-    toolbar.get_by_role('button', name=copy['workflows']['editMeta'], exact=True).click()
-    info.locator('textarea').fill('Updated workflow notes')
-    info.get_by_role('button', name=copy['common']['close'], exact=True).click()
+    rename_workflow('Updated workflow')
     retry = page.get_by_role('button', name=copy['workflows']['autoSaveFailed'] + ' · ' + copy['common']['retry'], exact=True)
     expect(retry).to_be_visible()
-    assert page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].description") == 'Vocal processing'
+    assert page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].name") == 'Vocal processing'
     assert canvas.evaluate('el=>el.data.graph===window.__savedGraph')
     page.evaluate('() => { Storage.prototype.setItem=window.__setItem }')
     retry.click()
-    page.wait_for_function("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].description==='Updated workflow notes'")
+    page.wait_for_function("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].name==='Updated workflow'")
     expect(page.locator('.workflow-save-status')).to_have_text(copy['workflows']['autoSaveSaved'])
 
     # Leaving immediately flushes a pending edit instead of dropping the debounce.
-    toolbar.get_by_role('button', name=copy['workflows']['editMeta'], exact=True).click()
-    info.locator('textarea').fill('Final workflow notes')
-    info.get_by_role('button', name=copy['common']['close'], exact=True).click()
+    rename_workflow('Final workflow')
     page.evaluate("document.querySelector('#app').__vue_app__.config.globalProperties.$router.push('/workflows')")
     page.wait_for_url('**/#/workflows')
-    assert page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].description") == 'Final workflow notes'
+    assert page.evaluate("JSON.parse(localStorage.getItem('pymss-studio:workflow-state')).workflows[0].name") == 'Final workflow'
+    assert not errors, errors
+    page.evaluate("id=>document.querySelector('#app').__vue_app__.config.globalProperties.$router.push('/workflow-node-editor?workflowId='+id)", saved['id'])
+    expect(canvas).to_be_visible()
+    output_button.click()
+    expect(output_path).to_have_value('E:/WorkflowOutput')
     assert not errors, errors
 
     # Unknown nodes remain native placeholders; existing empty graphs remain empty.
@@ -258,4 +301,4 @@ with sync_playwright() as playwright:
     page.screenshot(path=str(args.output_dir / 'load-error.png'), animations='disabled')
     failure_context.close()
     browser.close()
-    print('PASS: toolbar, node settings, viewport, palette, history, save shortcut, metadata, execution feedback, responsive layout and graph preservation')
+    print('PASS: toolbar, output settings, viewport, palette, history, save shortcut, renaming, execution feedback, responsive layout and graph preservation')

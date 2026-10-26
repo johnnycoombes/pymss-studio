@@ -4,6 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
 import { appendWorkflowNodeLogs } from '../src/workflows/nodeLogs.ts'
+import { normalizeLogRecord, workerLogRecord, formatLogRecord, localLogRecord } from '../src/utils/logRecord.ts'
 
 const source = ts.createSourceFile('task.ts', readFileSync(new URL('../src/stores/task.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
 const names = new Set(['normalizeStatus', 'clamp', 'resolveStageProgress', 'handleWorkerEvent'])
@@ -25,7 +26,7 @@ function setup() {
     TERMINAL_STATUSES: terminal,
     isTerminalTaskStatus: status => terminal.includes(status),
     markTaskStarted: () => {}, touch: () => {}, queueProgressPersist: () => {},
-    appendWorkflowNodeLogs, useSettingsStore: () => ({ developerMode: false }),
+    appendWorkflowNodeLogs, normalizeLogRecord, workerLogRecord, localLogRecord, useSettingsStore: () => ({ developerMode: false }),
     appendTaskLogs: (target, lines) => target.logs.push(...(Array.isArray(lines) ? lines : [lines])),
     normalizeStemOutputs: () => [], resolveTaskErrorMessage: (_code, message) => message,
     markTaskFinished: () => {}, queuePersist: () => {},
@@ -101,9 +102,11 @@ test('only explicit node ids route logs, even while another node is active', () 
   assert.equal(task.nodeLogs.first.length, 1)
   event('task_log', { message: 'Unattributed stderr', level: 'warning' })
   assert.equal(task.nodeLogs.first.length, 1)
-  assert.equal(task.logs[0], 'warning: Unattributed stderr')
+  assert.equal(task.logs[0].message, 'Unattributed stderr')
+  assert.equal(task.logs[0].level, 'warn')
   event('task_log', { nodeId: 'second', message: 'Model log', level: 'info' })
-  assert.deepEqual(task.nodeLogs.second, ['info: Model log'])
+  assert.equal(task.nodeLogs.second[0].message, 'Model log')
+  assert.equal(task.nodeLogs.second[0].level, 'info')
 })
 
 test('failed nodes retain their progress, diagnostics and tracebacks', () => {
@@ -112,7 +115,7 @@ test('failed nodes retain their progress, diagnostics and tracebacks', () => {
   event('error', { message: 'Model failed', detail: 'Traceback:\n  File "model.py", line 1\nValueError: invalid' })
   assert.equal(task.nodeStates.first.status, 'failed')
   assert.equal(task.nodeStates.first.progress, 40)
-  assert.ok(task.nodeLogs.first.some(line => line.includes('ValueError: invalid')))
+  assert.ok(task.nodeLogs.first.some(line => formatLogRecord(normalizeLogRecord(line)).includes('ValueError: invalid')))
 })
 
 test('node cancellation is recorded and late progress cannot overwrite it', () => {
@@ -121,7 +124,7 @@ test('node cancellation is recorded and late progress cannot overwrite it', () =
   event('task_cancelled', { message: 'Cancelled by user' })
   progress({ nodeId: 'first', nodeProgress: 1, message: 'Completed' })
   assert.equal(task.nodeStates.first.status, 'cancelled')
-  assert.equal(task.nodeLogs.first.at(-1), '[info] Cancelled by user')
+  assert.equal(task.nodeLogs.first.at(-1).message, 'Cancelled by user')
 })
 
 test('finishing audio does not complete a node before its output handling returns', () => {
@@ -131,7 +134,7 @@ test('finishing audio does not complete a node before its output handling return
   assert.equal(task.currentNodeId, 'first')
   event('error', { message: 'Missing output stem' })
   assert.equal(task.nodeStates.first.status, 'failed')
-  assert.ok(task.nodeLogs.first.some(line => line.includes('Missing output stem')))
+  assert.ok(task.nodeLogs.first.some(line => formatLogRecord(normalizeLogRecord(line)).includes('Missing output stem')))
 })
 
 test('workflow execution uses explicit node lifecycle without making task completion terminal', () => {
@@ -147,7 +150,7 @@ test('workflow execution uses explicit node lifecycle without making task comple
   assert.equal(task.currentNodeId, undefined)
   assert.equal(task.status, 'separating')
   assert.equal(task.progress, 90)
-  assert.ok(task.nodeLogs.save.some(line => line.includes('Node completed: Saved')))
+  assert.ok(task.nodeLogs.save.some(line => formatLogRecord(normalizeLogRecord(line)).includes('Node completed: Saved')))
 })
 
 test('workflow node failure remains failed through execution failure until the error detail arrives', () => {
@@ -161,7 +164,7 @@ test('workflow node failure remains failed through execution failure until the e
   assert.equal(task.currentNodeId, 'split')
   event('error', { message: 'Model execution failed', detail: 'Traceback: detail' })
   assert.equal(task.nodeStates.split.status, 'failed')
-  assert.ok(task.nodeLogs.split.some(line => line.includes('Traceback: detail')))
+  assert.ok(task.nodeLogs.split.some(line => formatLogRecord(normalizeLogRecord(line)).includes('Traceback: detail')))
 })
 
 test('workflow execution ignores non-second counters and late events after cancellation', () => {

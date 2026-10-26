@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { safeModelName } from '@/utils/modelName'
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useMessage } from 'naive-ui'
@@ -54,6 +55,7 @@ const nameError = computed(() => {
   if (!value) return t('models.customNameRequired')
   // pymss rejects any whitespace outright, so say so before the user submits.
   if (/\s/.test(value)) return t('models.customNameNoSpace')
+  if (!safeModelName(value)) return t('models.customNamePathUnsafe')
   return ''
 })
 
@@ -407,7 +409,7 @@ const nextDisabled = computed(() => {
 
 <style scoped>
 .cmi-modal {
-  width: min(620px, 92vw);
+  width: var(--modal-width-sm);
 }
 
 .cmi-title {

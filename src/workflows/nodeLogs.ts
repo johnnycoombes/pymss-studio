@@ -1,13 +1,16 @@
 import { visibleWorkflowNodeId } from './workbench.ts'
+import type { LogEntry } from '../utils/logRecord.ts'
 
-export type WorkflowNodeLogs = Record<string, string[]>
+export type WorkflowNodeLogs = Record<string, LogEntry[]>
 
-export function appendWorkflowNodeLogs(target: { nodeLogs?: WorkflowNodeLogs }, nodeId: string | undefined, lines: string | string[]) {
+export function appendWorkflowNodeLogs(target: { nodeLogs?: WorkflowNodeLogs }, nodeId: string | undefined, lines: LogEntry | LogEntry[]) {
   if (!nodeId) return
-  const values = (Array.isArray(lines) ? lines : [lines]).flatMap(line => line.split(/\r?\n/)).filter(Boolean)
+  const values = (Array.isArray(lines) ? lines : [lines]).flatMap<LogEntry>(line => typeof line === 'string' ? line.split(/\r?\n/).filter(Boolean) : [line])
   if (!values.length) return
   const previous = target.nodeLogs || {}
-  const logs = { ...previous, [nodeId]: [...(Object.hasOwn(previous, nodeId) ? previous[nodeId] : []), ...values].slice(-120) }
+  const existing = Object.hasOwn(previous, nodeId) ? previous[nodeId] : []
+  const unique = values.filter(value => typeof value === 'string' || value.legacy || !existing.some(entry => typeof entry !== 'string' && entry.id === value.id))
+  const logs = { ...previous, [nodeId]: [...existing, ...unique].slice(-120) }
   let total = Object.values(logs).reduce((sum, items) => sum + items.length, 0)
   for (const key of Object.keys(logs)) {
     if (total <= 600) break

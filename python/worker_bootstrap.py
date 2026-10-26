@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import importlib.util
 import json
 import os
@@ -11,11 +12,14 @@ import subprocess
 import sys
 import time
 import urllib.request
+import uuid
 from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable
 
 from pip._vendor.packaging.requirements import Requirement
+from pip._vendor.packaging.specifiers import SpecifierSet
+from pip._vendor.packaging.utils import canonicalize_name
 from pip._vendor.packaging.version import Version
 
 from worker_runtime_lock import RuntimeLockBusy, runtime_lock
@@ -51,7 +55,12 @@ PACKAGE_IMPORT_NAMES = {
 
 
 def _manifest() -> dict[str, Any]:
-    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    for spec in manifest.get("backends", {}).values():
+        override = spec.get("platformOverrides", {}).get(sys.platform)
+        if isinstance(override, dict):
+            spec.update(override)
+    return manifest
 
 
 def _pin_manifest_requirement(requirement: Any, version: str) -> str:
@@ -73,6 +82,19 @@ def _manifest_pinned_version(manifest: dict[str, Any], name: str) -> str:
         if specifier.operator in {"==", "==="} and "*" not in specifier.version:
             return specifier.version
     return ""
+
+
+def _runtime_requirement(name: str, value: Any) -> Requirement:
+    requirement = Requirement(str(value))
+    if name in {"pymss", "pymss-core"}:
+        # Release pins define the bundled baseline, not a ceiling for core updates.
+        requirement.specifier = SpecifierSet(
+            ",".join(
+                f">={spec.version.removesuffix('.*')}" if spec.operator in {"==", "===", "~="} else str(spec)
+                for spec in requirement.specifier if spec.operator not in {"<", "<="}
+            )
+        )
+    return requirement
 
 
 def _supported_backend(backend: str, manifest: dict[str, Any] | None = None) -> tuple[str, dict[str, Any]] | None:
@@ -139,7 +161,8 @@ def _resolve_runtime_state_from(file: Path) -> dict[str, Any] | None:
         if not p.is_absolute():
             resolved = file.parent / p
             if resolved.is_file():
-                state["pythonPath"] = str(resolved.resolve())
+                # Keep the executable link: POSIX venvs locate pyvenv.cfg through argv[0].
+                state["pythonPath"] = str(resolved.parent.resolve() / resolved.name)
             else:
                 return None
         elif not p.is_file():
@@ -149,15 +172,11 @@ def _resolve_runtime_state_from(file: Path) -> dict[str, Any] | None:
         overlay = Path(str(overlay_path))
         if not overlay.is_absolute():
             overlay = file.parent / overlay
-        try:
-            overlay = overlay.resolve()
-        except OSError:
+        resolved_overlay = _overlay_path_from_state({"overlayPath": str(overlay)})
+        if resolved_overlay is None:
             state.pop("overlayPath", None)
         else:
-            if overlay.is_dir() and _path_is_within(overlay, _runtime_overlay_root()):
-                state["overlayPath"] = str(overlay)
-            else:
-                state.pop("overlayPath", None)
+            state["overlayPath"] = str(resolved_overlay)
     state.pop("source", None)
     return state
 
@@ -339,6 +358,7 @@ def _recover_core_update_transactions() -> None:
 
 
 def _recover_runtime_transactions() -> None:
+    _recover_overlay_activation()
     _recover_reinstall_backups()
     _recover_core_update_transactions()
 
@@ -617,10 +637,13 @@ def _env_size_targets(manifest: dict[str, Any]) -> dict[str, Path]:
     return targets
 
 
-def _probe_environment(overlay_path: Path | None = None) -> dict[str, str]:
+def _probe_environment(overlay_path: Path | None = None, *, python_path: Path | None = None) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("PYTHONHOME", None)
+    if sys.platform == "darwin" and python_path and _is_bundled_bootstrap_python(python_path):
+        env["PYTHONHOME"] = str(BUNDLED_RUNTIME_ENVS_DIR.parent)
     env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     if overlay_path:
         env["PYTHONPATH"] = str(overlay_path)
     else:
@@ -628,24 +651,26 @@ def _probe_environment(overlay_path: Path | None = None) -> dict[str, str]:
     return env
 
 
-def _verify_runtime_audio(python_path: Path, overlay_path: Path | None = None) -> None:
+def _verify_runtime_audio(python_path: Path, overlay_path: Path | None = None, *, core_api: bool = False) -> None:
     """Exercise lazy imports and decoding before committing an installed environment."""
     completed = subprocess.run(
         [
             str(_runtime_command_path(python_path)),
             str(_runtime_command_path(Path(__file__).with_name("runtime_audio_probe.py"))),
+            *(["--check-core"] if core_api else []),
         ],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         timeout=60,
-        env={**_probe_environment(overlay_path), "PYTHONDONTWRITEBYTECODE": "1"},
+        env={**_probe_environment(overlay_path, python_path=python_path), "PYTHONDONTWRITEBYTECODE": "1"},
     )
     if completed.returncode:
         lines = completed.stderr.strip().splitlines()
         reason = lines[-1][:500] if lines else f"exit code {completed.returncode}"
-        raise RuntimeError(f"Runtime audio decoder verification failed: {reason}")
+        label = "Runtime compatibility verification" if core_api else "Runtime audio decoder verification"
+        raise RuntimeError(f"{label} failed: {reason}")
 
 
 def _probe_python_runtime(
@@ -690,7 +715,7 @@ print(json.dumps(result, ensure_ascii=False))
         encoding="utf-8",
         errors="replace",
         stderr=subprocess.PIPE,
-        env=_probe_environment(overlay_path),
+        env=_probe_environment(overlay_path, python_path=python_path),
     )
     result = json.loads(output)
     if (
@@ -737,7 +762,7 @@ print(json.dumps(result, ensure_ascii=False))
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_probe_environment(overlay_path),
+            env=_probe_environment(overlay_path, python_path=python_path),
         )
         data = json.loads(output.strip() or "{}")
         return {name: (str(data.get(name)) if data.get(name) else None) for name in package_names}
@@ -964,12 +989,22 @@ def _envs_with_live_active(
     return environments
 
 
-def _latest_pypi_version(distribution: str) -> str | None:
+def _latest_pypi_version(distribution: str, channel: str = "stable") -> str | None:
     url = f"https://pypi.org/pypi/{distribution}/json"
     with urllib.request.urlopen(url, timeout=12) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    version = payload.get("info", {}).get("version")
-    return str(version) if version else None
+    versions = []
+    for version, files in payload.get("releases", {}).items():
+        try:
+            parsed = Version(version)
+        except ValueError:
+            continue
+        if not files or all(file.get("yanked", False) for file in files):
+            continue
+        if channel != "prerelease" and parsed.is_prerelease:
+            continue
+        versions.append(parsed)
+    return str(max(versions)) if versions else None
 
 
 def _runtime_env_dir_for_python(python_path: Path) -> Path:
@@ -1021,7 +1056,11 @@ def _bundled_bootstrap_python() -> Path | None:
 def _is_bundled_bootstrap_python(path: Path) -> bool:
     bundled = _bundled_bootstrap_python()
     try:
-        return bool(bundled and _same_path(path.resolve(), bundled.resolve()))
+        return bool(
+            bundled
+            and _same_path(path.parent.resolve(), bundled.parent.resolve())
+            and _same_path(path.resolve(), bundled.resolve())
+        )
     except OSError:
         return False
 
@@ -1030,8 +1069,126 @@ def _runtime_overlay_root() -> Path:
     return RUNTIME_ENVS_DIR / ".overlays"
 
 
-def _runtime_overlay_selection_path(backend: str) -> Path:
-    return _runtime_overlay_root() / backend / "active-overlay.json"
+def _runtime_overlay_selection_path(backend: str, python_path: Path | None = None) -> Path:
+    suffix = ""
+    if python_path is not None:
+        identity = os.path.normcase(_normal_runtime_path(_runtime_command_path(python_path)))
+        suffix = "-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+    return _runtime_overlay_root() / backend / f"active-overlay{suffix}.json"
+
+
+def _read_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _recover_overlay_activation() -> None:
+    journal = RUNTIME_ENVS_DIR / ".overlay-activation.json"
+    transaction = _read_json_object(journal)
+    if not transaction:
+        return
+    backend = str(transaction.get("backend") or "")
+    if not _supported_backend(backend):
+        raise ValueError("Invalid runtime activation transaction")
+    active = _read_json_object(ACTIVE_RUNTIME_FILE) or {}
+    committed = active.get("activationId") == transaction["nextState"]["activationId"]
+    selection = transaction["nextState"] if committed else transaction.get("previousSelection")
+    path = _runtime_overlay_selection_path(backend)
+    if selection is None:
+        path.unlink(missing_ok=True)
+    else:
+        _atomic_write_json(path, selection)
+    journal.unlink()
+
+
+def _commit_runtime_overlay(state: dict[str, Any]) -> None:
+    journal = RUNTIME_ENVS_DIR / ".overlay-activation.json"
+    state["activationId"] = uuid.uuid4().hex
+    selection = _runtime_overlay_selection_path(str(state["backend"]))
+    previous_selection = _read_json_object(selection)
+    if previous_selection and previous_selection.get("pythonPath") and state.get("pythonPath") and not _same_path(previous_selection["pythonPath"], state["pythonPath"]):
+        # Keep the latest verified selection for the other installation source
+        # before the backend-wide index starts referring to the active source.
+        _atomic_write_json(_runtime_overlay_selection_path(state["backend"], Path(previous_selection["pythonPath"])), previous_selection)
+    _atomic_write_json(journal, {
+        "backend": state["backend"], "nextState": state,
+        "previousSelection": previous_selection,
+    })
+    try:
+        _atomic_write_json(selection, state)
+        # This single atomic replacement is the commit point. Recovery completes
+        # or undoes the secondary index according to this authoritative record.
+        _write_runtime_state(state)
+    except Exception:
+        _recover_overlay_activation()
+        if (_read_json_object(ACTIVE_RUNTIME_FILE) or {}).get("activationId") != state["activationId"]:
+            raise
+    else:
+        try:
+            _recover_overlay_activation()
+        except OSError:
+            # The authoritative state is committed. The durable journal repairs
+            # the secondary index on the next management operation.
+            pass
+
+
+def _cache_core_runtime_state(env_dir: Path, state_path: Path, python_path: Path, state: dict[str, Any], append_log: Callable[[str, str], None]) -> None:
+    if _is_bundled_runtime_env(env_dir) or _is_bundled_bootstrap_python(python_path):
+        return
+    cached = {key: value for key, value in state.items() if key not in {"pythonPath", "logPath", "activatedAt", "source"}}
+    try:
+        _atomic_write_json(state_path, cached)
+    except OSError as error:
+        append_log("warning", f"Runtime activated; environment cache could not be updated: {error}")
+
+
+def _core_update_identity(state: dict[str, Any], versions: dict[str, Any], manifest: dict[str, Any]) -> str:
+    identity = {
+        "backend": state.get("backend"),
+        "python": os.path.normcase(_normal_runtime_path(Path(str(state.get("pythonPath") or "")))),
+        "overlay": os.path.normcase(_normal_runtime_path(Path(str(state.get("overlayPath") or "")))),
+        "versions": versions, "manifest": manifest,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _core_rollback_available(state: dict[str, Any] | None, manifest: dict[str, Any]) -> bool:
+    previous = (state or {}).get("previousRuntime")
+    return bool(
+        isinstance(previous, dict)
+        and _same_path(previous.get("pythonPath"), state.get("pythonPath"))
+        and (not previous.get("overlayPath") or _overlay_path_from_state(previous) is not None)
+        and previous.get("pymssGraphAvailable") is not False
+        and _runtime_health(str(state.get("backend") or ""), previous, manifest) == "ready"
+    )
+
+
+def _load_core_update_plan(plan_id: str) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{32}", plan_id):
+        raise ValueError("A confirmed runtime update plan is required")
+    plan = _read_json_object(_runtime_overlay_root() / ".plans" / f"{plan_id}.json")
+    if not plan or time.time() - plan.get("createdAt", 0) > 15 * 60:
+        raise ValueError("The runtime update plan expired. Check for updates again.")
+    return plan
+
+
+def _save_core_update_plan(plan: dict[str, Any], task_id: str) -> None:
+    plan.update({"id": uuid.uuid4().hex, "createdAt": time.time()})
+    root = _runtime_overlay_root() / ".plans"
+    root.mkdir(parents=True, exist_ok=True)
+    for path in root.glob("*.json"):
+        if time.time() - path.stat().st_mtime > 15 * 60:
+            path.unlink(missing_ok=True)
+    _atomic_write_json(root / f"{plan['id']}.json", plan)
+    _emit("runtime_core_update_plan", {
+        key: plan[key] for key in (
+            "id", "backend", "pythonPath", "mode", "channel", "mirror",
+            "currentVersions", "targetVersions", "dependencyCount",
+        )
+    }, task_id)
 
 
 def _overlay_path_from_state(state: dict[str, Any] | None) -> Path | None:
@@ -1043,21 +1200,24 @@ def _overlay_path_from_state(state: dict[str, Any] | None) -> Path | None:
         resolved = path.resolve()
     except OSError:
         return None
-    return resolved if resolved.is_dir() and _path_is_within(resolved, _runtime_overlay_root()) else None
+    # Match Rust's allowed roots when reading an installation created before
+    # overlays moved to user storage. New generations still use the user root.
+    roots = [_runtime_overlay_root()]
+    if BUNDLED_RUNTIME_ENVS_DIR:
+        roots.append(BUNDLED_RUNTIME_ENVS_DIR / ".overlays")
+    return resolved if resolved.is_dir() and any(_path_is_within(resolved, root) for root in roots) else None
 
 
 def _registered_runtime_overlay(backend: str, python_path: Path) -> dict[str, Any] | None:
-    path = _runtime_overlay_selection_path(backend)
-    try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    if not isinstance(state, dict) or not _same_path(state.get("pythonPath"), python_path):
-        return None
-    overlay = _overlay_path_from_state(state)
-    if not overlay:
-        return None
-    return {**state, "overlayPath": str(overlay)}
+    for path in (_runtime_overlay_selection_path(backend), _runtime_overlay_selection_path(backend, python_path)):
+        state = _read_json_object(path)
+        if not state or not _same_path(state.get("pythonPath"), python_path):
+            continue
+        overlay = _overlay_path_from_state(state)
+        # A matching record without an overlay is an explicit restoration of
+        # the base; do not revive an older per-source cache behind it.
+        return {**state, "overlayPath": str(overlay)} if overlay else None
+    return None
 
 
 def _overlay_requirement_is_satisfied(requirement: str, installed_version: str | None) -> bool:
@@ -1098,12 +1258,42 @@ def _overlay_requirements(
     return requirements
 
 
+def _is_base_accelerator_package(name: str) -> bool:
+    name = canonicalize_name(name)
+    return name in {"torch", "torchaudio", "torchvision", "triton", "mlx"} or name.startswith(("nvidia-", "rocm-", "mlx-"))
+
+
+def _resolved_overlay_requirements(requirements: list[str], report: dict[str, Any]) -> list[str]:
+    if report.get("version") != "1" or not isinstance(report.get("install"), list):
+        raise RuntimeError("The package resolver returned an unsupported installation report")
+    resolved = {canonicalize_name(Requirement(value).name): value for value in requirements}
+    for item in report["install"]:
+        metadata = item["metadata"]
+        name = canonicalize_name(metadata["name"])
+        if _is_base_accelerator_package(name):
+            raise RuntimeError(f"The core update requires changing the base accelerator package {name}; the current runtime was preserved")
+        version = str(Version(metadata["version"]))
+        resolved[name] = _pin_manifest_requirement(resolved.get(name, name), version)
+    return list(resolved.values())
+
+
 def _cleanup_runtime_overlays(backend: str, keep: set[Path]) -> None:
     root = _runtime_overlay_root() / backend
     if not root.is_dir():
         return
     try:
         kept = {path.resolve() for path in keep}
+        current = _read_json_object(_runtime_overlay_selection_path(backend)) or {}
+        for path in root.glob("active-overlay*.json"):
+            selected = _read_json_object(path) or {}
+            if path.name != "active-overlay.json" and _same_path(selected.get("pythonPath"), current.get("pythonPath")):
+                continue
+            for record in (selected, selected.get("previousRuntime") or {}):
+                if not isinstance(record, dict):
+                    continue
+                overlay = _overlay_path_from_state(record)
+                if overlay:
+                    kept.add(overlay.parent)
         candidates = sorted(
             (path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")),
             key=lambda path: path.stat().st_mtime,
@@ -1111,13 +1301,9 @@ def _cleanup_runtime_overlays(backend: str, keep: set[Path]) -> None:
         )
     except OSError:
         return
-    retained_old = False
     for candidate in candidates:
         resolved = candidate.resolve()
         if resolved in kept:
-            continue
-        if not retained_old:
-            retained_old = True
             continue
         shutil.rmtree(candidate, ignore_errors=True)
 
@@ -1303,8 +1489,8 @@ def _manifest_versions_are_satisfied(
             failures.append(f"{name} is not installed")
             continue
         try:
-            parsed = Requirement(str(requirement))
-            if parsed.specifier and Version(str(actual)) not in parsed.specifier:
+            parsed = _runtime_requirement(name, requirement)
+            if parsed.specifier and not parsed.specifier.contains(Version(str(actual)), prereleases=True):
                 failures.append(f"{name}=={actual} does not satisfy {parsed.specifier}")
         except Exception as exc:
             failures.append(f"{name}: invalid requirement {requirement!r}: {exc}")
@@ -1441,6 +1627,7 @@ def _runtime_info_payload(payload: dict[str, Any], *, repair: bool = True) -> di
         "backend": backend,
         "installedBackend": install_state.get("backend") if install_state else None,
         "installState": install_state,
+        "rollbackAvailable": _core_rollback_available(install_state, manifest),
         "statePath": str(ACTIVE_RUNTIME_FILE),
         "logPath": str(install_state.get("logPath")) if install_state and install_state.get("logPath") else None,
         "installedEnvironments": environments,
@@ -1474,19 +1661,20 @@ def cmd_runtime_info(payload: dict[str, Any], *, repair: bool = True) -> int:
 
 
 def cmd_runtime_core_versions(payload: dict[str, Any]) -> int:
-    del payload
-    manifest = _manifest()
-    packages: dict[str, dict[str, str | None]] = {}
+    channel = "prerelease" if payload.get("channel") == "prerelease" else "stable"
+    current = payload.get("versions") or {}
+    packages: dict[str, dict[str, Any]] = {}
     for name in ("pymss", "pymss-core"):
-        pinned = _manifest_pinned_version(manifest, name)
-        if pinned:
-            packages[name] = {"latestVersion": pinned}
-            continue
         try:
-            packages[name] = {"latestVersion": _latest_pypi_version(name)}
+            latest = _latest_pypi_version(name, channel)
+            installed = current.get(name)
+            packages[name] = {
+                "latestVersion": latest, "currentVersion": installed,
+                "updateAvailable": bool(latest and installed and Version(latest) > Version(installed)),
+            }
         except Exception as exc:
             packages[name] = {"latestVersion": None, "error": str(exc)}
-    _emit("runtime_core_versions", {"packages": packages})
+    _emit("runtime_core_versions", {"channel": channel, "packages": packages})
     return 0
 
 
@@ -1682,16 +1870,18 @@ def cmd_delete_runtime(payload: dict[str, Any]) -> int:
         return emit_error("RUNTIME_DELETE_ACTIVE", f"Cannot delete the currently active runtime ({backend}). Switch to another environment first.")
     import shutil
     try:
-        owns_overlay = _registered_runtime_overlay(backend, python_path) is not None
         if env_dir.is_dir():
             shutil.rmtree(str(env_dir))
-        if owns_overlay:
-            shutil.rmtree(_runtime_overlay_root() / backend, ignore_errors=True)
-        if active_python and _same_path(active_python, python_path):
-            try:
-                ACTIVE_RUNTIME_FILE.unlink()
-            except Exception:
-                pass
+        for selection in (_runtime_overlay_selection_path(backend), _runtime_overlay_selection_path(backend, python_path)):
+            selected = _read_json_object(selection)
+            if selected and _same_path(selected.get("pythonPath"), python_path):
+                selection.unlink(missing_ok=True)
+        retained = set()
+        for record in (active, (active or {}).get("previousRuntime")):
+            overlay = _overlay_path_from_state(record)
+            if overlay:
+                retained.add(overlay.parent)
+        _cleanup_runtime_overlays(backend, retained)
         _emit("runtime_deleted", {"backend": backend})
         return 0
     except Exception as exc:
@@ -1739,6 +1929,7 @@ def _runtime_python_works(python_path: Path) -> bool:
             capture_output=True,
             text=True,
             timeout=20,
+            env=_probe_environment(python_path=python_path),
         ).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1753,6 +1944,7 @@ def _runtime_pip_works(python_path: Path) -> bool:
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            env=_probe_environment(python_path=python_path),
         ).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -1782,6 +1974,7 @@ def _ensure_runtime_pip(
         encoding="utf-8",
         errors="replace",
         timeout=120,
+        env=_probe_environment(python_path=python_path),
     )
     for line in result.stdout.splitlines():
         message = line.rstrip()
@@ -1819,7 +2012,9 @@ def _make_posix_venv_relocatable(env_dir: Path) -> bool:
     bootstrap = _bootstrap_python_path().resolve()
     if not bin_dir.is_dir() or not bootstrap.is_file():
         return False
-    relative = os.path.relpath(bootstrap, bin_dir)
+    # Resolve both ends: on macOS /var aliases /private/var, and lexical
+    # traversal from the alias can otherwise leave a dangling interpreter link.
+    relative = os.path.relpath(bootstrap, bin_dir.resolve())
     names = {"python", "python3", f"python{sys.version_info.major}.{sys.version_info.minor}"}
     changed = False
     for name in names:
@@ -1896,7 +2091,7 @@ def cmd_install_runtime(payload: dict[str, Any]) -> int:
         command.extend(args)
         append_log(stage, "pip install " + " ".join(args))
         _emit("runtime_install_stage", {"stage": stage, "command": "pip install " + " ".join(args)}, task_id)
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=os.environ.copy())
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=_probe_environment())
         assert process.stdout is not None
         try:
             for line in process.stdout:
@@ -2055,7 +2250,9 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
     backend = str(payload.get("backend") or "").strip().lower()
     mirror = str(payload.get("mirror") or "auto").strip().lower()
     locale = str(payload.get("locale") or "").strip().lower()
-    repair_dependencies = bool(payload.get("repairDependencies"))
+    prepare_only = payload.get("prepareOnly") is True
+    mode = str(payload.get("mode") or ("repair" if payload.get("repairDependencies") else "update"))
+    channel = "prerelease" if payload.get("channel") == "prerelease" else "stable"
     manifest = _manifest()
     _recover_runtime_transactions()
     supported = _supported_backend(backend)
@@ -2089,6 +2286,18 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
         return emit_error("RUNTIME_CORE_UPDATE_INACTIVE", "Core update is only available for the currently active runtime. Please switch to this environment first.", task_id=task_id, recoverable=True)
     if active.get("overlayPath"):
         state = {**state, **active}
+    try:
+        plan = None if prepare_only else _load_core_update_plan(str(payload.get("planId") or ""))
+        if plan:
+            if plan.get("backend") != backend or not _same_path(plan.get("pythonPath"), python_path):
+                raise ValueError("The runtime update plan belongs to another environment")
+            mode, channel, mirror = plan["mode"], plan["channel"], plan["mirror"]
+        if mode not in {"update", "sync", "repair", "rollback"}:
+            raise ValueError("Unsupported runtime core operation")
+    except (OSError, ValueError, KeyError) as exc:
+        from worker_protocol import emit_error
+        return emit_error("RUNTIME_UPDATE_PLAN_INVALID", str(exc), task_id=task_id, recoverable=True)
+    repair_dependencies = mode in {"sync", "repair"}
     manifest_status = _runtime_manifest_status(state.get("manifestVersion"), manifest.get("manifestVersion"))
     if manifest_status not in {"current", "older"} and not (
         repair_dependencies and manifest_status == "unknown"
@@ -2103,38 +2312,57 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
         )
     mirror, index_url = ("pypi", PYPI_MIRROR_URLS["pypi"]) if mirror == "auto" else _resolve_pypi_mirror(mirror, locale)
     package_versions = state.get("packageVersions") if isinstance(state.get("packageVersions"), dict) else {}
+    package_versions = {
+        **package_versions,
+        **_probe_python_package_versions(python_path, ["pymss", "pymss-core"], _overlay_path_from_state(active)),
+    }
+    identity = _core_update_identity(active, package_versions, manifest)
+    if plan and plan.get("identity") != identity:
+        from worker_protocol import emit_error
+        return emit_error("RUNTIME_UPDATE_PLAN_STALE", "The active runtime changed. Prepare and confirm a new update plan.", task_id=task_id, recoverable=True)
 
-    def installed_repair_version(name: str, direct_key: str) -> str:
-        if not repair_dependencies:
-            return ""
-        actual = str(state.get(direct_key) or package_versions.get(name) or "").strip()
+    def target_core_version(name: str, direct_key: str) -> str:
+        actual = str(package_versions.get(name) or state.get(direct_key) or "").strip()
         requirement_value = manifest.get("common", {}).get(name)
-        if not actual or not requirement_value:
-            return ""
         try:
-            requirement = Requirement(str(requirement_value))
-            return actual if not requirement.specifier or Version(actual) in requirement.specifier else ""
+            requirement = _runtime_requirement(name, requirement_value)
+            installed = actual if requirement.specifier.contains(Version(actual), prereleases=True) else ""
         except Exception:
-            return ""
+            installed = ""
+        if repair_dependencies:
+            baseline = installed or _manifest_pinned_version(manifest, name)
+            if not baseline:
+                lower = [Version(spec.version) for spec in requirement.specifier if spec.operator == ">="]
+                baseline = str(max(lower)) if lower else ""
+            if baseline:
+                return baseline
+        latest = _latest_pypi_version(name, channel)
+        if not latest:
+            raise RuntimeError(f"PyPI did not return a version for {name}")
+        # A synchronization or a stale package index must not downgrade an updated core.
+        return installed if installed and Version(installed) > Version(latest) else str(Version(latest))
 
-    target_pymss_version = installed_repair_version("pymss", "pymssVersion")
-    if not target_pymss_version:
-        target_pymss_version = _manifest_pinned_version(manifest, "pymss")
-    if not target_pymss_version:
-        try:
-            target_pymss_version = _latest_pypi_version("pymss")
-        except Exception as exc:
-            from worker_protocol import emit_error
-            return emit_error("RUNTIME_CORE_UPDATE_FAILED", f"Failed to resolve latest pymss version from PyPI: {exc}", task_id=task_id, recoverable=True)
-    target_pymss_core_version = installed_repair_version("pymss-core", "pymssCoreVersion")
-    if not target_pymss_core_version:
-        target_pymss_core_version = _manifest_pinned_version(manifest, "pymss-core")
-    if not target_pymss_core_version:
-        try:
-            target_pymss_core_version = _latest_pypi_version("pymss-core")
-        except Exception as exc:
-            from worker_protocol import emit_error
-            return emit_error("RUNTIME_CORE_UPDATE_FAILED", f"Failed to resolve latest pymss-core version from PyPI: {exc}", task_id=task_id, recoverable=True)
+    try:
+        previous_runtime = (plan.get("rollbackState") if plan else active.get("previousRuntime")) if mode == "rollback" else None
+        if mode == "rollback":
+            if not isinstance(previous_runtime, dict) or not _same_path(previous_runtime.get("pythonPath"), python_path):
+                raise ValueError("No verified previous runtime is available")
+            previous_versions = previous_runtime.get("packageVersions") or {}
+            targets = {
+                "pymss": previous_runtime.get("pymssVersion") or previous_versions.get("pymss"),
+                "pymss-core": previous_runtime.get("pymssCoreVersion") or previous_versions.get("pymss-core"),
+            }
+        elif plan:
+            targets = plan["targetVersions"]
+        else:
+            targets = {
+                "pymss": target_core_version("pymss", "pymssVersion"),
+                "pymss-core": target_core_version("pymss-core", "pymssCoreVersion"),
+            }
+        target_pymss_version, target_pymss_core_version = targets["pymss"], targets["pymss-core"]
+    except Exception as exc:
+        from worker_protocol import emit_error
+        return emit_error("RUNTIME_CORE_UPDATE_FAILED", f"Failed to resolve runtime core versions: {exc}", task_id=task_id, recoverable=True)
     overlay_backend_root = _runtime_overlay_root() / backend
     overlay_backend_root.mkdir(parents=True, exist_ok=True)
     log_path = overlay_backend_root / "pymss-core-update.log"
@@ -2146,27 +2374,77 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
         {
             "backend": backend,
             "logPath": str(log_path),
-            "mode": "repair" if repair_dependencies else "update",
+            "mode": mode,
         },
         task_id,
     )
 
+    log_writable = True
+
     def append_log(stage: str, message: str) -> None:
-        with log_path.open("a", encoding="utf-8", errors="replace") as file:
-            file.write(f"[{stage}] {message}\n")
+        nonlocal log_writable
+        if not log_writable:
+            return
+        try:
+            with log_path.open("a", encoding="utf-8", errors="replace") as file:
+                file.write(f"[{stage}] {message}\n")
+        except OSError:
+            log_writable = False
+            _emit("runtime_core_update_log", {"stage": "warning", "message": "The runtime log is unavailable. The operation will continue."}, task_id)
 
     try:
         base_probe = _probe_python_runtime(python_path, _backend_extra_names(manifest, backend))
     except Exception:
         base_probe = {}
-    torch_version = str((state or {}).get("torchVersion") or base_probe.get("torchVersion") or "").strip()
+    torch_version = str(base_probe.get("torchVersion") or (state or {}).get("torchVersion") or "").strip()
     if not torch_version:
         from worker_protocol import emit_error
         return emit_error("RUNTIME_CORE_UPDATE_FAILED", "Unable to determine the installed Torch version; refusing to update the runtime core.", task_id=task_id, recoverable=True)
+    # Older bundled state omitted Torch's version. Preserve the live base facts
+    # in both generations so a healthy previous core remains eligible for rollback.
+    runtime_facts = {
+        key: base_probe[key]
+        for key in ("pythonVersion", "torchBackend", "acceleratorAvailable")
+        if key in base_probe
+    }
+    runtime_facts["torchVersion"] = torch_version
     staging_generation: Path | None = None
     promoted_generation: Path | None = None
     overlay_committed = False
     try:
+        if plan and (plan.get("torchVersion") != torch_version or plan.get("baseVersions") != base_probe.get("packageVersions")):
+            raise ValueError("The base runtime changed. Prepare and confirm a new update plan.")
+        if mode == "rollback":
+            rollback_overlay = _overlay_path_from_state(previous_runtime)
+            if previous_runtime.get("overlayPath") and rollback_overlay is None:
+                raise ValueError("The previous runtime files are no longer available")
+            if prepare_only:
+                _save_core_update_plan({
+                    "backend": backend, "pythonPath": str(python_path), "mode": mode,
+                    "channel": channel, "mirror": mirror, "identity": identity,
+                    "torchVersion": torch_version, "baseVersions": base_probe.get("packageVersions"),
+                    "currentVersions": {name: package_versions.get(name) for name in targets},
+                    "targetVersions": targets, "dependencyCount": 0, "rollbackState": previous_runtime,
+                }, task_id)
+                return 0
+            probed = _probe_python_runtime(python_path, _backend_extra_names(manifest, backend), rollback_overlay)
+            manifest_ok, failures = _manifest_versions_are_satisfied(probed, manifest, backend)
+            if not manifest_ok or any(probed.get("packageVersions", {}).get(name) != version for name, version in targets.items()):
+                raise RuntimeError("The previous runtime failed compatibility verification: " + "; ".join(failures))
+            if probed.get("torchVersion") != torch_version or probed.get("torchBackend") != base_probe.get("torchBackend") or probed.get("pymssGraphAvailable") is not True:
+                raise RuntimeError("The previous runtime is incompatible with the current application")
+            _verify_runtime_audio(python_path, rollback_overlay, core_api=True)
+            restored = {key: value for key, value in previous_runtime.items() if key not in {"previousRuntime", "activationId"}}
+            restored["previousRuntime"] = {key: value for key, value in active.items() if key not in {"previousRuntime", "activationId"}}
+            restored["previousRuntime"].update({
+                "packageVersions": package_versions, "pymssVersion": package_versions.get("pymss"),
+                "pymssCoreVersion": package_versions.get("pymss-core"),
+            })
+            _emit("runtime_core_update_stage", {"stage": "activate", "message": "Restoring the previous runtime"}, task_id)
+            _commit_runtime_overlay(restored)
+            _cache_core_runtime_state(env_dir, env_state_path, python_path, restored, append_log)
+            _emit("runtime_core_update_finished", {"backend": backend, "state": restored, "mode": mode, "rollbackAvailable": _core_rollback_available(restored, manifest)}, task_id)
+            return 0
         _emit(
             "runtime_core_update_stage",
             {
@@ -2175,7 +2453,8 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             },
             task_id,
         )
-        _ensure_runtime_pip(python_path, task_id, append_log)
+        if not _runtime_pip_works(python_path):
+            raise RuntimeError("The runtime package installer is unavailable. Repair the runtime before updating core packages.")
         base_versions = dict(base_probe.get("packageVersions") or {})
         requirements = _overlay_requirements(
             manifest,
@@ -2184,6 +2463,14 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             target_pymss_version,
             target_pymss_core_version,
         )
+        if prepare_only and mode == "update":
+            for index, name in enumerate(("pymss", "pymss-core")):
+                requirement = _runtime_requirement(name, manifest["common"][name])
+                requirement.specifier &= SpecifierSet(f"<={targets[name]}")
+                installed = package_versions.get(name)
+                if installed:
+                    requirement.specifier &= SpecifierSet(f">={installed}")
+                requirements[index] = str(requirement)
         # Cancellation can terminate this bootstrap process before its finally block runs.
         # Runtime operations are serialized, so any staging directory left from an earlier
         # process is safe to reclaim before starting the next generation.
@@ -2199,14 +2486,14 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
         wheel_cache = _runtime_overlay_root() / ".wheel-cache"
         wheel_cache.mkdir(parents=True, exist_ok=True)
 
-        command = [
-            str(python_path), "-m", "pip", "install",
-            "--upgrade", "--target", str(staging_site_packages), "--no-deps",
+        pip_command = [
+            str(python_path), "-m", "pip", "install", "--upgrade",
             "--only-binary=:all:", "--prefer-binary", "--cache-dir", str(wheel_cache),
         ]
         if index_url:
-            command.extend(["--index-url", index_url])
-        command.extend(requirements)
+            pip_command.extend(["--index-url", index_url])
+        if channel == "prerelease":
+            pip_command.append("--pre")
 
         def run_pip(command: list[str], stage: str) -> None:
             process = subprocess.Popen(
@@ -2216,7 +2503,7 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=_probe_environment(),
+                env=_probe_environment(python_path=python_path),
             )
             assert process.stdout is not None
             try:
@@ -2236,17 +2523,51 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             if process.wait() != 0:
                 raise RuntimeError(f"pip failed during {stage} with exit code {process.returncode}")
 
-        stage = "repair" if repair_dependencies else ("manifest" if manifest_status == "older" else "core")
+        stage = "resolve" if prepare_only else mode
         _emit(
             "runtime_core_update_stage",
             {
                 "stage": stage,
                 "message": "Building isolated runtime overlay",
-                "command": "pip install --target <overlay> --no-deps " + " ".join(requirements),
             },
             task_id,
         )
-        run_pip(command, stage)
+        # Resolve against the immutable base, without --target (which ignores installed
+        # packages). Install only the resulting delta into the new overlay afterwards.
+        if prepare_only:
+            constraints = staging_generation / "base-constraints.txt"
+            constraints.write_text(f"torch=={torch_version}\n", encoding="utf-8")
+            report_path = staging_generation / "resolve-report.json"
+            run_pip([
+                *pip_command, "--dry-run", "--report", str(report_path),
+                "--constraint", str(constraints), *requirements,
+            ], "resolve")
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            requirements = _resolved_overlay_requirements(requirements, report)
+            selected = {canonicalize_name(item["metadata"]["name"]): item["metadata"]["version"] for item in report["install"]}
+            targets = {name: selected.get(name) or base_versions.get(name) for name in targets}
+            for index, name in enumerate(("pymss", "pymss-core")):
+                if not targets[name]:
+                    raise RuntimeError(f"Unable to resolve a compatible version of {name}")
+                if channel == "stable" and Version(targets[name]).is_prerelease and targets[name] != package_versions.get(name):
+                    raise RuntimeError("No stable core version is compatible with the current runtime")
+                requirements[index] = _pin_manifest_requirement(manifest["common"][name], targets[name])
+            if mode == "update" and not any(
+                not package_versions.get(name) or Version(version) > Version(package_versions[name])
+                for name, version in targets.items()
+            ):
+                raise RuntimeError("No newer core is compatible with the current runtime. Check the package mirror or upgrade Python/PyTorch before retrying.")
+            _save_core_update_plan({
+                "backend": backend, "pythonPath": str(python_path), "mode": mode,
+                "channel": channel, "mirror": mirror, "identity": identity,
+                "torchVersion": torch_version, "baseVersions": base_probe.get("packageVersions"),
+                "currentVersions": {name: package_versions.get(name) for name in targets},
+                "targetVersions": targets, "dependencyCount": max(0, len(requirements) - 2),
+                "requirements": requirements,
+            }, task_id)
+            return 0
+        requirements = plan["requirements"]
+        run_pip([*pip_command, "--target", str(staging_site_packages), "--no-deps", *requirements], stage)
         _emit("runtime_core_update_stage", {"stage": "verify", "message": "Verifying runtime packages"}, task_id)
         probed = _probe_python_runtime(
             python_path,
@@ -2273,12 +2594,13 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             raise RuntimeError(
                 f"Torch version changed to {probed.get('torchVersion') or 'unknown'} during update; expected {torch_version}"
             )
-        _verify_runtime_audio(python_path, staging_site_packages)
+        _verify_runtime_audio(python_path, staging_site_packages, core_api=True)
         staging_generation.rename(final_generation)
         promoted_generation = final_generation
         overlay_path = final_generation / "site-packages"
         updated = {
             **(state or {}),
+            **runtime_facts,
             "backend": backend,
             "manifestVersion": manifest.get("manifestVersion"),
             "pythonPath": str(python_path),
@@ -2290,27 +2612,28 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             "pymssCoreVersion": probed.get("pymssCoreVersion") or (state.get("pymssCoreVersion") if state else None),
             "pymssGraphAvailable": bool(probed.get("pymssGraphAvailable")),
             "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "previousRuntime": {key: value for key, value in active.items() if key not in {"previousRuntime", "activationId"}},
         }
-        _emit("runtime_core_update_stage", {"stage": "activate", "message": "Activating runtime overlay"}, task_id)
-        _atomic_write_json(_runtime_overlay_selection_path(backend), {
-            "backend": backend,
-            "manifestVersion": manifest.get("manifestVersion"),
-            "pythonPath": str(python_path),
-            "overlayPath": str(overlay_path),
+        updated["previousRuntime"].update({
+            **runtime_facts,
+            "packageVersions": package_versions,
+            "pymssVersion": package_versions.get("pymss"),
+            "pymssCoreVersion": package_versions.get("pymss-core"),
         })
-        _write_runtime_state(updated)
+        _emit("runtime_core_update_stage", {"stage": "activate", "message": "Activating runtime overlay"}, task_id)
+        _atomic_write_json(final_generation / "runtime-state.json", updated)
+        _commit_runtime_overlay(updated)
         overlay_committed = True
-        if env_state_path and not _is_bundled_runtime_env(env_dir) and not _is_bundled_bootstrap_python(python_path):
-            env_state = dict(updated)
-            env_state.pop("pythonPath", None)
-            env_state.pop("logPath", None)
-            env_state.pop("activatedAt", None)
-            env_state.pop("source", None)
-            try:
-                _atomic_write_json(env_state_path, env_state)
-            except OSError as cache_error:
-                append_log("warning", f"runtime cache state was not updated: {cache_error}")
-        _cleanup_runtime_overlays(backend, {final_generation})
+        _cache_core_runtime_state(env_dir, env_state_path, python_path, updated, append_log)
+        retained = {final_generation}
+        previous_overlay = _overlay_path_from_state(active)
+        if previous_overlay:
+            retained.add(previous_overlay.parent)
+        try:
+            _cleanup_runtime_overlays(backend, retained)
+            (_runtime_overlay_root() / ".plans" / f"{plan['id']}.json").unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            append_log("warning", f"Runtime activated; deferred cleanup: {cleanup_error}")
         append_log(
             "complete",
             "Runtime dependency reinstall completed" if repair_dependencies else "Core package update completed",
@@ -2320,14 +2643,15 @@ def cmd_update_runtime_core(payload: dict[str, Any]) -> int:
             {
                 "backend": backend,
                 "state": updated,
+                "rollbackAvailable": _core_rollback_available(updated, manifest),
                 "logPath": str(log_path),
-                "mode": "repair" if repair_dependencies else "update",
+                "mode": mode,
             },
             task_id,
         )
         return 0
     except Exception as exc:
-        if not overlay_committed and promoted_generation and promoted_generation.is_dir():
+        if not overlay_committed and promoted_generation and promoted_generation.is_dir() and not (RUNTIME_ENVS_DIR / ".overlay-activation.json").exists():
             shutil.rmtree(promoted_generation, ignore_errors=True)
         from worker_protocol import emit_error
         append_log("error", str(exc))

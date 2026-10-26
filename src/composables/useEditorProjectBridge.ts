@@ -12,14 +12,19 @@ type UseEditorProjectBridgeOptions = {
   hasTauriApis: boolean
   editor: EditorStore
   assetPanelEl: Ref<HTMLElement | null>
+  mixerRef: Ref<{ containsPoint: (x: number, y: number) => boolean } | null>
+  canDropToMixer: () => boolean
+  zoomFactor: Ref<number>
   message: MessageApiInjection
   t: ComposerTranslation
 }
 
 export function useEditorProjectBridge(options: UseEditorProjectBridgeOptions) {
-  const { routeProjectId, hasTauriApis, editor, assetPanelEl, message, t } = options
+  const { routeProjectId, hasTauriApis, editor, assetPanelEl, mixerRef, canDropToMixer, zoomFactor, message, t } = options
 
   const isDraggingExternal = ref(false)
+  const isDraggingExternalOnMixer = ref(false)
+  const isImportingExternal = ref(false)
 
   let unlistenDrop: UnlistenFn | null = null
   let unlistenOpenProject: UnlistenFn | null = null
@@ -36,16 +41,22 @@ export function useEditorProjectBridge(options: UseEditorProjectBridgeOptions) {
     return operation
   }
 
-  function isPointInAssetPanel(position: { x: number; y: number } | null | undefined) {
-    const element = assetPanelEl.value
-    if (!element || !position) return false
-
-    const rect = element.getBoundingClientRect()
-    const scale = window.devicePixelRatio || 1
+  function dropTarget(position: { x: number; y: number } | null | undefined) {
+    if (!position || !editor.session || editor.loading || isImportingExternal.value) return null
+    // Wry's WKWebView drag events use Cocoa points; WebView2 uses physical pixels.
+    const scale = /Mac/i.test(window.navigator.platform) ? zoomFactor.value : window.devicePixelRatio || 1
     const x = position.x / scale
     const y = position.y / scale
+    const rect = assetPanelEl.value?.getBoundingClientRect()
+    if (rect && rect.width > 0 && rect.height > 0
+      && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return 'assets'
+    if (canDropToMixer() && mixerRef.value?.containsPoint(x, y)) return 'mixer'
+    return null
+  }
 
-    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+  function clearExternalDrag() {
+    isDraggingExternal.value = false
+    isDraggingExternalOnMixer.value = false
   }
 
   async function handleProjectLoad(projectId: string) {
@@ -57,14 +68,23 @@ export function useEditorProjectBridge(options: UseEditorProjectBridgeOptions) {
     }
   }
 
-  async function handleExternalDrop(paths: string[]) {
+  async function handleExternalDrop(paths: string[], addTracks: boolean) {
+    if (!paths.length) return
+    const targetSession = editor.session
+    isImportingExternal.value = true
     try {
-      const result = await editor.scanAssets(paths)
-      if (result.files.length) message.success(t('editor.importSuccess', { count: result.files.length }))
-      else message.warning(t('editor.importEmpty'))
+      const result = await editor.scanAssets(paths, { addTracks })
+      if (disposed || editor.session !== targetSession) return
+      if (result.files.length) message.success(t(addTracks ? 'editor.importTracksSuccess' : 'editor.importSuccess', { count: result.files.length }))
+      if (result.warnings?.length) {
+        message.warning(t('editor.importWarnings', { detail: result.warnings.slice(0, 3).join('\n') }), { duration: 8000 })
+      } else if (!result.files.length) message.warning(t('editor.importEmpty'))
     } catch (error) {
+      if (disposed || editor.session !== targetSession) return
       const detail = error instanceof Error ? error.message : String(error)
       message.error(detail || t('editor.importEmpty'))
+    } finally {
+      isImportingExternal.value = false
     }
   }
 
@@ -76,20 +96,22 @@ export function useEditorProjectBridge(options: UseEditorProjectBridgeOptions) {
         if (disposed) return
         const type = event.payload.type
         if (type === 'over' || type === 'enter') {
-          isDraggingExternal.value = isPointInAssetPanel(event.payload.position)
+          const target = dropTarget(event.payload.position)
+          isDraggingExternal.value = target === 'assets'
+          isDraggingExternalOnMixer.value = target === 'mixer'
           return
         }
 
         if (type === 'drop') {
-          const isDropInAssetPanel = isPointInAssetPanel(event.payload.position)
-          isDraggingExternal.value = false
-          if (!isDropInAssetPanel) return
+          const target = dropTarget(event.payload.position)
+          clearExternalDrag()
+          if (!target) return
           const paths = (event.payload as { paths?: string[] }).paths || []
-          await handleExternalDrop(paths)
+          await handleExternalDrop(paths, target === 'mixer')
           return
         }
 
-        isDraggingExternal.value = false
+        clearExternalDrag()
       })
       if (disposed) removeDrop()
       else unlistenDrop = removeDrop
@@ -114,12 +136,15 @@ export function useEditorProjectBridge(options: UseEditorProjectBridgeOptions) {
 
   onBeforeUnmount(() => {
     disposed = true
+    clearExternalDrag()
     unlistenDrop?.()
     unlistenOpenProject?.()
   })
 
   return {
     isDraggingExternal,
+    isDraggingExternalOnMixer,
+    isImportingExternal,
     loadProject,
   }
 }

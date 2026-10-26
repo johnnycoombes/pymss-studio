@@ -102,6 +102,22 @@ function exporter(child, exportMix = async () => ({ path: 'D:/mix.wav' })) {
   return { hook, notices }
 }
 
+test('exports leave mix gain unchanged unless peak protection is explicitly selected', async t => {
+  const env = await environment(t)
+  const child = await env.instance('editor-a')
+  const requests = []
+  const { hook } = exporter(child, async options => { requests.push(clone(options)); return { path: 'D:/mix.wav' } })
+  assert.equal(hook.exportPeakProtectionDraft.value, false)
+  for (const format of ['wav', 'flac']) {
+    hook.setExportFormat(format)
+    await child.run(hook.exportMix)
+    assert.equal(requests.at(-1).audioParams.peakProtection, false)
+  }
+  hook.setExportPeakProtection(true)
+  await child.run(hook.exportMix)
+  assert.equal(requests.at(-1).audioParams.peakProtection, true)
+})
+
 for (const format of ['wav', 'flac']) {
   test(`${format} export persists through the main window and survives reopening without overwriting unrelated settings`, async t => {
     const env = await environment(t)

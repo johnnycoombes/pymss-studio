@@ -1,0 +1,78 @@
+Source: https://github.com/storytold/soundcraft
+Commit: 52471b37e957feaea56dfd48932ef16d314cc74a
+License: MIT OR Apache-2.0 (license texts included in each crate)
+
+soundcraft-vst3-host: host sources and test fixture imported from crates/vst3-host.
+soundcraft-au-host: AUv2 effect host imported from crates/au-host at the same commit;
+locally extended to AUv2/AUv3 effects and adapted to fallible DSP, queued parameters,
+stopped-worker property refresh, bounded state and a generic parameter controller.
+Native Cocoa view hosting and AUEventListener integration are local adaptations;
+view/unit lifetime follows the helper's stopped-worker and UI-thread teardown.
+Optional AU OfflineRender notification, stopped-unit transitions and persistent
+failure after an unsuccessful rollback are local additions. Dedicated auol units
+requiring a priming/preflight lifecycle remain excluded.
+AUv3 uses Apple's documented AudioComponentInstantiate and RequestViewController
+C compatibility bridge. Bounded main-runloop waits, late-result retirement,
+retained view controllers and distinct au3: identities are local additions.
+No private AUAudioUnit property/getter or 64-bit parameter-address cast is used.
+Independent mono/stereo main-input/output negotiation, per-direction channel
+mapping and exact offline-mode layout restoration are local additions. Explicit
+instantiation retries initialization failures; automatic metadata probes retain
+failure coalescing. No new AudioToolbox ABI declaration is introduced.
+https://developer.apple.com/documentation/audiotoolbox/auchannelinfo
+https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_supportednumchannels
+API reference:
+https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extensions-using-the-auv2-api
+soundcraft-dsp: only the plugin interfaces and data types from crates/dsp/src/lib.rs;
+built-in DSP, application, editor and DAW engine implementations are excluded.
+
+Local adaptations: descriptor-based explicit loading; fallible processor configuration
+and processing; normalized parameter delivery without controller calls on the audio
+thread; host message/attribute COM objects; hidden/bypass parameter and preset refresh
+synchronization; controlled process lifecycle and error propagation; macOS helper event-loop
+and autorelease scopes; Linux X11/XEmbed windows and per-context/frame IRunLoop ownership.
+VST3 realtime/offline setup and process modes, same-instance stopped mode changes,
+and isolated processing-mode fixture contracts are local adaptations. Mode setup
+and bus negotiation run on the helper control/UI thread.
+OnlyARA/OnlyOfflineProcess normal-insert rejection, live factory revalidation and
+OnlyRT refusal before offline reconfiguration are local additions. NoOfflineProcess
+is not treated as a ban on ordinary downmix export; it concerns direct offline processing.
+https://raw.githubusercontent.com/steinbergmedia/vst3_pluginterfaces/master/vst/ivstaudioprocessor.h
+https://steinbergmedia.github.io/vst3_dev_portal/pages/FAQ/Processing.html
+Timing readers, lifecycle flags shared with the worker and an atomic latency/tail
+pair are local additions. SDK timing queries and latency-change reactivation run
+on the creating control thread while the application suspends DSP. Getter-raised
+notifications remain pending; failed transitions prevent further processing.
+Application integrations
+are maintained in native/audio-host, not in the upstream FFI implementation.
+
+Windows editor ownership is supplied explicitly by the desktop bridge, including
+reassignment of an already-open VST2/VST3 container. Logical visibility preserves
+the view across owner-driven WM_SHOWWINDOW notifications and their nested explicit
+show/hide calls; user close and explicit hide still retire the view. Hidden-window
+regressions cover cross-process ownership, re-opening, minimization and restoration.
+https://learn.microsoft.com/en-us/windows/win32/winmsg/window-features#owned-windows
+https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-showwindow
+
+native/vst2-host is a local effect adapter. Its ABI declarations reference the
+MIT-licensed RustAudio/vst-rs source; the corresponding notice is included in
+native/vst2-host/THIRD-PARTY-LICENSES.txt. No Steinberg SDK headers are distributed.
+
+Native editor transport shortcuts:
+- Host windows record their calling webview label and expose a separate per-owner key counter.
+- Windows captures unmodified non-repeating Space in hosted VST2/VST3 child windows, while
+  standard edit/caret/character-input controls retain keyboard input. Cocoa applies the same
+  policy to hosted VST2/VST3/Audio Unit windows and native AppKit text responders.
+- The existing status protocol forwards intents to the owning frontend transport; no global
+  system hotkeys or asynchronous protocol output are introduced.
+- Linux native transport interception remains disabled: X11 passive grabs cannot reliably
+  distinguish third-party plugin text editors. Native plugin loading remains available.
+
+Audio Unit compatibility:
+- Negotiate the main mono/stereo buses while reducing writable auxiliary bus counts.
+  Fixed auxiliary inputs receive dedicated silent render callbacks; auxiliary outputs stay
+  unconnected. Callback storage is retained until AudioComponentInstanceDispose succeeds.
+- RequiresAsyncInstantiation and IsV3 components use the documented out-of-process creation
+  option. Component flags and instantiation/configuration stages are written to diagnostics.
+https://developer.apple.com/documentation/audiotoolbox/kaudiounitproperty_elementcount
+https://developer.apple.com/documentation/audiotoolbox/hosting-audio-unit-extensions-using-the-auv2-api
