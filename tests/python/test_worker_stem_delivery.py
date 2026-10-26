@@ -19,7 +19,7 @@ import numpy as np
 
 import worker_infer
 from stem_delivery import StemDeliveryError, decode_peak, write_stem_file
-from workflow_delivery import apply_simple_dj_folds, rewrite_yaml_ogg
+from workflow_delivery import apply_simple_dj_folds, collect_dj_ogg_save_names, rewrite_yaml_ogg
 
 
 class _DeferSeparatorBase:
@@ -91,21 +91,69 @@ class SeparatorDeliveryTests(unittest.TestCase):
             self.assertEqual(separator.received_format, "wav")
             self.assertTrue(separator._studio_defer_delivery)
             separator.process_folder(str(source))
-            names = sorted(path.name for path in out.iterdir())
-            self.assertEqual(names, [
-                "song - Bass.ogg",
-                "song - Drums.ogg",
-                "song - Melody.ogg",
-                "song - Vocals.ogg",
-            ])
+            names = sorted(path.name for path in out.iterdir() if path.suffix == ".ogg")
+            self.assertEqual(names, ["bass.ogg", "drums.ogg", "other.ogg", "vocals.ogg"])
+            for name in names:
+                self.assertNotIn("inst", name)
+            self.assertEqual([name for name in names if "other" in name], ["other.ogg"])
             peaks = {}
             for path in out.iterdir():
+                if path.suffix != ".ogg":
+                    continue
                 peak, sample_rate, _frames = decode_peak(path)
                 peaks[path.name] = peak
                 self.assertEqual(sample_rate, 44100)
                 self.assertLess(peak, 1.0)
             print("SEPARATOR_OGG_EVIDENCE " + " ".join(f"{name}={peak:.4f}" for name, peak in sorted(peaks.items())))
-            self.assertGreater(peaks["song - Drums.ogg"], peaks["song - Vocals.ogg"])
+            self.assertGreater(peaks["drums.ogg"], peaks["vocals.ogg"])
+
+    def test_xdj_layout_publishes_exact_names_and_deletes_azstem_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mix_dir = root / "in"
+            out = root / "out"
+            mix_dir.mkdir()
+            out.mkdir()
+            rate = 44100
+            frames = rate
+            time = np.arange(frames, dtype=np.float32) / float(rate)
+            vocals = 0.2 * np.sin(2.0 * np.pi * 440.0 * time)
+            bass = 0.3 * np.sin(2.0 * np.pi * 80.0 * time)
+            drums = 1.7 * np.sin(2.0 * np.pi * 120.0 * time)
+            melody = 0.4 * np.sin(2.0 * np.pi * 660.0 * time)
+            mix = np.stack([vocals + bass + drums + melody, vocals + bass + drums + melody], axis=0).astype(np.float32)
+            source = mix_dir / "song.wav"
+            write_stem_file(source, mix, rate, "wav")
+            existing = out / "STEMS" / "song"
+            existing.mkdir(parents=True)
+            (existing / "azstem.env").write_text("stale", encoding="utf-8")
+            (existing / "vocals.ogg").write_bytes(b"stale")
+            separator = self._separator(
+                output_format="ogg",
+                dj_output=True,
+                xdj_layout=True,
+                output_root=str(out),
+                audio_params={"ogg_quality": 6, "ogg_min_bitrate": 0},
+                output_naming={"enabled": True, "template": "%filename% - %stem%"},
+                output_model="bs-roformer",
+            )
+            separator._test_output = out
+            separator.process_folder(str(source))
+            folder = out / "STEMS" / "song"
+            names = sorted(path.name for path in folder.iterdir())
+            self.assertEqual(names, ["bass.ogg", "drums.ogg", "other.ogg", "vocals.ogg"])
+            self.assertFalse((folder / "azstem.env").exists())
+            self.assertFalse(any(path.name.startswith(".") for path in (out / "STEMS").iterdir()))
+            self.assertFalse(list(out.glob("*.ogg")))
+            peaks = {}
+            for path in folder.iterdir():
+                peak, sample_rate, _frames = decode_peak(path)
+                peaks[path.name] = peak
+                self.assertEqual(sample_rate, 44100)
+                self.assertLess(peak, 1.0)
+            print("XDJ_LAYOUT_EVIDENCE " + " ".join(f"{name}={peak:.4f}" for name, peak in sorted(peaks.items())))
+            self.assertGreater(peaks["drums.ogg"], peaks["vocals.ogg"])
+            self.assertGreater(peaks["drums.ogg"], 0.5)
 
 
 class WorkflowDeliveryTests(unittest.TestCase):
@@ -152,6 +200,27 @@ class WorkflowDeliveryTests(unittest.TestCase):
             self.assertEqual(overrides["sep1.vocals"], ("studio:dj:sep1", 0))
             self.assertEqual(definition["steps"][0]["output_names"]["Vocals"], "%filename% - %stem%")
             self.assertEqual(definition["steps"][0]["output_names"]["Melody"], "Club %filename% %stem%")
+            self.assertEqual(collect_dj_ogg_save_names(dag), {
+                "save:sep1:Vocals": "vocals",
+                "save:sep1:Melody": "other",
+                "save:sep1:Bass": "bass",
+                "save:sep1:Drums": "drums",
+            })
+            ogg_definition = {
+                "steps": [{
+                    "id": "sep1",
+                    "dj_output": True,
+                    "save": {"vocals": "Default"},
+                    "output_names": {"vocals": "%filename%_%stem%"},
+                }],
+            }
+            apply_simple_dj_folds(self._dag(graph), ogg_definition, ogg_step_ids={"sep1"})
+            self.assertEqual(ogg_definition["steps"][0]["output_names"], {
+                "Vocals": "vocals",
+                "Melody": "other",
+                "Bass": "bass",
+                "Drums": "drums",
+            })
             broken = {
                 "steps": [{
                     "id": "sep1",

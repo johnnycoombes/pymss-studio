@@ -1215,6 +1215,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
     output_format = output_format or "wav"
     from workflow_delivery import (
         apply_simple_dj_folds,
+        collect_dj_ogg_save_names,
         encode_deferred_ogg,
         ensure_dj_fold_node,
         mark_compiled_ogg_saves,
@@ -1248,7 +1249,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
         inference_params = _simple_inference_params(wf)
         dag = graph.compile_workflow_to_dag(wf)
         _apply_simple_inference_params(dag, inference_params)
-        dj_sources = apply_simple_dj_folds(dag, data)
+        dj_sources = apply_simple_dj_folds(dag, data, ogg_step_ids=set(ogg_plan.step_formats))
         reserved_simple_names: set[str] = set()
         filename_format = "ogg" if ogg_plan.run_wants_ogg else output_format
         simple_output_metadata = _apply_simple_output_names(
@@ -1274,9 +1275,11 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
                 widget_format="wav" if ogg_plan.run_wants_ogg else output_format,
             ))
         mark_compiled_ogg_saves(dag, ogg_plan, audio_params)
+        ogg_plan.dj_file_stems = collect_dj_ogg_save_names(dag)
     else:
         dag = graph.load_comfy_file(workflow_path)
         ogg_plan = rewrite_graph_ogg(dag, audio_params, output_format)
+        ogg_plan.dj_file_stems = collect_dj_ogg_save_names(dag)
 
     _apply_runtime_device(dag, payload, simple=simple_definition is not None)
     dynamic_folders: dict[str, str] = {}
@@ -1388,6 +1391,16 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
             item["sampleRate"] = rec.sample_rate
         outputs.append(item)
 
+    reported_output_dir = task_output_dir
+    if bool(payload.get("xdjLayout") or payload.get("xdj_layout")) and primary:
+        from stem_delivery import relocate_xdj_outputs
+
+        relocate_xdj_outputs(outputs, output_dir, Path(primary).name)
+        saved_paths = [item["path"] for item in outputs]
+        parents = {Path(path).resolve().parent for path in saved_paths}
+        if len(parents) == 1:
+            reported_output_dir = next(iter(parents))
+
     # Non-output leaf nodes (plugin STRING producers: ASR text, measurements,
     # MIDI paths) surface as nodeValues so the task result carries their work.
     node_values: list[dict[str, Any]] = []
@@ -1412,7 +1425,7 @@ def _run_pymss(payload: dict[str, Any], task_id: str, input_path: str | None,
     result_payload = {
         "files": saved_paths,
         "outputs": outputs,
-        "outputDir": str(Path(saved_paths[0]).parent.resolve()) if workbench and saved_paths else str(task_output_dir.resolve()),
+        "outputDir": str(Path(saved_paths[0]).parent.resolve()) if workbench and saved_paths else str(reported_output_dir.resolve()),
         **({"outputDirectories": sorted({str(Path(path).parent.resolve()) for path in saved_paths})} if workbench else {}),
         "outputFormat": reported_format,
     }

@@ -13,6 +13,30 @@ export const OGG_QUALITY_DEFAULT = 6
 export const OGG_MIN_BITRATE_QUALITY = 8
 export const DJ_STEMS = ['Vocals', 'Melody', 'Bass', 'Drums'] as const
 export const DJ_NAMING_TEMPLATE = '%filename% - %stem%'
+export const DJ_OGG_FILE_STEMS: Record<(typeof DJ_STEMS)[number], string> = {
+  Vocals: 'vocals',
+  Melody: 'other',
+  Bass: 'bass',
+  Drums: 'drums',
+}
+
+const XDJ_RESERVED_NAMES = new Set([
+  'CON', 'PRN', 'AUX', 'NUL',
+  ...Array.from({ length: 9 }, (_, index) => `COM${index + 1}`),
+  ...Array.from({ length: 9 }, (_, index) => `LPT${index + 1}`),
+])
+
+export function xdjTrackFolderName(trackFilename: string): string {
+  const base = String(trackFilename || '').replace(/\\/g, '/').split('/').pop() || ''
+  const dot = base.lastIndexOf('.')
+  // Match pathlib's stem: a trailing dot is part of the name, and a leading dot is not an extension.
+  const text = dot > 0 && dot < base.length - 1 ? base.slice(0, dot) : base
+  let folder = text.replace(/[<>:"/\\|?*\u0000-\u001f]+/g, '_')
+  if (!folder || folder === '.' || folder === '..') folder = 'track'
+  const device = folder.replace(/[ .]+$/g, '').split('.')[0].toUpperCase()
+  if (folder.endsWith(' ') || folder.endsWith('.') || XDJ_RESERVED_NAMES.has(device)) folder = `${folder}_`
+  return folder
+}
 
 const STOCK_NAMING_TEMPLATES = new Set([
   '',

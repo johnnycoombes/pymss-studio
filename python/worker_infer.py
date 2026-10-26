@@ -222,6 +222,8 @@ def _studio_separator_type() -> type[Any]:
             from worker_rocm import configure_rocm_runtime
 
             dj_output = bool(kwargs.pop("dj_output", False))
+            xdj_layout = bool(kwargs.pop("xdj_layout", False))
+            output_root = str(kwargs.pop("output_root", "") or "")
             requested_format = str(kwargs.get("output_format") or "wav").strip().lower() or "wav"
             if requested_format == "vorbis":
                 requested_format = "ogg"
@@ -234,6 +236,8 @@ def _studio_separator_type() -> type[Any]:
             super().__init__(*args, **kwargs)
             self._studio_naming = _normalize_output_naming(output_naming)
             self._studio_dj_output = dj_output
+            self._studio_xdj_layout = xdj_layout
+            self._studio_output_root = output_root
             self._studio_requested_format = requested_format
             self._studio_audio_params = dict(audio_params)
             self._studio_defer_delivery = dj_output or requested_format == "ogg"
@@ -484,18 +488,40 @@ def _studio_separator_type() -> type[Any]:
                     ]
                 extension = self._studio_requested_format or "wav"
                 save_dir = str(items[0]["save_dir"])
+                dj_ogg = bool(getattr(self, "_studio_dj_output", False)) and extension == "ogg"
+                xdj_layout = dj_ogg and bool(getattr(self, "_studio_xdj_layout", False))
+                stage_dir: Path | None = None
+                final_dir: Path | None = None
                 paths = []
                 try:
-                    for stem_name, _audio, _rate in final:
-                        target_name = self._delivery_filename(stem_name, context)
-                        paths.append(_claim_output_path(
-                            Path(save_dir) / f"{target_name}.{extension}",
-                            self._studio_claimed_paths,
-                        ))
+                    if dj_ogg:
+                        from stem_delivery import dj_ogg_file_stem, open_xdj_stage, publish_xdj_stage
+
+                        file_stems = [dj_ogg_file_stem(stem_name) for stem_name, _audio, _rate in final]
+                        if xdj_layout:
+                            root = str(getattr(self, "_studio_output_root", "") or save_dir)
+                            stage_dir, final_dir = open_xdj_stage(root, Path(input_path).name)
+                            paths = [stage_dir / f"{file_stem}.ogg" for file_stem in file_stems]
+                        else:
+                            paths = [Path(save_dir) / f"{file_stem}.ogg" for file_stem in file_stems]
+                    else:
+                        for stem_name, _audio, _rate in final:
+                            target_name = self._delivery_filename(stem_name, context)
+                            paths.append(_claim_output_path(
+                                Path(save_dir) / f"{target_name}.{extension}",
+                                self._studio_claimed_paths,
+                            ))
                     params = dict(getattr(self, "_studio_audio_params", {}) or {})
                     params["ogg_quality"] = getattr(self, "_studio_ogg_quality", params.get("ogg_quality", 6))
                     encode_stem_group(final, paths, output_format=extension, audio_params=params)
+                    if xdj_layout and stage_dir is not None and final_dir is not None:
+                        publish_xdj_stage(stage_dir, final_dir)
+                        paths = [final_dir / path.name for path in paths]
+                        stage_dir = None
                 except Exception:
+                    if stage_dir is not None and stage_dir.exists():
+                        import shutil
+                        shutil.rmtree(stage_dir, ignore_errors=True)
                     for path in paths:
                         path.unlink(missing_ok=True)
                         self._studio_claimed_paths.discard(path)
@@ -753,6 +779,8 @@ def _prepare_separator(
         output_naming=payload.get("outputNaming"),
         output_model=str(model_name or ""),
         dj_output=dj_output,
+        xdj_layout=bool(payload.get("xdjLayout") or payload.get("xdj_layout")),
+        output_root=str(payload.get("output") or ""),
     )
     if dj_output:
         from stem_delivery import StemDeliveryError, missing_dj_roles
